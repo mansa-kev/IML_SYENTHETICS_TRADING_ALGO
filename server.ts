@@ -28,7 +28,15 @@ let balance = 10000.00;
 let peakBalance = 10000.00;
 let tradingEnabled = false;
 let selectedSymbol = "R_10"; // Volatility 10 (1s)
-let tradingMode = "AUTO" as "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" | "AUTO";
+let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
+// Sovereign Hybrid Risk Engine (SHRE) state variables
+let hybridRiskType = "FIXED" as "FIXED" | "PERCENT";
+let hybridRiskFixedAmount = 25.00;
+let hybridRiskPercent = 0.5; // 0.5% of account balance (e.g. $50 on $10k)
+let hybridRewardRatio = 3.0; // 3R target payout
+let hybridEarlyCutoffEnabled = true;
+let hybridEarlyCutoffPct = 0.15; // 15% of R adverse excursion limit
+let hybridGreeningTriggerPct = 0.20; // 20% of R greening break-even trigger
 let simulationSpeed = 1; // Real-time standard
 let riskPreset = "MODERATE" as "CONSERVATIVE" | "MODERATE" | "AGGRESSIVE";
 
@@ -59,9 +67,10 @@ let circuitBreakerCooldown = 0; // seconds remaining
 let cooldownMessage = "";
 let consecutiveLosses = 0;
 let consecutiveWins = 0;
+let sessionBlocked = false;
 
-// Historical pricing buffers (rolling arrays of size 1000)
-const maxBufferLength = 1000;
+// Historical pricing buffers (rolling arrays of size 2000)
+const maxBufferLength = 2000;
 const tickBuffers: Record<string, number[]> = {
   R_10: [],
   R_25: [],
@@ -306,7 +315,54 @@ if (supabaseUrl && supabaseKey) {
   console.log("[SUPABASE] No SUPABASE_URL or SUPABASE_KEY/SUPABASE_ANON_KEY detected in env. Local persistence active.");
 }
 
+function isMissingTableError(error: any): boolean {
+  if (!error) return false;
+  const msg = (error.message || "").toLowerCase();
+  return (
+    error.code === "PGRST116" ||
+    msg.includes("relation") ||
+    msg.includes("not found") ||
+    msg.includes("not find") ||
+    msg.includes("schema cache") ||
+    msg.includes("does not exist")
+  );
+}
+
+function isRLSError(error: any): boolean {
+  if (!error) return false;
+  const msg = (error.message || "").toLowerCase();
+  return msg.includes("row-level security") || msg.includes("rls");
+}
+
 let lastInstructionLogged = 0;
+let lastRLSInstructionLogged = 0;
+
+function logSupabaseRLSInstructions() {
+  const now = Date.now();
+  if (now - lastRLSInstructionLogged < 300000) return;
+  lastRLSInstructionLogged = now;
+  
+  const instruction = [
+    `[SUPABASE RLS ERROR] ⚠️ Cannot write to Supabase due to Row-Level Security policy!`,
+    `To fix this, go to Supabase SQL Editor and run:`,
+    ``,
+    `-- Disable RLS if you only use this project privately for the bot:`,
+    `ALTER TABLE sovereign_state DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE sovereign_trades DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE sovereign_strategy_history DISABLE ROW LEVEL SECURITY;`,
+    ``,
+    `-- OR, create an open policy for the bot:`,
+    `CREATE POLICY "Allow all operations for anon" ON sovereign_state FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON sovereign_trades FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON sovereign_strategy_history FOR ALL USING (true) WITH CHECK (true);`,
+    ``,
+    `Alternatively, place your SUPABASE_SERVICE_ROLE_KEY into the Environment logic instead of SUPABASE_ANON_KEY to fully bypass RLS.`
+  ];
+  
+  console.log("\n==========================================================================");
+  instruction.forEach(line => console.log(line));
+  console.log("==========================================================================\n");
+}
 function logSupabaseSetupInstructions() {
   const now = Date.now();
   if (now - lastInstructionLogged < 300000) return; // limit logging to once every 5 minutes to prevent spam
@@ -325,6 +381,7 @@ function logSupabaseSetupInstructions() {
     `CREATE TABLE IF NOT EXISTS sovereign_trades (`,
     `  id text PRIMARY KEY,`,
     `  symbol text NOT NULL,`,
+    `  contract_type text,`,
     `  direction text NOT NULL,`,
     `  entry_epoch bigint,`,
     `  exit_epoch bigint,`,
@@ -337,6 +394,18 @@ function logSupabaseSetupInstructions() {
     `  bb_pct_at_entry numeric,`,
     `  adx_at_entry numeric,`,
     `  regime_at_entry text,`,
+    `  is_hybrid_linear boolean DEFAULT false,`,
+    `  target_risk_amount numeric,`,
+    `  hybrid_position_size numeric,`,
+    `  tick_stream jsonb,`,
+    `  created_at timestamp with time zone DEFAULT now()`,
+    `);`,
+    ``,
+    `CREATE TABLE IF NOT EXISTS sovereign_strategy_history (`,
+    `  id bigserial PRIMARY KEY,`,
+    `  epoch_recorded bigint NOT NULL,`,
+    `  global_parameters jsonb,`,
+    `  sub_algorithms jsonb,`,
     `  created_at timestamp with time zone DEFAULT now()`,
     `);`
   ];
@@ -385,6 +454,13 @@ async function saveStateToSupabase() {
       selectedSymbol,
       tradingMode,
       riskPreset,
+      hybridRiskType,
+      hybridRiskFixedAmount,
+      hybridRiskPercent,
+      hybridRewardRatio,
+      hybridEarlyCutoffEnabled,
+      hybridEarlyCutoffPct,
+      hybridGreeningTriggerPct,
       activePositions,
       completedTrades,
       currentParams,
@@ -397,14 +473,51 @@ async function saveStateToSupabase() {
       .upsert({ id: "dashboard", data: dataToSave, updated_at: new Date().toISOString() });
 
     if (error) {
-      if (error.code === "PGRST116" || error.message?.includes("relation") || error.message?.includes("not found")) {
+      if (isMissingTableError(error)) {
         logSupabaseSetupInstructions();
+      } else if (isRLSError(error)) {
+        logSupabaseRLSInstructions();
       } else {
         console.error("[SUPABASE_SAVE_ERROR]", error.message);
       }
     }
   } catch (err: any) {
     console.error("[SUPABASE_SAVE_ERROR] Failed to write sovereign session state to Supabase:", err);
+  }
+}
+
+async function saveStrategyHistoryToSupabase() {
+  if (!supabaseClient) return;
+  try {
+    const strategyData = {
+      epoch_recorded: Math.floor(Date.now() / 1000),
+      global_parameters: currentParams,
+      sub_algorithms: Object.keys(subAlgorithms).reduce((acc, key) => {
+        const sub = subAlgorithms[key];
+        acc[key] = {
+          rsiOversoldThreshold: sub.rsiOversoldThreshold,
+          rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
+          bbStd: sub.bbStd,
+          minConfluenceScore: sub.minConfluenceScore,
+          targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
+          recentWinRate: sub.recentWinRate,
+        };
+        return acc;
+      }, {} as Record<string, any>)
+    };
+
+    const { error } = await supabaseClient
+      .from("sovereign_strategy_history")
+      .insert([strategyData]);
+
+    if (error) {
+       // Silent fail if table not exist, as we log the general setup instruction
+       if (!isMissingTableError(error)) {
+         console.warn("[SUPABASE_STRATEGY_HISTORY]", error.message);
+       }
+    }
+  } catch (e) {
+    // Ignore history push errors
   }
 }
 
@@ -416,6 +529,7 @@ async function saveTradeToSupabase(record: TradeRecord) {
       .upsert({
         id: record.id,
         symbol: record.symbol,
+        contract_type: record.contractType,
         direction: record.direction,
         entry_epoch: record.entryEpoch,
         exit_epoch: record.exitEpoch,
@@ -428,11 +542,17 @@ async function saveTradeToSupabase(record: TradeRecord) {
         bb_pct_at_entry: record.bbPctAtEntry,
         adx_at_entry: record.adxAtEntry,
         regime_at_entry: record.regimeAtEntry,
+        is_hybrid_linear: record.isHybridLinear || false,
+        target_risk_amount: record.targetRiskAmount || null,
+        hybrid_position_size: record.hybridPositionSize || null,
+        tick_stream: record.tickStreamSnapshot || [],
         created_at: new Date().toISOString()
       });
     if (error) {
-      if (error.message?.includes("relation") || error.message?.includes("not found")) {
+      if (isMissingTableError(error)) {
         logSupabaseSetupInstructions();
+      } else if (isRLSError(error)) {
+        logSupabaseRLSInstructions();
       } else {
         console.error("[SUPABASE_TRADE_PERSIST_ERROR]", error.message);
       }
@@ -453,7 +573,7 @@ async function loadStateFromSupabase() {
       .maybeSingle();
 
     if (error) {
-      if (error.message?.includes("relation") || error.message?.includes("not found")) {
+      if (isMissingTableError(error)) {
         logSupabaseSetupInstructions();
       } else {
         console.warn("[SUPABASE_RESTORE] Error reading state:", error.message);
@@ -469,6 +589,13 @@ async function loadStateFromSupabase() {
       if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
       if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
       if (loaded.riskPreset !== undefined) riskPreset = loaded.riskPreset;
+      if (loaded.hybridRiskType !== undefined) hybridRiskType = loaded.hybridRiskType;
+      if (loaded.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = loaded.hybridRiskFixedAmount;
+      if (loaded.hybridRiskPercent !== undefined) hybridRiskPercent = loaded.hybridRiskPercent;
+      if (loaded.hybridRewardRatio !== undefined) hybridRewardRatio = loaded.hybridRewardRatio;
+      if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
+      if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
+      if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
       if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
       if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
@@ -508,6 +635,13 @@ function saveStateToDisk() {
       selectedSymbol,
       tradingMode,
       riskPreset,
+      hybridRiskType,
+      hybridRiskFixedAmount,
+      hybridRiskPercent,
+      hybridRewardRatio,
+      hybridEarlyCutoffEnabled,
+      hybridEarlyCutoffPct,
+      hybridGreeningTriggerPct,
       activePositions,
       completedTrades,
       currentParams,
@@ -562,6 +696,13 @@ function loadStateFromDisk() {
       if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
       if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
       if (loaded.riskPreset !== undefined) riskPreset = loaded.riskPreset;
+      if (loaded.hybridRiskType !== undefined) hybridRiskType = loaded.hybridRiskType;
+      if (loaded.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = loaded.hybridRiskFixedAmount;
+      if (loaded.hybridRiskPercent !== undefined) hybridRiskPercent = loaded.hybridRiskPercent;
+      if (loaded.hybridRewardRatio !== undefined) hybridRewardRatio = loaded.hybridRewardRatio;
+      if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
+      if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
+      if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
       if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
       if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
@@ -706,6 +847,16 @@ class DerivLiveBridge {
 
   public getIsAuthorized(): boolean {
     return this.isAuthorized;
+  }
+
+  public refreshBalance() {
+    if (!this.ws || this.ws.readyState !== 1) return; // 1 is WebSocket.OPEN
+    if (this.isAuthorized && DERIV_API_TOKEN) {
+      logs.push(`[DERIV_LIVE] 🔄 Requesting fresh balance reference following reset trigger...`);
+      this.ws.send(JSON.stringify({
+        authorize: DERIV_API_TOKEN
+      }));
+    }
   }
 
   public subscribeToTicks(symbol: string) {
@@ -900,63 +1051,23 @@ class DerivLiveBridge {
     const derivSymbol = this.getDerivSymbolCode(symbol);
     const effMode = getEffectiveTradeType();
     
-    if (effMode === "OPTIONS_DIGITS") {
-      // Contract for Digits
-      const proposal = {
-        buy: 1,
-        price: stake,
-        parameters: {
-          amount: stake,
-          basis: "stake",
-          contract_type: direction === "LONG" ? "DIGITOVER" : "DIGITUNDER", // Simplest digit option map
-          currency: "USD",
-          duration: 5,
-          duration_unit: "t",
-          symbol: derivSymbol,
-          barrier: "4" // baseline mid-barrier digit
-        }
-      };
-      this.ws.send(JSON.stringify(proposal));
-      logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE DIGITS contract proposal: ${proposal.parameters.contract_type} on ${derivSymbol} (Stake: $${stake})`);
-      return true;
-    } else if (effMode === "OPTION") {
-      // Proposal request for quick RISE / FALL
-      const proposal = {
-        buy: 1,
-        price: stake,
-        parameters: {
-          amount: stake,
-          basis: "stake",
-          contract_type: direction === "LONG" ? "CALL" : "PUT",
-          currency: "USD",
-          duration: 5,
-          duration_unit: "t", // Ticks duration is ultra robust for fast feedback
-          symbol: derivSymbol
-        }
-      };
-      
-      this.ws.send(JSON.stringify(proposal));
-      logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE contract proposal order: ${direction} on ${derivSymbol} (Stake: $${stake})`);
-      return true;
-    } else {
-      // Submission protocol for Multipliers parameters
-      const proposal = {
-        buy: 1,
-        price: stake,
-        parameters: {
-          amount: stake,
-          basis: "stake",
-          contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
-          currency: "USD",
-          symbol: derivSymbol,
-          multiplier: multiplier || (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200),
-        }
-      };
+    // Submission protocol for Multipliers parameters
+    const proposal = {
+      buy: 1,
+      price: stake,
+      parameters: {
+        amount: stake,
+        basis: "stake",
+        contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
+        currency: "USD",
+        symbol: derivSymbol,
+        multiplier: multiplier || (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200),
+      }
+    };
 
-      this.ws.send(JSON.stringify(proposal));
-      logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${multiplier || "default"}): ${direction} on ${derivSymbol} (Stake: $${stake})`);
-      return true;
-    }
+    this.ws.send(JSON.stringify(proposal));
+    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${multiplier || "default"}): ${direction} on ${derivSymbol} (Stake: $${stake})`);
+    return true;
   }
 }
 
@@ -971,6 +1082,68 @@ function computeSMA(prices: number[], period: number): number {
   if (prices.length < period) return prices[prices.length - 1] || 0;
   const slice = prices.slice(-period);
   return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// 1.1. Kaufman Adaptive Moving Average (KAMA)
+function computeKAMA(prices: number[], period = 50, fastLength = 2, slowLength = 30): number {
+  if (prices.length < period + 1) return prices[prices.length - 1] || 0;
+  const lookback = Math.min(prices.length, 300);
+  const startIdx = prices.length - lookback;
+  const initialSlice = prices.slice(startIdx, startIdx + period);
+  let kamaVal = initialSlice.reduce((a, b) => a + b, 0) / period; // seed with SMA
+
+  const fastest = 2 / (fastLength + 1);
+  const slowest = 2 / (slowLength + 1);
+
+  for (let i = startIdx + period; i < prices.length; i++) {
+    const change = Math.abs(prices[i] - prices[i - period]);
+    let volatility = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      volatility += Math.abs(prices[j] - prices[j - 1]);
+    }
+    const er = volatility === 0 ? 0 : change / volatility;
+    const sc = Math.pow(er * (fastest - slowest) + slowest, 2);
+    kamaVal = kamaVal + sc * (prices[i] - kamaVal);
+  }
+  return kamaVal;
+}
+
+// 1.2. Hill Estimator for Tail Exponent (Alpha Hat) calculation (tracks empirical fat tails)
+function computeHillEstimator(prices: number[], lookback = 500, k = 50): number {
+  if (prices.length < 100) return 3.50; // default to safe, light-tailed Gaussian baseline if data is limited
+  
+  const actualLookback = Math.min(prices.length - 1, lookback);
+  const absReturns: number[] = [];
+  
+  for (let i = prices.length - 1; i > prices.length - 1 - actualLookback; i--) {
+    const p1 = prices[i];
+    const p2 = prices[i - 1];
+    if (p2 > 0) {
+      const logRet = Math.abs(Math.log(p1 / p2));
+      if (logRet > 0) {
+        absReturns.push(logRet);
+      }
+    }
+  }
+
+  if (absReturns.length < k + 2) return 3.50;
+
+  // Sort absolute logarithmic returns in descending order
+  absReturns.sort((a, b) => b - a);
+
+  // Hill Estimator calculation formula
+  let sum = 0;
+  const xK = absReturns[k]; // the k-th order statistic
+  if (xK === 0) return 3.50;
+
+  for (let i = 0; i < k; i++) {
+    sum += Math.log(absReturns[i] / xK);
+  }
+
+  const denominator = sum / k;
+  if (denominator <= 0) return 3.50;
+
+  return 1.0 / denominator;
 }
 
 // 2. Bollinger Bands
@@ -1109,6 +1282,170 @@ function checkDivergence(prices: number[], rsiArr: number[], direction: "BULLISH
   }
 }
 
+// ------------------------------------------
+// FRACTAL PERSISTENCE ENGINE (HURST EXPONENT H)
+// ------------------------------------------
+
+function linearRegression(x: number[], y: number[]): { slope: number, intercept: number, rSquared: number } {
+  const n = x.length;
+  if (n < 2) return { slope: 0.5, intercept: 0, rSquared: 0 };
+  let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0, sumYY = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += x[i];
+    sumY += y[i];
+    sumXY += x[i] * y[i];
+    sumXX += x[i] * x[i];
+    sumYY += y[i] * y[i];
+  }
+  const denominator = (n * sumXX - sumX * sumX);
+  if (denominator === 0) return { slope: 0.5, intercept: 0, rSquared: 0 };
+  const slope = (n * sumXY - sumX * sumY) / denominator;
+  const intercept = (sumY - slope * sumX) / n;
+  
+  // Calculate R-squared
+  const yMean = sumY / n;
+  let ssTot = 0;
+  let ssRes = 0;
+  for (let i = 0; i < n; i++) {
+    const prediction = slope * x[i] + intercept;
+    ssTot += Math.pow(y[i] - yMean, 2);
+    ssRes += Math.pow(y[i] - prediction, 2);
+  }
+  const rSquared = ssTot === 0 ? 0 : 1 - (ssRes / ssTot);
+  return { slope, intercept, rSquared };
+}
+
+function computeDFA1(prices: number[], windowSize = 256): { H: number, rSquared: number } {
+  if (prices.length < windowSize + 1) {
+    return { H: 0.5, rSquared: 0 };
+  }
+  const slice = prices.slice(- (windowSize + 1));
+  const returns: number[] = [];
+  for (let i = 1; i < slice.length; i++) {
+    const r = Math.log(slice[i] / slice[i - 1]);
+    returns.push(r);
+  }
+  
+  const N = returns.length;
+  const mean = returns.reduce((a, b) => a + b, 0) / N;
+  const profile: number[] = new Array(N);
+  let cumulative = 0;
+  for (let i = 0; i < N; i++) {
+    cumulative += (returns[i] - mean);
+    profile[i] = cumulative;
+  }
+  
+  const boxSizes = [16, 32, 64, 128];
+  const logN: number[] = [];
+  const logF: number[] = [];
+  
+  for (const n of boxSizes) {
+    const numBoxes = Math.floor(N / n);
+    if (numBoxes === 0) continue;
+    
+    let sumSqrY = 0;
+    for (let b = 0; b < numBoxes; b++) {
+      const startIdx = b * n;
+      // Fit linear trend: y = s * t + c
+      let sumT = 0, sumYVal = 0, sumTYVal = 0, sumTT = 0;
+      for (let t = 0; t < n; t++) {
+        const val = profile[startIdx + t];
+        sumT += t;
+        sumYVal += val;
+        sumTYVal += t * val;
+        sumTT += t * t;
+      }
+      const denom = n * sumTT - sumT * sumT;
+      const s = denom === 0 ? 0 : (n * sumTYVal - sumT * sumYVal) / denom;
+      const c = (sumYVal - s * sumT) / n;
+      
+      for (let t = 0; t < n; t++) {
+        const fitted = s * t + c;
+        const residual = profile[startIdx + t] - fitted;
+        sumSqrY += residual * residual;
+      }
+    }
+    
+    const f2 = sumSqrY / (numBoxes * n);
+    const fn = Math.sqrt(f2);
+    if (fn > 0) {
+      logN.push(Math.log(n));
+      logF.push(Math.log(fn));
+    }
+  }
+  
+  if (logN.length < 2) {
+    return { H: 0.5, rSquared: 0 };
+  }
+  
+  const reg = linearRegression(logN, logF);
+  const H = Math.max(0, Math.min(1, reg.slope));
+  return { H, rSquared: reg.rSquared };
+}
+
+function computeRS(prices: number[], windowSize = 1024): { H: number, rSquared: number } {
+  if (prices.length < windowSize + 1) {
+    return { H: 0.5, rSquared: 0 };
+  }
+  const slice = prices.slice(- (windowSize + 1));
+  const returns: number[] = [];
+  for (let i = 1; i < slice.length; i++) {
+    returns.push(Math.log(slice[i] / slice[i - 1]));
+  }
+  
+  const N = returns.length;
+  const boxSizes = [16, 32, 64, 128, 256, 512];
+  const logN: number[] = [];
+  const logRS: number[] = [];
+  
+  for (const n of boxSizes) {
+    const numBoxes = Math.floor(N / n);
+    if (numBoxes === 0) continue;
+    
+    const rsVals: number[] = [];
+    for (let b = 0; b < numBoxes; b++) {
+      const startIdx = b * n;
+      const subReturns = returns.slice(startIdx, startIdx + n);
+      const subMean = subReturns.reduce((a, b) => a + b, 0) / n;
+      
+      // Cumulative deviations
+      let curDev = 0;
+      let minDev = 0;
+      let maxDev = 0;
+      let sumSq = 0;
+      for (let t = 0; t < n; t++) {
+        const dev = subReturns[t] - subMean;
+        curDev += dev;
+        if (curDev < minDev) minDev = curDev;
+        if (curDev > maxDev) maxDev = curDev;
+        sumSq += dev * dev;
+      }
+      
+      const r = maxDev - minDev;
+      const variance = sumSq / n;
+      const s = Math.sqrt(variance);
+      
+      if (s > 0 && r > 0) {
+        rsVals.push(r / s);
+      }
+    }
+    
+    if (rsVals.length > 0) {
+      const avgRS = rsVals.reduce((a, b) => a + b, 0) / rsVals.length;
+      logN.push(Math.log(n));
+      logRS.push(Math.log(avgRS));
+    }
+  }
+  
+  if (logN.length < 2) {
+    return { H: 0.5, rSquared: 0 };
+  }
+  
+  const reg = linearRegression(logN, logRS);
+  const H = Math.max(0, Math.min(1, reg.slope));
+  return { H, rSquared: reg.rSquared };
+}
+
 // ==========================================
 // REGIME DETECTION ENGINE
 // ==========================================
@@ -1211,11 +1548,11 @@ function getCurrentIndicators(symbol: string) {
   };
 }
 
-let activeTradeType: "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" = "MULTIPLIER";
+let activeTradeType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
 
-function getEffectiveTradeType(): "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" {
+function getEffectiveTradeType(): "MULTIPLIER" | "HYBRID_LINEAR" {
   if (tradingMode === "AUTO") return activeTradeType;
-  return tradingMode as "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS";
+  return tradingMode as "MULTIPLIER" | "HYBRID_LINEAR";
 }
 
 // ==========================================
@@ -1224,29 +1561,28 @@ function getEffectiveTradeType(): "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" {
 function evaluateGovernorFocus() {
   let highestScore = -1;
   let bestSymbol = governorFocusSymbol;
-  let bestType: "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" = "MULTIPLIER";
+  let bestType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
 
   Object.values(subAlgorithms).forEach((sub) => {
-    // Determine prevailing mood for this instrument
-    const rsiDev = Math.abs(sub.rsiVal - 50); // range 0 to 50
-    const bbExtreme = Math.abs(sub.bbPct - 0.5) * 50; // range 0 to 25
+    // Determine prevailing mood for this instrument using Conviction Score (Hurst/Fractal metrics)
+    // A higher conviction score means the sub-algorithm has better structural alignment for trading.
+    const convictionScore = sub.convictionScore || 0;
     const trendStrength = sub.adxVal || 0; // standard ADX is 0-100
     
     // Evaluate MULTIPLIER fit (loves strong trends)
-    const multScore = trendStrength > 25 ? (trendStrength * 1.5) : (trendStrength * 0.5);
+    const multScore = (trendStrength * 1.0) + (convictionScore * 50);
     
-    // Evaluate OPTION_RISE_FALL fit (loves oscillations / mean reversion)
-    const optScore = (rsiDev * 1.2) + (bbExtreme * 1.2) - (trendStrength * 0.5);
+    // Evaluate HYBRID_LINEAR fit (favors persistent fractal structures, higher Hurst components)
+    const hybridScore = (convictionScore * 80) + (trendStrength * 0.5);
     
-    // Evaluate OPTIONS_DIGITS fit (loves fast tick rate and high noise / tight ranges)
-    const tickRateBoost = INSTRUMENTS[sub.symbol]?.tickType === "1s" ? 30 : 0;
-    const digitsScore = tickRateBoost + (trendStrength < 20 ? 15 : 0);
-
     // Find best mode for this specific symbol
-    let localBestType: "MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" = "MULTIPLIER";
+    let localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
     let localMaxScore = multScore;
-    if (optScore > localMaxScore) { localMaxScore = optScore; localBestType = "OPTION"; }
-    if (digitsScore > localMaxScore) { localMaxScore = digitsScore; localBestType = "OPTIONS_DIGITS"; }
+
+    if (hybridScore > localMaxScore) {
+      localMaxScore = hybridScore;
+      localBestType = "HYBRID_LINEAR";
+    }
 
     if (localMaxScore > highestScore) {
       highestScore = localMaxScore;
@@ -1297,6 +1633,31 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   sub.atrVal = parseFloat(atr.toFixed(4));
   sub.mRegime = currentRegime;
 
+  const dfaRes = computeDFA1(prices, 256);
+  const rsRes = computeRS(prices, 1024);
+  const rsMacroRes = computeRS(prices, 2000);
+  const kamaLocal = computeKAMA(prices, 50);
+  const smaHigher = computeSMA(prices, 600);
+
+  sub.hurstVal = parseFloat(dfaRes.H.toFixed(3));
+  sub.hurstRSquared = parseFloat(dfaRes.rSquared.toFixed(3));
+  sub.hurstConfirm = parseFloat(rsRes.H.toFixed(3));
+  sub.hurstMacro = parseFloat(rsMacroRes.H.toFixed(3));
+  sub.kamaValue = parseFloat(kamaLocal.toFixed(4));
+
+  // Section 7.1 Hill Estimator Tail Exponent (Alpha Hat)
+  const alphaVal = computeHillEstimator(prices, 500, 50);
+  sub.tailExponent = parseFloat(alphaVal.toFixed(3));
+
+  // Compute Conviction Score Composite (C) between 0.0 and 1.0 according to Section 3.3
+  const hMicro = dfaRes.H;
+  const hMeso = rsRes.H;
+  const hNorm = Math.max(0, Math.min(1, (hMicro - 0.65) / (0.866 - 0.65)));
+  const rSqr = dfaRes.rSquared;
+  const deltaHNorm = Math.max(0, Math.min(1, 1 - Math.abs(hMicro - hMeso) / 0.10));
+  const conviction = 0.50 * hNorm + 0.30 * rSqr + 0.20 * deltaHNorm;
+  sub.convictionScore = parseFloat(conviction.toFixed(3));
+
   // 4. Update the Governor's Focused Instrument dynamically
   evaluateGovernorFocus();
 
@@ -1310,68 +1671,81 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     return;
   }
 
-  // Allow trading in TRANSITION regimes to increase activity and execute setups
-  // if (currentRegime === MarketRegime.TRANSITION) {
-  //   return;
-  // }
-
   // Accumulate RSI array for divergence checks
   const dRsiArr = prices.slice(-100).map((_, i, arr) => computeRSI(prices.slice(-100).slice(0, i + 1), 14));
 
-  // 6. Evaluate Long Criteria
-  const isOversold = currentPrice <= lower;
-  // Dynamic constraint: trigger overbought and oversold ranges fully without artificial floors or ceilings
-  const isRsiOversoldRange = rsiVal <= sub.rsiOversoldThreshold;
-  const isBelowVwap = currentPrice < vwapVal;
-  const isBullDivergent = checkDivergence(prices, dRsiArr, "BULLISH");
-  const isBullReversalPattern = checkReversalCandle(candles);
-
-  const longScore = (isOversold ? 1 : 0) + 
-                    (isRsiOversoldRange ? 1 : 0) + 
-                    (isBelowVwap ? 1 : 0) + 
-                    (isBullDivergent ? 1 : 0) + 
-                    (isBullReversalPattern ? 1 : 0);
-
-  // Evaluate Short Criteria
-  const isOverbought = currentPrice >= upper;
-  const isRsiOverboughtRange = rsiVal >= sub.rsiOverboughtThreshold;
-  const isAboveVwap = currentPrice > vwapVal;
-  const isBearDivergent = checkDivergence(prices, dRsiArr, "BEARISH");
-  const isBearReversalPattern = checkReversalCandle(candles);
-
-  const shortScore = (isOverbought ? 1 : 0) + 
-                     (isRsiOverboughtRange ? 1 : 0) + 
-                     (isAboveVwap ? 1 : 0) + 
-                     (isBearDivergent ? 1 : 0) + 
-                     (isBearReversalPattern ? 1 : 0);
-
-  sub.confluenceScore = Math.max(longScore, shortScore);
-  if (Math.random() < 0.05) logs.push(`[DEBUG] Symbol: ${symbol} L:${longScore} S:${shortScore} MIN:${sub.minConfluenceScore}`);
-
+  // 6. Evaluate Signals (Dynamic SFT-V2 Fractal Strategy with Mean-Fader Fallback)
   let triggerTrade = false;
   let direction: "LONG" | "SHORT" = "LONG";
   let score = 0;
   let conditionsList: string[] = [];
 
-  // Minimum confluence score setup matches individual sub-algorithm configuration
-  if (longScore >= sub.minConfluenceScore) {
-    triggerTrade = true;
-    direction = "LONG";
-    score = longScore;
-    if (isOversold) conditionsList.push("BB_OVERSOLD");
-    if (isRsiOversoldRange) conditionsList.push("RSI_OVERSOLD_ZONE");
-    if (isBelowVwap) conditionsList.push("BELOW_VWAP");
-    if (isBullDivergent) conditionsList.push("BULLISH_DIVERG");
-    if (isBullReversalPattern) conditionsList.push("REVERSAL_CANDLE");
-  } else if (shortScore >= sub.minConfluenceScore) {
-    triggerTrade = true;
-    direction = "SHORT";
-    score = shortScore;
-    if (isOverbought) conditionsList.push("BB_OVERBOUGHT");
-    if (isRsiOverboughtRange) conditionsList.push("RSI_OVERBOUGHT_ZONE");
-    if (isAboveVwap) conditionsList.push("ABOVE_VWAP");
-    if (isBearDivergent) conditionsList.push("BEARISH_DIVERG");
-    if (isBearReversalPattern) conditionsList.push("REVERSAL_CANDLE");
+  const isPersistentRegime = hMicro >= 0.65 && hMeso >= 0.62 && rsMacroRes.H >= 0.60 && rSqr >= 0.92;
+
+  if (isPersistentRegime) {
+    // SFT-V2 Fractal Pursuit Entry (Trend-following inside persistent memory corridors)
+    const isLocalBull = currentPrice > kamaLocal;
+    const isHigherBull = currentPrice > smaHigher;
+    
+    if (isLocalBull === isHigherBull) {
+      triggerTrade = true;
+      direction = isLocalBull ? "LONG" : "SHORT";
+      score = 5; // Elite level persistence score
+      conditionsList = ["SFT_V2_FRACTAL", "KAMA_LOCAL", "SMA_HIGHER", "PERS_CONFIRM"];
+      logs.push(`[SFT_V2_TACTICAL] 🌪️ Fractal Persistence detected on ${symbol} (H_μ: ${hMicro.toFixed(2)}, H_m: ${hMeso.toFixed(2)}, H_M: ${rsMacroRes.H.toFixed(2)}). Local KAMA and Higher SMA aligned in ${direction} direction. Active Conviction Score: ${(conviction * 100).toFixed(1)}%.`);
+    } else {
+      // Timeframe conflict in a persistent regime; standard mean reversion is dangerous, stand-by
+      if (Math.random() < 0.05) {
+        logs.push(`[SFT_V2_STANDBY] ⚠️ High persistence on ${symbol} but timeframe conflict detected (Local Bull: ${isLocalBull}, MTF Bull: ${isHigherBull}). Standby to avoid chops.`);
+      }
+    }
+  } else {
+    // FALLBACK: Standard Mean-Fader signals for stationary/random-walk regimes
+    const isOversold = currentPrice <= lower;
+    const isRsiOversoldRange = rsiVal <= sub.rsiOversoldThreshold;
+    const isBelowVwap = currentPrice < vwapVal;
+    const isBullDivergent = checkDivergence(prices, dRsiArr, "BULLISH");
+    const isBullReversalPattern = checkReversalCandle(candles);
+
+    const longScore = (isOversold ? 1 : 0) + 
+                      (isRsiOversoldRange ? 1 : 0) + 
+                      (isBelowVwap ? 1 : 0) + 
+                      (isBullDivergent ? 1 : 0) + 
+                      (isBullReversalPattern ? 1 : 0);
+
+    const isOverbought = currentPrice >= upper;
+    const isRsiOverboughtRange = rsiVal >= sub.rsiOverboughtThreshold;
+    const isAboveVwap = currentPrice > vwapVal;
+    const isBearDivergent = checkDivergence(prices, dRsiArr, "BEARISH");
+    const isBearReversalPattern = checkReversalCandle(candles);
+
+    const shortScore = (isOverbought ? 1 : 0) + 
+                       (isRsiOverboughtRange ? 1 : 0) + 
+                       (isAboveVwap ? 1 : 0) + 
+                       (isBearDivergent ? 1 : 0) + 
+                       (isBearReversalPattern ? 1 : 0);
+
+    sub.confluenceScore = Math.max(longScore, shortScore);
+
+    if (longScore >= sub.minConfluenceScore) {
+      triggerTrade = true;
+      direction = "LONG";
+      score = longScore;
+      if (isOversold) conditionsList.push("BB_OVERSOLD");
+      if (isRsiOversoldRange) conditionsList.push("RSI_OVERSOLD_ZONE");
+      if (isBelowVwap) conditionsList.push("BELOW_VWAP");
+      if (isBullDivergent) conditionsList.push("BULLISH_DIVERG");
+      if (isBullReversalPattern) conditionsList.push("REVERSAL_CANDLE");
+    } else if (shortScore >= sub.minConfluenceScore) {
+      triggerTrade = true;
+      direction = "SHORT";
+      score = shortScore;
+      if (isOverbought) conditionsList.push("BB_OVERBOUGHT");
+      if (isRsiOverboughtRange) conditionsList.push("RSI_OVERBOUGHT_ZONE");
+      if (isAboveVwap) conditionsList.push("ABOVE_VWAP");
+      if (isBearDivergent) conditionsList.push("BEARISH_DIVERG");
+      if (isBearReversalPattern) conditionsList.push("REVERSAL_CANDLE");
+    }
   }
 
   const tickEffMode = getEffectiveTradeType();
@@ -1405,9 +1779,18 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
 
     // Determine stake sized with Kelly formula scaling factor
-    const baseStake = calculateKellyStake();
+    const baseStake = calculateKellyStake(symbol);
     let stake = baseStake * sub.targetRiskStakeMultiplier;
-    logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
+    
+    // Scale down dynamically using our SFT-V2 Conviction Score Composite (C) for fractal entries
+    const cScore = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
+    if (sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
+      const priorStake = stake;
+      stake = stake * cScore;
+      logs.push(`[SFT_V2_RISK] 🎚️ Active Conviction Composite scaling (C: ${(cScore * 100).toFixed(1)}%) adjusted Kelly stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)}.`);
+    } else {
+      logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
+    }
 
     // Check if the Governor co-signs an Elite trade on the focused instrument
     let isEliteGovernorTrade = false;
@@ -1418,6 +1801,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
 
     stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.05)).toFixed(2));
+    
+    // Ensure Multiplier mode respects Fixed USD risk if configured
+    if (tradingMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
+      stake = Math.min(stake, hybridRiskFixedAmount);
+    }
     logs.push(`[TRACE] Clamped stake down: final=${stake}, balance=${balance}`);
 
     if (stake > balance) {
@@ -1431,8 +1819,15 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
     let takeProfitDistance = stopLossDistance * 1.5; // standard exit ratio
     let chosenMultiplier = 50;
+    let targetRisk = 25.00;
 
-    if (tradingMode === "MULTIPLIER") {
+    if (tickEffMode === "HYBRID_LINEAR") {
+      const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
+      targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
+      takeProfitDistance = stopLossDistance * hybridRewardRatio;
+      stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
+      logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
+    } else if (tradingMode === "MULTIPLIER") {
       const targetLossPct = sub.targetLossPct || 0.15; // default 15% max risk on stake
       const slPct = stopLossDistance / currentPrice;
       const desiredMultiplier = targetLossPct / slPct;
@@ -1480,6 +1875,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       contractType = direction === "LONG" ? "RISE" : "FALL";
     } else if (tickEffMode === "OPTIONS_DIGITS") {
       contractType = direction === "LONG" ? "OVER" : "UNDER";
+    } else if (tickEffMode === "HYBRID_LINEAR") {
+      contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
     }
 
     const positionId = `CT_${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
@@ -1496,7 +1893,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       pnl: 0.0,
       ticksElapsed: 0,
       entryEpoch: epoch,
-      multiplier: tradingMode === "MULTIPLIER" ? chosenMultiplier : undefined,
+      multiplier: (tradingMode === "MULTIPLIER" && tickEffMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+      isHybridLinear: tickEffMode === "HYBRID_LINEAR" ? true : undefined,
+      targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
+      hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
+      isFractalTrend: isPersistentRegime,
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
@@ -1504,9 +1905,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (liveOrderPlaced) {
-      logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
-    } else {
       balance = parseFloat((balance - stake).toFixed(2));
+      logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
     }
 
     activePositions.push(position);
@@ -1516,45 +1916,74 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   }
 }
 
-// Position Sizing: KELLY SIZER WITH STRICT LOWER-UPPER CAPS
-function calculateKellyStake(): number {
-  if (completedTrades.length < 5) {
-    // If we have minimal trades data, use absolute initial capital safety guidelines (0.5% cap)
-    const baseStake = balance * 0.005;
-    return Math.max(0.35, parseFloat(baseStake.toFixed(2)));
+function computeMedian(arr: number[]): number {
+  if (arr.length === 0) return 0;
+  const sorted = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Position Sizing: HYBRID HALF-KELLY SIZER with monotone regression and Bayesian shrinkage
+function calculateKellyStake(symbol?: string): number {
+  const last50 = completedTrades.slice(-50);
+  const winPnlArr = last50.filter(t => t.pnl > 0).map(t => t.pnl);
+  const lossPnlArr = last50.filter(t => t.pnl < 0).map(t => Math.abs(t.pnl));
+  
+  // Derive b (Payout Ratio) using rolling 50-trade median ratio
+  const b = (last50.length >= 30 && winPnlArr.length >= 10 && lossPnlArr.length >= 10)
+    ? computeMedian(winPnlArr) / (computeMedian(lossPnlArr) || 1)
+    : 1.25; // 1.25x default fallback based on TP/SL ratio
+
+  let p = 0.50;
+  const sub = symbol ? subAlgorithms[symbol] : null;
+  const hurst = sub ? sub.hurstVal : undefined;
+
+  if (hurst !== undefined && hurst >= 0.65) {
+    // Section 4.1.1 monotone regression: p(H) = a*H + b
+    const pEmpirical = Math.max(0.50, Math.min(0.75, 0.85 * hurst - 0.05));
+    // Section 4.1.1 Bayesian shrinkage: p_shrunk = 0.7 * p_empirical + 0.3 * 0.50
+    p = 0.7 * pEmpirical + 0.3 * 0.50;
+  } else {
+    // Fallback: historic overall winrate shrunk toward 50%
+    const totalCount = completedTrades.length;
+    const winCount = completedTrades.filter(t => t.pnl > 0).length;
+    const histWinrate = totalCount > 0 ? (winCount / totalCount) : 0.50;
+    const pEmpirical = Math.max(0.40, Math.min(0.60, histWinrate));
+    p = 0.7 * pEmpirical + 0.3 * 0.50;
   }
 
-  // Win stats calculation
-  const wins = completedTrades.filter(t => t.pnl > 0);
-  const winRate = wins.length / completedTrades.length;
-  
-  let winSum = 0;
-  let lossSum = 0;
-  wins.forEach(w => winSum += w.pnl);
-  completedTrades.filter(t => t.pnl <= 0).forEach(l => lossSum += Math.abs(l.pnl));
-
-  const avgWin = wins.length > 0 ? winSum / wins.length : 1;
-  const avgLoss = (completedTrades.length - wins.length) > 0 ? lossSum / (completedTrades.length - wins.length) : 1;
-
-  const b = avgWin / (avgLoss || 1);
-  const p = winRate;
+  // Full Kelly Formula: f* = (b*p - q)/b
   const q = 1 - p;
+  const fullKelly = (b * p - q) / (b || 1);
+  // Half-Kelly multiplier for protection (0.5 * f*)
+  const halfKelly = fullKelly / 2.0;
 
-  // Kelly Formula
-  let kelly = (b * p - q) / (b || 1);
-  // Half-Kelly multiplier for protection
-  let halfKelly = kelly / 2.0;
-
-  // STRICT CAPS: Not over 2% of equity, and no less than 0.35 Deriv minimums
+  // STRICT CAPS based on risk preset
   const MAX_STAKE_PCT = riskPreset === "AGGRESSIVE" ? 0.04 : riskPreset === "CONSERVATIVE" ? 0.01 : 0.02;
   const calculatedMax = balance * MAX_STAKE_PCT;
   
-  let stake = balance * Math.max(0.005, Math.min(halfKelly, MAX_STAKE_PCT));
-  if (isNaN(stake) || stake < 0.35) {
+  let kellyPct = Math.max(0.005, Math.min(halfKelly, MAX_STAKE_PCT));
+  if (isNaN(kellyPct) || kellyPct <= 0) {
+    kellyPct = 0.005; // safe fallback (0.5% of equity)
+  }
+
+  let stake = balance * kellyPct;
+  if (stake < 0.35) {
     stake = balance * 0.005; // safe fallback
   }
 
-  return Math.max(0.35, parseFloat(Math.min(stake, calculatedMax).toFixed(2)));
+  // Section 7.3 Halving Trigger Protocol
+  const isHalvingProtocolActive = Object.values(subAlgorithms).some(s => s.enabled && s.tailExponent !== undefined && s.tailExponent <= 2.2);
+  if (isHalvingProtocolActive) {
+    const priorStake = stake;
+    stake = stake * 0.50;
+    if (Math.random() < 0.05) {
+      logs.push(`[POWER_LAW_SHIELD] 🚨 Halving Trigger Protocol is ACTIVE (At least one active symbol has tail exponent <= 2.2). Cut stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)} (-50%).`);
+    }
+  }
+
+  const finalStake = parseFloat(Math.min(stake, calculatedMax).toFixed(2));
+  return Math.max(0.35, finalStake);
 }
 
 function executeProposal(
@@ -1571,7 +2000,7 @@ function executeProposal(
   epoch: number
 ) {
   // Check if trading amount exceeds balance
-  let stake = calculateKellyStake();
+  let stake = calculateKellyStake(symbol);
   const sub = subAlgorithms[symbol];
   if (sub) {
     stake = stake * sub.targetRiskStakeMultiplier;
@@ -1592,8 +2021,17 @@ function executeProposal(
   let stopLossDistance = Math.max(entryPrice * 0.003, atrBuffer);
   let takeProfitDistance = stopLossDistance * 1.25; // optimized 1.25x exit ratio for high hit rate
   let chosenMultiplier = 50;
+  let targetRisk = 25.00;
 
-  if (tradingMode === "MULTIPLIER") {
+  const effMode = getEffectiveTradeType();
+
+  if (effMode === "HYBRID_LINEAR") {
+    const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
+    targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
+    takeProfitDistance = stopLossDistance * hybridRewardRatio;
+    stake = parseFloat(Math.max(0.35, Math.min(targetRisk * 2.0, balance * 0.1)).toFixed(2));
+    logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
+  } else if (tradingMode === "MULTIPLIER") {
     const slPct = stopLossDistance / entryPrice;
     const desiredMultiplier = targetLossPct / slPct;
 
@@ -1631,12 +2069,13 @@ function executeProposal(
   const stopLoss = direction === "LONG" ? (entryPrice - stopLossDistance) : (entryPrice + stopLossDistance);
   const takeProfit = direction === "LONG" ? (entryPrice + takeProfitDistance) : (entryPrice - takeProfitDistance);
 
-  const effMode = getEffectiveTradeType();
   let contractType: ActivePosition["contractType"] = direction === "LONG" ? "MULTUP" : "MULTDOWN";
   if (effMode === "OPTION") {
     contractType = direction === "LONG" ? "RISE" : "FALL";
   } else if (effMode === "OPTIONS_DIGITS") {
     contractType = direction === "LONG" ? "OVER" : "UNDER";
+  } else if (effMode === "HYBRID_LINEAR") {
+    contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
   }
 
   const id = `TX_${Math.floor(Math.random() * 89999 + 10000)}`;
@@ -1654,15 +2093,17 @@ function executeProposal(
     pnl: 0.0,
     ticksElapsed: 0,
     entryEpoch: epoch,
-    multiplier: tradingMode === "MULTIPLIER" ? chosenMultiplier : undefined,
+    multiplier: (tradingMode === "MULTIPLIER" && effMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+    isHybridLinear: effMode === "HYBRID_LINEAR" ? true : undefined,
+    targetRiskAmount: effMode === "HYBRID_LINEAR" ? targetRisk : undefined,
+    hybridPositionSize: effMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
   };
 
   // Place actual contract proposal request if live credentials are active
   const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
   if (liveOrderPlaced) {
-    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
-  } else {
     balance = parseFloat((balance - stake).toFixed(2));
+    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
   }
 
   activePositions.push(position);
@@ -1672,7 +2113,7 @@ function executeProposal(
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
-  const settledTrades: { idx: number, pos: ActivePosition, price: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual", epoch: number }[] = [];
+  const settledTrades: { idx: number, pos: ActivePosition, price: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "early_cutoff", epoch: number }[] = [];
 
   activePositions.forEach((pos, idx) => {
     if (pos.symbol !== symbol) return;
@@ -1681,7 +2122,10 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
 
     // P&L formula estimation based on mode
     let posPnl = 0;
-    if (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN") {
+    if (pos.isHybridLinear) {
+      const isUp = pos.contractType === "HYBRID_LINEAR_UP";
+      posPnl = (isUp ? 1 : -1) * pos.hybridPositionSize! * (currentPrice - pos.entryPrice);
+    } else if (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN") {
       const isUp = pos.contractType === "MULTUP";
       const pctDiff = (currentPrice - pos.entryPrice) / pos.entryPrice;
       const scale = pos.multiplier || 50;
@@ -1707,60 +2151,174 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
       pos.lowestPriceSinceEntry = currentPrice;
     }
 
+    let exitTriggered = false;
+    let reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "early_cutoff" = "time_exit";
+
     // Trailing Stop & Break Even Logic
-    if (subAlg && (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN")) {
-      // 1. Break Even
-      if (subAlg.breakEvenEnabled && !pos.breakEvenActive) {
-        // Trigger BE early if price has covered 20% of the distance to TP (was 30%)
-        if (pos.direction === "LONG") {
-          const tpDistance = pos.takeProfit - pos.entryPrice;
-          if (currentPrice >= pos.entryPrice + tpDistance * 0.2) {
-            pos.stopLoss = pos.entryPrice + tpDistance * 0.05; // lock in a small 5% profit offset
+    if (pos.isHybridLinear) {
+      const isUp = pos.contractType === "HYBRID_LINEAR_UP";
+      const stopLossDistance = Math.abs(pos.entryPrice - pos.stopLoss);
+      
+      // 1. Adverse Excursion Limit (Early Cutoff / Partial Loss limit of 15%)
+      if (hybridEarlyCutoffEnabled && posPnl <= -hybridEarlyCutoffPct * pos.targetRiskAmount!) {
+        exitTriggered = true;
+        reason = "early_cutoff";
+        posPnl = -hybridEarlyCutoffPct * pos.targetRiskAmount!;
+        pos.pnl = parseFloat(posPnl.toFixed(2));
+      }
+
+      // 2. Greening Dynamic Trailing Stop
+      if (!exitTriggered) {
+        const currentR = posPnl / pos.targetRiskAmount!;
+        if (currentR >= hybridGreeningTriggerPct) {
+          if (!pos.breakEvenActive) {
+            pos.stopLoss = pos.entryPrice;
             pos.breakEvenActive = true;
-          }
-        } else if (pos.direction === "SHORT") {
-          const tpDistance = pos.entryPrice - pos.takeProfit;
-          if (currentPrice <= pos.entryPrice - tpDistance * 0.2) {
-            pos.stopLoss = pos.entryPrice - tpDistance * 0.05; // lock in a small 5% profit offset
-            pos.breakEvenActive = true;
+            logs.push(`[GREENING_SHIELD] Position #${pos.id} reached +${(currentR * 100).toFixed(0)}% of R profit. Stop Loss moved to Break-Even (entry: $${pos.entryPrice.toFixed(2)}). Risk is 100% eliminated.`);
+          } else {
+            // Trail stop loss
+            const trailDistance = stopLossDistance * 1.0; // Trail by 1R
+            if (pos.direction === "LONG" && pos.highestPriceSinceEntry) {
+              const newSL = pos.highestPriceSinceEntry - trailDistance;
+              if (newSL > pos.stopLoss) {
+                pos.stopLoss = parseFloat(newSL.toFixed(5));
+                const lockedInR = (pos.stopLoss - pos.entryPrice) / stopLossDistance;
+                logs.push(`[GREENING_TRAIL] Long Position #${pos.id} trailed higher. New Stop: $${pos.stopLoss.toFixed(2)} (Locked in +${(lockedInR * 100).toFixed(0)}% of R)`);
+              }
+            } else if (pos.direction === "SHORT" && pos.lowestPriceSinceEntry) {
+              const newSL = pos.lowestPriceSinceEntry + trailDistance;
+              if (newSL < pos.stopLoss) {
+                pos.stopLoss = parseFloat(newSL.toFixed(5));
+                const lockedInR = (pos.entryPrice - pos.stopLoss) / stopLossDistance;
+                logs.push(`[GREENING_TRAIL] Short Position #${pos.id} trailed lower. New Stop: $${pos.stopLoss.toFixed(2)} (Locked in +${(lockedInR * 100).toFixed(0)}% of R)`);
+              }
+            }
           }
         }
       }
+    } else if (subAlg && (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN")) {
+      const prices = tickBuffers[pos.symbol] || [];
+      if (pos.isFractalTrend && prices.length >= 50) {
+        // Section 6.1 Volatility-Adaptive Trailing Stop
+        const valRegime = detectRegime(pos.symbol);
+        let kAtr = 2.0;
+        let atrPeriod = 14;
 
-      // 2. Trailing Stop
-      if (subAlg.trailingStopEnabled && pos.breakEvenActive) {
-        // Only start trailing after BE is hit, to lock in profits
-        const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * 0.25; // tighter trail distance (was 0.35)
-        
-        if (pos.direction === "LONG") {
-          const newSL = pos.highestPriceSinceEntry - trailDistance;
-          if (newSL > pos.stopLoss) {
-            pos.stopLoss = newSL;
+        if (valRegime === MarketRegime.LOW_VOL) {
+          kAtr = 3.0;
+          atrPeriod = 14;
+        } else if (valRegime === MarketRegime.HIGH_VOL) {
+          kAtr = 1.5;
+          atrPeriod = 7;
+        } else {
+          kAtr = 2.0;
+          atrPeriod = 14;
+        }
+
+        // Section 6.1.1 Accelerator Adjustment
+        if (subAlg.hurstVal !== undefined && subAlg.hurstVal > 0.75) {
+          kAtr = 2.5;
+          atrPeriod = 14;
+        }
+
+        // Section 6.2 Parabolic Spike Detection
+        let isParabolicSpike = false;
+        const currentRoC = Math.abs((prices[prices.length - 1] - prices[prices.length - 6]) / prices[prices.length - 6]);
+        let rocSum = 0;
+        let rocCount = 0;
+        for (let i = prices.length - 1; i >= Math.max(5, prices.length - 50); i--) {
+          const oldP = prices[i - 5];
+          if (oldP > 0) {
+            rocSum += Math.abs((prices[i] - oldP) / oldP);
+            rocCount++;
           }
-        } else if (pos.direction === "SHORT") {
-          const newSL = pos.lowestPriceSinceEntry + trailDistance;
+        }
+        const avgRoC = rocCount > 0 ? (rocSum / rocCount) : 0.001;
+        const isRoCSpike = currentRoC > 2.5 * avgRoC;
+
+        const h64Res = computeDFA1(prices, 64);
+        const h64 = h64Res.H;
+        const h256 = subAlg.hurstVal || 0.5;
+        const isHurstDeclining = (h256 - h64) > 0.05;
+
+        if (isRoCSpike && isHurstDeclining) {
+          isParabolicSpike = true;
+          kAtr = 1.5;
+          atrPeriod = 7;
+          if (Math.random() < 0.04) {
+            logs.push(`[SFT_V2_CONVEXITY] ⚠️ Parabolic Spike detected on ${pos.symbol}! RoC: ${(currentRoC * 100).toFixed(2)}% (vs Avg: ${(avgRoC * 100).toFixed(2)}%), H_64: ${h64.toFixed(2)} (declined from H_256: ${h256.toFixed(2)}). Tightening Stop to 1.5x ATR(7).`);
+          }
+        }
+
+        const activeAtrObj = computeATRAndADX(candleBuffers[pos.symbol] || [], atrPeriod);
+        const activeAtr = activeAtrObj ? activeAtrObj.atr : 1.0;
+        const trailBufferValue = activeAtr * kAtr;
+
+        if (pos.direction === "LONG" && pos.highestPriceSinceEntry !== undefined) {
+          const newSL = pos.highestPriceSinceEntry - trailBufferValue;
+          if (newSL > pos.stopLoss) {
+            pos.stopLoss = parseFloat(newSL.toFixed(5));
+          }
+        } else if (pos.direction === "SHORT" && pos.lowestPriceSinceEntry !== undefined) {
+          const newSL = pos.lowestPriceSinceEntry + trailBufferValue;
           if (newSL < pos.stopLoss) {
-            pos.stopLoss = newSL;
+            pos.stopLoss = parseFloat(newSL.toFixed(5));
+          }
+        }
+      } else {
+        // Standard non-fractal Trailing and BE management
+        // 1. Break Even
+        if (subAlg.breakEvenEnabled && !pos.breakEvenActive) {
+          // Trigger BE early if price has covered 20% of the distance to TP
+          if (pos.direction === "LONG") {
+            const tpDistance = pos.takeProfit - pos.entryPrice;
+            if (currentPrice >= pos.entryPrice + tpDistance * 0.2) {
+              pos.stopLoss = pos.entryPrice + tpDistance * 0.05; // lock in a small 5% profit offset
+              pos.breakEvenActive = true;
+            }
+          } else if (pos.direction === "SHORT") {
+            const tpDistance = pos.entryPrice - pos.takeProfit;
+            if (currentPrice <= pos.entryPrice - tpDistance * 0.2) {
+              pos.stopLoss = pos.entryPrice - tpDistance * 0.05; // lock in a small 5% profit offset
+              pos.breakEvenActive = true;
+            }
+          }
+        }
+
+        // 2. Trailing Stop
+        if (subAlg.trailingStopEnabled && pos.breakEvenActive) {
+          // Only start trailing after BE is hit, to lock in profits
+          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * 0.25; // tighter trail distance
+          
+          if (pos.direction === "LONG") {
+            const newSL = pos.highestPriceSinceEntry - trailDistance;
+            if (newSL > pos.stopLoss) {
+              pos.stopLoss = newSL;
+            }
+          } else if (pos.direction === "SHORT") {
+            const newSL = pos.lowestPriceSinceEntry + trailDistance;
+            if (newSL < pos.stopLoss) {
+              pos.stopLoss = newSL;
+            }
           }
         }
       }
     }
 
     // CHECK EXITS
-    let exitTriggered = false;
-    let reason: "stop_loss" | "take_profit" | "time_exit" | "manual" = "time_exit";
-
-    // Stop Loss Hit
-    if (pos.direction === "LONG" && currentPrice <= pos.stopLoss) {
-      exitTriggered = true;
-      reason = "stop_loss";
-    } else if (pos.direction === "SHORT" && currentPrice >= pos.stopLoss) {
-      exitTriggered = true;
-      reason = "stop_loss";
+    if (!exitTriggered) {
+      // Stop Loss Hit
+      if (pos.direction === "LONG" && currentPrice <= pos.stopLoss) {
+        exitTriggered = true;
+        reason = "stop_loss";
+      } else if (pos.direction === "SHORT" && currentPrice >= pos.stopLoss) {
+        exitTriggered = true;
+        reason = "stop_loss";
+      }
     }
 
-    // Take Profit Hit
-    if (!exitTriggered) {
+    // Take Profit Hit (Bypassed entirely in persistent fractal trend regimes to allow capturing fat tails)
+    if (!exitTriggered && !pos.isFractalTrend) {
       if (pos.direction === "LONG" && currentPrice >= pos.takeProfit) {
         exitTriggered = true;
         reason = "take_profit";
@@ -1793,10 +2351,21 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
   });
 }
 
-function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual", epoch: number) {
+function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "early_cutoff", epoch: number) {
   // Recalculate definitive exit P&L
   let finalPnl = pos.pnl;
-  if (pos.contractType === "RISE" || pos.contractType === "FALL") {
+  if (pos.isHybridLinear) {
+    if (reason === "stop_loss") {
+      finalPnl = -pos.targetRiskAmount!;
+    } else if (reason === "take_profit") {
+      finalPnl = pos.targetRiskAmount! * hybridRewardRatio;
+    } else if (reason === "early_cutoff") {
+      finalPnl = -hybridEarlyCutoffPct * pos.targetRiskAmount!;
+    } else {
+      const isUp = pos.contractType === "HYBRID_LINEAR_UP";
+      finalPnl = (isUp ? 1 : -1) * pos.hybridPositionSize! * (exitPrice - pos.entryPrice);
+    }
+  } else if (pos.contractType === "RISE" || pos.contractType === "FALL") {
     // Binary Option resolves strictly based on end price vs start price upon settlement step
     const isRise = pos.contractType === "RISE";
     const won = isRise ? (exitPrice > pos.entryPrice) : (exitPrice < pos.entryPrice);
@@ -1870,6 +2439,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     bbPctAtEntry: computeBollinger(tickBuffers[pos.symbol] || [], currentParams.bbPeriod).percentB,
     adxAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).adx,
     atrAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).atr,
+    tickStreamSnapshot: (tickBuffers[pos.symbol] || []).slice(-150),
     conditionsMet: pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"],
   };
 
@@ -2259,26 +2829,39 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
 // ==========================================
 function evaluateCircuitBreakers() {
   // Daily & Session limits monitoring
-  const initialCap = 1000.00; // Baseline session seed capital
+  const initialCap = 10000.00; // Baseline session seed capital
   const lossFromBaseline = initialCap - balance;
-  const maxSessionDrawdownCap = initialCap * currentParams.rsiOversoldThreshold * 0.001; // dynamically links limits
+  const drawdownPct = lossFromBaseline / initialCap;
   
-  // STRICT CONSTRAINT 1: Max consecutive losses = 3
-  if (consecutiveLosses >= 3) {
+  // Section 8: Terminal Session Block & Strict Safeguards
+  if (drawdownPct >= 0.05 && !sessionBlocked) { // 5% absolute stop
     tradingEnabled = false;
-    circuitBreakerCooldown = 300; // 5-minute cooldown period
-    cooldownMessage = "CRITICAL: Bot stopped automatically. Triggered: [Max consecutive losses (3) met]. Entangled into cooldown buffer.";
-    logs.push(`[BREAKER_ACT] 🛑 CONSECUTIVE LOSSES THRESHOLD REACHED. Circuit breaker locked for 5 mins.`);
+    sessionBlocked = true;
+    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5% Drawdown breached.";
+    logs.push(`[BREAKER_ACT] 🛑 TERMINAL DRAWDOWN BREAKER ENGAGED. Current loss: $${lossFromBaseline.toFixed(2)}. Session permanently blocked.`);
     return;
   }
 
-  // STRICT CONSTRAINT 2: Daily/Session loss cap (e.g. 5% max draw)
-  const statsLossThresh = initialCap * 0.05; // 5% absolute stop
-  if (lossFromBaseline > statsLossThresh) {
+  // Section 8: Max consecutive losses (5 trades) -> Terminal Block
+  if (consecutiveLosses >= 5 && !sessionBlocked) {
     tradingEnabled = false;
-    circuitBreakerCooldown = 450;
-    cooldownMessage = "CRITICAL: Bot stopped automatically. Triggered: [Session max PnL stop-loss limit (5%) breached]. Trading paused.";
-    logs.push(`[BREAKER_ACT] 🛑 DRAWDOWN BREAKER ENGAGED. Current loss: $${lossFromBaseline.toFixed(2)}. Pausing trading.`);
+    sessionBlocked = true;
+    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5 Consecutive losses.";
+    logs.push(`[BREAKER_ACT] 🛑 MAX CONSECUTIVE LOSSES (5) BREACHED. Session permanently blocked.`);
+    return;
+  }
+
+  if (sessionBlocked) return; // Prevent temporal breakers overriding terminal state
+
+  // Temporal Mitigation limits
+  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0) {
+    circuitBreakerCooldown = 300; // 5-minute cooldown period
+    cooldownMessage = "WARNING: 3 Consecutive losses met. 5-minute cooldown active.";
+    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive Losses Threshold. Circuit breaker locked for 5 mins.`);
+  } else if (drawdownPct >= 0.03 && circuitBreakerCooldown === 0) {
+    circuitBreakerCooldown = 450; // 7.5-minute pause on 3% draw
+    cooldownMessage = "WARNING: 3% Drawdown warning limit breached. 7.5-minute pause.";
+    logs.push(`[BREAKER_ACT] ⚠️ 3% Drawdown Warning. Current loss: $${lossFromBaseline.toFixed(2)}. Pausing trading for 7.5 mins.`);
   }
 }
 
@@ -2298,9 +2881,24 @@ function runMachineLearningAdaptation() {
       return;
     }
 
+    // Historical Trade Data
+    const trades = completedTrades.filter(t => t.symbol === sub.name);
     const winRate = sub.recentWinRate;
+    const grossWins = trades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
+    const grossLosses = Math.abs(trades.filter(t => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0));
     
-    if (winRate < 0.44) {
+    // Profit Factor Calculation ($)
+    const profitFactor = grossLosses === 0 ? (grossWins > 0 ? 3.0 : 1.0) : grossWins / grossLosses;
+    const cappedPF = Math.min(profitFactor, 3.0); // normalize between 0 and 3
+    
+    // Composite Objective Score (0.0 to 1.0)
+    // 40% weight on Win Rate, 60% weight on Profit Factor (returns relative to risk)
+    const objectiveScore = (winRate * 0.40) + ((cappedPF / 3.0) * 0.60);
+
+    // Adaptive Volatility Context integration
+    const tailAdverse = sub.tailExponent !== undefined && sub.tailExponent <= 2.8;
+
+    if (objectiveScore < 0.38) {
       // DEFENSIVE DIRECTIVE: Underperforming sub-algorithm! Trigger defensive guidelines
       // Tighten filters to target absolute premium entries
       if (sub.rsiOversoldThreshold > 26) sub.rsiOversoldThreshold -= 1;
@@ -2309,32 +2907,46 @@ function runMachineLearningAdaptation() {
       // Enforce high overlays configuration
       sub.minConfluenceScore = 4;
       
+      // Increase trailing stop buffer natively in high-variance regimes
+      if (tailAdverse) {
+        sub.bbStd = parseFloat((sub.bbStd * 1.1).toFixed(2));
+      }
+      
       // Limit capital downside (cutting half Kelly sizing)
       sub.targetRiskStakeMultiplier = 0.5;
-      sub.directiveMessage = `DEFENSIVE: Underperformance detected (WinRate ${(winRate * 100).toFixed(1)}%). Capping risk allocations to 0.5x, narrowing RSI channels & forcing Max Confluence overlays.`;
+      sub.directiveMessage = `DEFENSIVE: Underperformance detected (ObjScore ${(objectiveScore * 100).toFixed(1)}%, PF: ${profitFactor.toFixed(2)}). Capping risk allocations to 0.5x, narrowing RSI channels & forcing Max Confluence overlays.`;
       
-      logs.push(`[GOVERNOR_POLICE] ⚠️ Sub-algorithm ${sub.name} matches defensive guidelines. WR is ${(winRate * 100).toFixed(1)}%. Risk exposure reduced.`);
+      logs.push(`[GOVERNOR_POLICE] ⚠️ Sub-algorithm ${sub.name} matches defensive guidelines. Score: ${(objectiveScore * 100).toFixed(1)}%. PF: ${profitFactor.toFixed(2)}. Risk exposure reduced.`);
     } 
-    else if (winRate > 0.60) {
+    else if (objectiveScore > 0.62 && profitFactor >= 1.25) {
       // AGGRESSIVE EXPANSION DIRECTIVE: Outstanding performance! Scale-up exposures to capture more trades
       // Gradually expand filters to capture more volume safely
-      if (sub.rsiOversoldThreshold < 35) sub.rsiOversoldThreshold += 1;
-      if (sub.rsiOverboughtThreshold > 65) sub.rsiOverboughtThreshold -= 1;
+      if (sub.rsiOversoldThreshold < 35 && !tailAdverse) sub.rsiOversoldThreshold += 1;
+      if (sub.rsiOverboughtThreshold > 65 && !tailAdverse) sub.rsiOverboughtThreshold -= 1;
       
       // Allow standard confluences
       sub.minConfluenceScore = 2;
 
+      // Tighten standard deviations slightly to take earlier entries
+      if (sub.bbStd > 1.8) {
+        sub.bbStd = parseFloat((sub.bbStd * 0.95).toFixed(2));
+      }
+
       // Elevate stake sizes to compound positive expectancy (boost Kelly size)
-      sub.targetRiskStakeMultiplier = 1.3;
-      sub.directiveMessage = `COMPOUNDING: Robust returns detected (WinRate ${(winRate * 100).toFixed(1)}%). Boosting risk targets to 1.3x Kelly, expanding price channels to map high frequency trends.`;
+      // Only augment risk if we aren't highly leptokurtic
+      sub.targetRiskStakeMultiplier = tailAdverse ? 1.0 : 1.3;
+      sub.directiveMessage = `COMPOUNDING: Robust returns detected (PF: ${profitFactor.toFixed(2)}). Boosting risk targets to ${sub.targetRiskStakeMultiplier}x, optimizing price channels to map high frequency trends.`;
       
-      logs.push(`[GOVERNOR_POLICE] 🚀 Sub-algorithm ${sub.name} is yielding high returns (${(winRate * 100).toFixed(1)}% WR). Upgrading directive to compounding expansion.`);
+      logs.push(`[GOVERNOR_POLICE] 🚀 Sub-algorithm ${sub.name} is yielding high returns (PF: ${profitFactor.toFixed(2)}). Upgrading directive to compounding expansion.`);
     } 
     else {
       // BALANCED PILOTING: Normal equilibrium performance
       sub.targetRiskStakeMultiplier = 1.0;
-      sub.directiveMessage = `STABLE PILOTING: Performance remains at standard equilibrium (WinRate ${(winRate * 100).toFixed(1)}%). Running default indicator filters.`;
-      logs.push(`[GOVERNOR_POLICE] ⚖️ Sub-algorithm ${sub.name} running at standard equilibrium (WR is ${(winRate * 100).toFixed(1)}%). Standard filters applied.`);
+      // Allow incremental relaxation of extreme strict overlays if we're stagnant
+      if (sub.minConfluenceScore > 3) sub.minConfluenceScore = 3;
+      
+      sub.directiveMessage = `STABLE PILOTING: Performance tracking equilibrium (Score ${(objectiveScore * 100).toFixed(1)}%, PF: ${profitFactor.toFixed(2)}). Adjusting to baseline filters.`;
+      logs.push(`[GOVERNOR_POLICE] ⚖️ Sub-algorithm ${sub.name} running at standard equilibrium (Score ${(objectiveScore * 100).toFixed(1)}%). Standard limit overlays applied.`);
     }
   });
 
@@ -2343,14 +2955,25 @@ function runMachineLearningAdaptation() {
   if (recentTrades.length >= 5) {
     const wins = recentTrades.filter(t => t.pnl > 0);
     const globalWinRate = wins.length / recentTrades.length;
-    if (globalWinRate < 0.45) {
+    
+    // Global Profit Factor Check
+    const grossWins = recentTrades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
+    const grossLosses = Math.abs(recentTrades.filter(t => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0));
+    const globalPF = grossLosses === 0 ? (grossWins > 0 ? 2.0 : 1.0) : grossWins / grossLosses;
+
+    if (globalWinRate < 0.45 && globalPF < 1.0) {
       if (currentParams.rsiOversoldThreshold > 25) currentParams.rsiOversoldThreshold -= 1;
       if (currentParams.rsiOverboughtThreshold < 75) currentParams.rsiOverboughtThreshold += 1;
       currentParams.atrStopMultiplier = parseFloat((currentParams.atrStopMultiplier * 1.1).toFixed(2));
-      logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio WR ${(globalWinRate * 100).toFixed(1)}% < 45%. Tightening global parameters universally.`);
+      logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio WR ${(globalWinRate * 100).toFixed(1)}% & PF < 1. Tightening global parameters universally.`);
     } else {
-      logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio WR ${(globalWinRate * 100).toFixed(1)}% is healthy. Global macro parameters unchanged.`);
+      logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio metric is healthy (WR ${(globalWinRate * 100).toFixed(1)}%, PF ${globalPF.toFixed(2)}). Global macro parameters active.`);
     }
+  }
+
+  // Push the adapted strategy iteration to Supabase for long-term ML processing
+  if (supabaseClient) {
+    saveStrategyHistoryToSupabase().catch(() => {});
   }
 }
 
@@ -2655,6 +3278,7 @@ Here is an automated system validation report based on direct mathematical track
     circuitBreaker: {
       consecutiveLosses,
       cooldownRemaining: circuitBreakerCooldown,
+      sessionBlocked,
     },
     recentTrades: completedTrades.slice(-8).map(t => ({
       direction: t.direction,
@@ -2694,6 +3318,46 @@ Failed to contact Gemini servers: ${err.message || err}. Reverting to local diag
 // REST API ROUTING
 // ==========================================
 
+// ML Data Export Endpoint
+app.get("/api/ml-export", async (req, res) => {
+  const format = req.query.format || "json";
+
+  let exportData = [...completedTrades];
+
+  if (supabaseClient) {
+    try {
+      const { data, error } = await supabaseClient
+        .from("sovereign_trades")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .limit(10000); // Fetch up to 10k historical trades
+
+      if (data && !error) {
+        exportData = data;
+      }
+    } catch (err) {
+      console.error("[ML_EXPORT] Error fetching from Supabase:", err);
+    }
+  }
+
+  if (format === "csv") {
+    if (exportData.length === 0) {
+      return res.status(200).send("No trades available.");
+    }
+    const headers = Object.keys(exportData[0]).join(",");
+    const rows = exportData.map(row => 
+      Object.values(row).map(v => typeof v === "object" ? JSON.stringify(v) : v).join(",")
+    ).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.csv"');
+    return res.status(200).send(`${headers}\n${rows}`);
+  }
+
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.json"');
+  res.json(exportData);
+});
+
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
   const currentRegime = detectRegime(selectedSymbol);
@@ -2720,6 +3384,13 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     tradingEnabled,
     tradingMode,
     riskPreset,
+    hybridRiskType,
+    hybridRiskFixedAmount,
+    hybridRiskPercent,
+    hybridRewardRatio,
+    hybridEarlyCutoffEnabled,
+    hybridEarlyCutoffPct,
+    hybridGreeningTriggerPct,
     governorFocusSymbol,
     governorStatus,
     subAlgorithms,
@@ -2740,6 +3411,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     circuitBreaker: {
       cooldownRemaining: circuitBreakerCooldown,
       cooldownMessage,
+      sessionBlocked,
     },
     logs: logs.slice(-1000), // return last 1000 logs (increased to support tall terminal & scrollback searches)
   });
@@ -2747,7 +3419,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
 
 // Update Configuration
 app.post("/api/config", (req, res) => {
-  const { symbol, enabled, mode, risk, params, subAlgConfig } = req.body;
+  const { symbol, enabled, mode, risk, params, subAlgConfig, hybridConfig } = req.body;
 
   if (subAlgConfig !== undefined) {
     const { targetSymbol, enabled: subEnabled, params: subParams } = subAlgConfig;
@@ -2785,6 +3457,9 @@ app.post("/api/config", (req, res) => {
   }
 
   if (enabled !== undefined) {
+    if (enabled && sessionBlocked) {
+      return res.status(403).json({ error: "Session permanently blocked due to terminal limit breach. Please manually reset session." });
+    }
     tradingEnabled = enabled;
     if (enabled) {
       if (liveBridgeInstance.getIsAuthorized()) {
@@ -2810,6 +3485,17 @@ app.post("/api/config", (req, res) => {
   if (params !== undefined) {
     currentParams = { ...currentParams, ...params };
     logs.push(`[PARAMS] Manual adjustment applied to operational indicators.`);
+  }
+
+  if (hybridConfig !== undefined) {
+    if (hybridConfig.hybridRiskType !== undefined) hybridRiskType = hybridConfig.hybridRiskType;
+    if (hybridConfig.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = Number(hybridConfig.hybridRiskFixedAmount);
+    if (hybridConfig.hybridRiskPercent !== undefined) hybridRiskPercent = Number(hybridConfig.hybridRiskPercent);
+    if (hybridConfig.hybridRewardRatio !== undefined) hybridRewardRatio = Number(hybridConfig.hybridRewardRatio);
+    if (hybridConfig.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = Boolean(hybridConfig.hybridEarlyCutoffEnabled);
+    if (hybridConfig.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = Number(hybridConfig.hybridEarlyCutoffPct);
+    if (hybridConfig.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = Number(hybridConfig.hybridGreeningTriggerPct);
+    logs.push(`[SOVEREIGN_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
 
   saveStateToDisk();
@@ -2922,7 +3608,7 @@ app.get("/reports/:file", (req, res) => {
 });
 
 // Reset live indicators and stats
-app.post("/api/reset", (req, res) => {
+app.post("/api/reset", async (req, res) => {
   activePositions = [];
   completedTrades = [];
   consecutiveLosses = 0;
@@ -2930,17 +3616,63 @@ app.post("/api/reset", (req, res) => {
   circuitBreakerCooldown = 0;
   cooldownMessage = "";
   tradingEnabled = false;
+  sessionBlocked = false;
   currentParams = { ...defaultParams };
   
   if (!liveBridgeInstance.getIsAuthorized()) {
     balance = 10000.00;
     peakBalance = 10000.00;
+  } else {
+    // If authorized, trigger live balance fetch to get the absolute live balance from Deriv
+    try {
+      liveBridgeInstance.refreshBalance();
+      // Initialize peakBalance to current balance as fallback
+      peakBalance = balance;
+    } catch (e) {
+      console.error("[RESET] Failed requesting live Deriv balance update:", e);
+    }
   }
+
+  // Fully reset all sub-algorithms' trade counters and stats
+  Object.keys(subAlgorithms).forEach(key => {
+    const sub = subAlgorithms[key];
+    sub.totalTrades = 0;
+    sub.winningTrades = 0;
+    sub.totalPnl = 0;
+    sub.consecutiveLosses = 0;
+    sub.consecutiveWins = 0;
+    sub.recentWinRate = 0.5;
+    sub.cooldownUntil = 0;
+    sub.directiveMessage = "INITIALIZING STANDBY PILOT";
+  });
   
   logs = [`[${new Date().toISOString()}] Sovereign Engine active metrics and overrides have been reset safely.`];
+  
+  if (supabaseClient) {
+    try {
+      // Clear all trade logging records from Supabase to start cleanly
+      const { error: delError } = await supabaseClient
+        .from("sovereign_trades")
+        .delete()
+        .neq("id", "trigger-nothing-to-delete-all");
+      if (delError) {
+        logs.push(`[SUPABASE_RESET_WARNING] Could not clear 'sovereign_trades' cache: ${delError.message}`);
+      } else {
+        logs.push(`[SUPABASE_RESET] Cloud 'sovereign_trades' logs wiped cleanly.`);
+      }
+    } catch (err: any) {
+      console.error("[SUPABASE_RESET_ERROR] Exception wiping trades:", err);
+    }
+  }
+
   liveBridgeInstance.requestHistoryForSymbols();
 
   saveStateToDisk();
+
+  if (supabaseClient) {
+    await saveStateToSupabase();
+  }
+  
   res.json({ success: true, message: "Active trading metrics reset successfully." });
 });
 

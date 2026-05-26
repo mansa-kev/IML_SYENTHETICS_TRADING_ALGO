@@ -32,7 +32,7 @@ export interface Candle {
 export interface ActivePosition {
   id: string; // contract_id
   symbol: string;
-  contractType: "MULTUP" | "MULTDOWN" | "RISE" | "FALL" | "DIFFERS" | "OVER" | "UNDER"; // Extended contract types
+  contractType: "MULTUP" | "MULTDOWN" | "RISE" | "FALL" | "DIFFERS" | "OVER" | "UNDER" | "HYBRID_LINEAR_UP" | "HYBRID_LINEAR_DOWN"; // Extended contract types
   direction: "LONG" | "SHORT";
   stake: number;
   entryPrice: number;
@@ -46,6 +46,10 @@ export interface ActivePosition {
   highestPriceSinceEntry?: number;
   lowestPriceSinceEntry?: number;
   breakEvenActive?: boolean;
+  isHybridLinear?: boolean;
+  targetRiskAmount?: number;
+  hybridPositionSize?: number;
+  isFractalTrend?: boolean;
 }
 
 export interface TradeRecord {
@@ -57,7 +61,7 @@ export interface TradeRecord {
   entryPrice: number;
   exitPrice: number;
   pnl: number;
-  exitReason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker";
+  exitReason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
   regimeAtEntry: MarketRegime;
   entryEpoch: number;
   exitEpoch: number;
@@ -67,6 +71,10 @@ export interface TradeRecord {
   adxAtEntry: number;
   atrAtEntry: number;
   conditionsMet: string[]; // JSON representation
+  isHybridLinear?: boolean;
+  targetRiskAmount?: number;
+  hybridPositionSize?: number;
+  tickStreamSnapshot?: number[]; // To store raw price data for ML off-platform
 }
 
 export interface SessionStats {
@@ -106,6 +114,7 @@ export interface CircuitBreakerStats {
   cooldownRemaining: number;      // in seconds. 0 if ok
   cooldownMessage: string;
   peakBalance: number;
+  sessionBlocked?: boolean;
 }
 
 export interface BacktestResult {
@@ -175,5 +184,12 @@ export interface SubAlgorithm {
   atrVal: number;
   confluenceScore: number;
   mRegime: MarketRegime;
+  hurstVal?: number; // DFA-1 256-tick rolling estimate
+  hurstConfirm?: number; // R/S 1024-tick confirmation
+  hurstRSquared?: number; // DFA fit quality (R2)
+  hurstMacro?: number; // R/S 2000-tick macro structural persistence
+  convictionScore?: number; // SFT-V2 Conviction Composite Score (0.00 to 1.00)
+  kamaValue?: number; // Kaufman Adaptive Moving Average
+  tailExponent?: number; // Hill Estimator tail exponent (alpha hat)
 }
 

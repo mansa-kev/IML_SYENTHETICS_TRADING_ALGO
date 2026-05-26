@@ -5,6 +5,7 @@
 
 import React, { useState, useEffect, useRef } from "react";
 import { 
+  Clock,
   Play, 
   Square, 
   RefreshCw, 
@@ -26,7 +27,8 @@ import {
   BookMarked,
   Star,
   ShieldCheck,
-  Info
+  Info,
+  PieChart
 } from "lucide-react";
 import { MarketRegime, ActivePosition, TradeRecord, LearningParams } from "./types/sovereign";
 import {
@@ -36,7 +38,11 @@ import {
   XAxis,
   YAxis,
   Tooltip as RechartsTooltip,
-  CartesianGrid
+  CartesianGrid,
+  BarChart,
+  Bar,
+  Cell,
+  Legend
 } from "recharts";
 
 const INSTRUMENTS = {
@@ -56,8 +62,17 @@ export default function App() {
   const [symbol, setSymbol] = useState<string>("R_10");
   const [symbolName, setSymbolName] = useState<string>("Volatility 10 (1s)");
   const [idealStrategy, setIdealStrategy] = useState<string>("mean_reversion");
-  const [tradingMode, setTradingMode] = useState<"MULTIPLIER" | "OPTION" | "OPTIONS_DIGITS" | "AUTO">("AUTO");
+  const [tradingMode, setTradingMode] = useState<"MULTIPLIER" | "HYBRID_LINEAR" | "AUTO">("AUTO");
   const [isAuthorized, setIsAuthorized] = useState<boolean>(false);
+
+  // Sovereign Hybrid Risk Engine (SHRE) configs:
+  const [hybridRiskType, setHybridRiskType] = useState<"FIXED" | "PERCENT">("FIXED");
+  const [hybridRiskFixedAmount, setHybridRiskFixedAmount] = useState<number>(25.0);
+  const [hybridRiskPercent, setHybridRiskPercent] = useState<number>(1.0);
+  const [hybridRewardRatio, setHybridRewardRatio] = useState<number>(3.0);
+  const [hybridEarlyCutoffEnabled, setHybridEarlyCutoffEnabled] = useState<boolean>(true);
+  const [hybridEarlyCutoffPct, setHybridEarlyCutoffPct] = useState<number>(0.15);
+  const [hybridGreeningTriggerPct, setHybridGreeningTriggerPct] = useState<number>(0.50);
   const [indicators, setIndicators] = useState<any>({
     rsiVal: 50,
     upper: 0,
@@ -103,7 +118,8 @@ export default function App() {
 
   const [circuitStats, setCircuitStats] = useState({
     cooldownRemaining: 0,
-    cooldownMessage: ""
+    cooldownMessage: "",
+    sessionBlocked: false
   });
 
   const [governorFocusSymbol, setGovernorFocusSymbol] = useState<string>("R_10");
@@ -114,6 +130,7 @@ export default function App() {
 
   // Sub-algorithm Config Modal View States
   const [selectedSubSymbol, setSelectedSubSymbol] = useState<string | null>(null);
+  const [showResetConfirm, setShowResetConfirm] = useState<boolean>(false);
   const [selectedPerfDetail, setSelectedPerfDetail] = useState<string | null>(null);
   const [modalTab, setModalTab] = useState<"tuner" | "history">("tuner");
 
@@ -175,6 +192,15 @@ export default function App() {
       setIdealStrategy(data.idealStrategy);
       setTradingMode(data.tradingMode);
       setIsAuthorized(data.isAuthorized);
+
+      if (data.hybridRiskType !== undefined) setHybridRiskType(data.hybridRiskType);
+      if (data.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(data.hybridRiskFixedAmount);
+      if (data.hybridRiskPercent !== undefined) setHybridRiskPercent(data.hybridRiskPercent);
+      if (data.hybridRewardRatio !== undefined) setHybridRewardRatio(data.hybridRewardRatio);
+      if (data.hybridEarlyCutoffEnabled !== undefined) setHybridEarlyCutoffEnabled(data.hybridEarlyCutoffEnabled);
+      if (data.hybridEarlyCutoffPct !== undefined) setHybridEarlyCutoffPct(data.hybridEarlyCutoffPct);
+      if (data.hybridGreeningTriggerPct !== undefined) setHybridGreeningTriggerPct(data.hybridGreeningTriggerPct);
+
       if (data.indicators) {
         setIndicators(data.indicators);
       }
@@ -187,7 +213,8 @@ export default function App() {
       setCurrentParams(data.parameters);
       setCircuitStats({
         cooldownRemaining: data.circuitBreaker.cooldownRemaining,
-        cooldownMessage: data.circuitBreaker.cooldownMessage
+        cooldownMessage: data.circuitBreaker.cooldownMessage,
+        sessionBlocked: data.circuitBreaker.sessionBlocked
       });
       setGovernorFocusSymbol(data.governorFocusSymbol || "R_10");
       setGovernorStatus(data.governorStatus || "GOVERNING: Active and regulating live sub-algorithms.");
@@ -239,6 +266,21 @@ export default function App() {
     } catch (err) {
       console.error("Failed to update system config:", err);
     }
+  };
+
+  // Synchronise and persist the Sovereign Hybrid Risk Engine properties
+  const saveHybridConfig = async (newConfig: Record<string, any>) => {
+    if (newConfig.hybridRiskType !== undefined) setHybridRiskType(newConfig.hybridRiskType);
+    if (newConfig.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(newConfig.hybridRiskFixedAmount);
+    if (newConfig.hybridRiskPercent !== undefined) setHybridRiskPercent(newConfig.hybridRiskPercent);
+    if (newConfig.hybridRewardRatio !== undefined) setHybridRewardRatio(newConfig.hybridRewardRatio);
+    if (newConfig.hybridEarlyCutoffEnabled !== undefined) setHybridEarlyCutoffEnabled(newConfig.hybridEarlyCutoffEnabled);
+    if (newConfig.hybridEarlyCutoffPct !== undefined) setHybridEarlyCutoffPct(newConfig.hybridEarlyCutoffPct);
+    if (newConfig.hybridGreeningTriggerPct !== undefined) setHybridGreeningTriggerPct(newConfig.hybridGreeningTriggerPct);
+
+    await updateBackendConfig({
+      hybridConfig: newConfig
+    });
   };
 
   const toggleSubAlgorithm = async (targetSymbol: string, currentEnabled: boolean) => {
@@ -299,15 +341,19 @@ export default function App() {
     }
   };
 
-  const forceReset = async () => {
-    if (!window.confirm("Perform automated reset of current live trade statistics, cooldown states, and parameter overrides?")) return;
+  const triggerResetEngine = async () => {
     try {
       await fetch("/api/reset", { method: "POST" });
       setAiReport("");
       fetchState();
+      setShowResetConfirm(false);
     } catch (err) {
       console.error(err);
     }
+  };
+
+  const forceReset = () => {
+    setShowResetConfirm(true);
   };
 
   // Trigger Gemini quantitative analytical report
@@ -317,9 +363,12 @@ export default function App() {
       try {
         const res = await fetch("/api/report-summary");
         if (res.ok) {
-          const data = await res.json();
-          if (data && data.summary) {
-            setReportSummary(data);
+          const contentType = res.headers.get("content-type");
+          if (contentType && contentType.includes("application/json")) {
+            const data = await res.json();
+            if (data && data.summary) {
+              setReportSummary(data);
+            }
           }
         }
       } catch (e) {
@@ -356,11 +405,14 @@ export default function App() {
         try {
           const res = await fetch("/api/report-summary");
           if (res.ok) {
-            const data = await res.json();
-            if (data && data.pdfUrl) {
-              setReportSummary(data);
-              setReportGenerating(false);
-              clearInterval(intervalId);
+            const contentType = res.headers.get("content-type");
+            if (contentType && contentType.includes("application/json")) {
+              const data = await res.json();
+              if (data && data.pdfUrl) {
+                setReportSummary(data);
+                setReportGenerating(false);
+                clearInterval(intervalId);
+              }
             }
           }
         } catch (err) {
@@ -386,8 +438,13 @@ export default function App() {
         body: JSON.stringify({ prompt: promptValue })
       });
       if (res.ok) {
-        const data = await res.json();
-        setAiReport(data.report);
+        const contentType = res.headers.get("content-type");
+        if (contentType && contentType.includes("application/json")) {
+          const data = await res.json();
+          setAiReport(data.report);
+        } else {
+          setAiReport("Error: Server returned non-JSON/HTML response. Verify server status.");
+        }
       }
     } catch (err) {
       setAiReport("Error: Failed to obtain response from server advisory. Verify Server logs.");
@@ -697,9 +754,8 @@ export default function App() {
             className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 text-sm py-1.5 font-mono outline-soft"
           >
             <option value="AUTO">AUTO: Algo Adaptive</option>
+            <option value="HYBRID_LINEAR">HYBRID: Linear (Risk R Sizing)</option>
             <option value="MULTIPLIER">MULT: Multipliers</option>
-            <option value="OPTION">OPTION: Rise / Fall</option>
-            <option value="OPTIONS_DIGITS">DIGITS: Differs / Over / Under</option>
           </select>
 
           {/* Toggle Engine trading State */}
@@ -721,13 +777,43 @@ export default function App() {
           {/* Operational metrics reset */}
           <button
             onClick={forceReset}
-            className="p-1.5 rounded bg-[#1b211f] border border-brand-teal/25 hover:bg-brand-teal/15 text-brand-mint/70 hover:text-red-400 transition cursor-pointer"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-red-900/20 border border-red-550/30 hover:bg-red-950/40 text-red-400 hover:text-red-350 transition cursor-pointer text-xs font-mono font-bold uppercase"
             title="Sovereign Reset Database to default baseline"
           >
-            <RefreshCw className="w-4 h-4" />
+            <RefreshCw className="w-3.5 h-3.5 text-red-405" />
+            Reset Metrics & Logs
           </button>
         </div>
       </header>
+
+      {/* ==========================================
+          POWER-LAW SAFETY HALVING TRIGGER BANNER
+          ========================================== */}
+      {(() => {
+        const criticalSyms = Object.values(subAlgorithms)
+          .filter((s: any) => s.enabled && s.tailExponent !== undefined && s.tailExponent <= 2.2)
+          .map((s: any) => `${s.name} (α̂: ${s.tailExponent.toFixed(2)})`);
+        if (criticalSyms.length === 0) return null;
+        return (
+          <div className="w-full bg-gradient-to-r from-rose-950 to-red-900 border-2 border-red-500 rounded-xl p-5 text-white flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-red-900/40 shadow-lg animate-pulse">
+            <div className="flex items-center gap-4">
+              <span className="text-3xl">⚠️</span>
+              <div>
+                <h3 className="font-display font-black text-lg text-rose-200 tracking-tight">
+                  CRITICAL TAIL RISK DETECTED — HALVING ACTIVE
+                </h3>
+                <p className="text-rose-100 text-sm mt-0.5 max-w-4xl leading-relaxed">
+                  The Hill Estimator on a 500-tick lookback window has detected extreme, infinite-variance fat tails on: <span className="underline font-mono font-bold text-yellow-300">{criticalSyms.join(", ")}</span>. 
+                  Standard stop-losses are highly prone to tail slippage. The **Halving Trigger Protocol** is now dynamically reducing all active trade stakes by **-50%** for capital preservation.
+                </p>
+              </div>
+            </div>
+            <div className="px-4 py-2 rounded bg-red-800 text-xs font-mono font-extrabold uppercase border border-red-400 whitespace-nowrap tracking-wider">
+              🛡️ -50% Stake Protection
+            </div>
+          </div>
+        );
+      })()}
 
       {/* ==========================================
           UPPER BACKDROP CONTAINER (Custom visual background sections)
@@ -938,6 +1024,47 @@ export default function App() {
                       <span className="text-brand-slate/75 font-semibold">Regime:</span>
                       <span className="text-brand-teal font-black uppercase text-xs">{sub.mRegime ? sub.mRegime.replace('_', ' ') : "--"}</span>
                     </div>
+                    <div className="flex justify-between border-t border-brand-slate/10 pt-1 mt-1">
+                      <span className="text-[#581c87] font-semibold">Hurst DFA-1:</span>
+                      <span className="text-[#581c87] font-extrabold">
+                        {sub.hurstVal !== undefined ? sub.hurstVal.toFixed(2) : "--"}{" "}
+                        <span className="text-[9px] text-slate-500 font-normal">(R²: {sub.hurstRSquared !== undefined ? sub.hurstRSquared.toFixed(2) : "--"})</span>
+                      </span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-[#1e1b4b] font-semibold">Hurst R/S (1k):</span>
+                      <span className="text-[#1e1b4b] font-extrabold">
+                        {sub.hurstConfirm !== undefined ? sub.hurstConfirm.toFixed(2) : "--"}
+                      </span>
+                    </div>
+                    {sub.hurstMacro !== undefined && (
+                      <div className="flex justify-between">
+                        <span className="text-[#0369a1] font-semibold">Hurst Macro (2k):</span>
+                        <span className="text-[#0369a1] font-extrabold">
+                          {sub.hurstMacro.toFixed(2)}
+                        </span>
+                      </div>
+                    )}
+                    {sub.convictionScore !== undefined && (
+                      <div className="flex justify-between border-t border-dashed border-brand-slate/10 pt-1 mt-0.5">
+                        <span className="text-[#0f766e] font-bold">SFT-V2 Conv:</span>
+                        <span className="text-[#0f766e] font-black">
+                          {(sub.convictionScore * 100).toFixed(0)}%
+                        </span>
+                      </div>
+                    )}
+                    {sub.tailExponent !== undefined && (
+                      <div className="flex justify-between border-t border-dashed border-brand-slate/10 pt-1 mt-0.5">
+                        <span className="text-[#be2c52] font-semibold">Tail α̂ (Hill):</span>
+                        <span className={`font-extrabold ${
+                          sub.tailExponent >= 3.0 ? "text-emerald-700" :
+                          sub.tailExponent >= 2.2 ? "text-amber-700" :
+                          "text-rose-700 animate-pulse font-black"
+                        }`}>
+                          {sub.tailExponent.toFixed(2)}
+                        </span>
+                      </div>
+                    )}
                   </div>
 
                   {/* Executive action directive message */}
@@ -1037,36 +1164,156 @@ export default function App() {
             </div>
           </div>
 
-          {/* MANUAL DIRECT EXECUTION DIAGNOSTICS */}
-          <div className="bg-slate-900/25 border border-slate-900 rounded p-5">
-            <h3 className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold mb-3">
-              Direct Trade Diagnostics
-            </h3>
-            <p className="text-sm text-slate-400 leading-relaxed mb-4">
-              Instantly broadcast and force place a manual {tradingMode} position on the active index to analyze real-time tick execution speed, stop levels, or multiplier triggers.
-            </p>
-            
-            <div className="grid grid-cols-2 gap-3">
-              <button 
-                onClick={() => fetch("/api/trade", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ direction: "LONG" })
-                }).then(() => fetchState())}
-                className="py-1.5 rounded bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 hover:bg-emerald-500/20 text-sm font-mono font-semibold transition cursor-pointer"
-              >
-                Force LONG Trade
-              </button>
-              <button 
-                onClick={() => fetch("/api/trade", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ direction: "SHORT" })
-                }).then(() => fetchState())}
-                className="py-1.5 rounded bg-red-500/10 border border-red-500/20 text-red-400 hover:bg-red-500/20 text-sm font-mono font-semibold transition cursor-pointer"
-              >
-                Force SHORT Trade
-              </button>
+
+          {/* SOVEREIGN HYBRID RISK ENGINE (SHRE) PROFILE */}
+          <div className="bg-[#111615] border border-brand-teal/20 rounded-xl p-5 shadow-xl space-y-4">
+            <div className="flex items-center justify-between pb-2 border-b border-brand-teal/10">
+              <span className="text-sm uppercase font-mono text-brand-mint font-semibold flex items-center gap-1.5">
+                <ShieldCheck className="w-4 h-4 text-[#10b981]" /> Hybrid Risk Sizing (SHRE)
+              </span>
+              <span className="text-xs font-mono text-brand-teal/80 bg-brand-teal/10 px-2 py-0.5 rounded border border-brand-teal/20">
+                ACTIVE
+              </span>
+            </div>
+
+            <div className="space-y-4 font-mono text-xs text-brand-mint/90">
+              {/* Risk Type Selector */}
+              <div>
+                <label className="text-slate-400 block mb-1.5 text-[10px] uppercase tracking-wider">Risk Allocation Model</label>
+                <div className="grid grid-cols-2 gap-2 bg-[#1b211f] rounded border border-brand-teal/25 p-0.5">
+                  <button
+                    onClick={() => saveHybridConfig({ hybridRiskType: "FIXED" })}
+                    className={`py-1 rounded transition text-center text-[10px] font-bold cursor-pointer ${hybridRiskType === "FIXED" ? "bg-brand-teal text-brand-mint shadow" : "text-brand-mint/50 hover:text-brand-mint"}`}
+                  >
+                    Fixed USD ($)
+                  </button>
+                  <button
+                    onClick={() => saveHybridConfig({ hybridRiskType: "PERCENT" })}
+                    className={`py-1 rounded transition text-center text-[10px] font-bold cursor-pointer ${hybridRiskType === "PERCENT" ? "bg-brand-teal text-brand-mint shadow" : "text-brand-mint/50 hover:text-brand-mint"}`}
+                  >
+                    Equity Pct (%)
+                  </button>
+                </div>
+              </div>
+
+              {/* Risk Input Controls */}
+              {hybridRiskType === "FIXED" ? (
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-slate-400 text-[10px] uppercase tracking-wider">Risk Capital per Trade</label>
+                    <span className="text-brand-gold font-bold text-sm">${hybridRiskFixedAmount.toFixed(1)} USD</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="5"
+                    max="200"
+                    step="5"
+                    value={hybridRiskFixedAmount}
+                    onChange={(e) => saveHybridConfig({ hybridRiskFixedAmount: parseFloat(e.target.value) })}
+                    className="w-full h-1 bg-[#1b211f] rounded-lg appearance-none cursor-pointer accent-brand-teal"
+                  />
+                  <div className="grid grid-cols-4 gap-1 mt-2">
+                    {([10, 25, 50, 100] as const).map((amt) => (
+                      <button
+                        key={amt}
+                        onClick={() => saveHybridConfig({ hybridRiskFixedAmount: amt })}
+                        className={`text-[9px] py-1 rounded border transition-all cursor-pointer ${hybridRiskFixedAmount === amt ? "border-brand-teal bg-brand-teal/10 text-brand-mint" : "border-slate-800 text-slate-500 hover:border-slate-600 hover:text-slate-300"}`}
+                      >
+                        ${amt}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div>
+                  <div className="flex items-center justify-between mb-1.5">
+                    <label className="text-slate-400 text-[10px] uppercase tracking-wider">Risk Fraction of Equity</label>
+                    <span className="text-brand-gold font-bold text-sm">
+                      {hybridRiskPercent.toFixed(1)}% (${(balance * hybridRiskPercent / 100).toFixed(2)})
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.2"
+                    max="5"
+                    step="0.1"
+                    value={hybridRiskPercent}
+                    onChange={(e) => saveHybridConfig({ hybridRiskPercent: parseFloat(e.target.value) })}
+                    className="w-full h-1 bg-[#1b211f] rounded-lg appearance-none cursor-pointer accent-brand-teal"
+                  />
+                  <div className="grid grid-cols-4 gap-1 mt-2">
+                    {([0.5, 1.0, 2.0, 3.0] as const).map((pct) => (
+                      <button
+                        key={pct}
+                        onClick={() => saveHybridConfig({ hybridRiskPercent: pct })}
+                        className={`text-[9px] py-1 rounded border transition-all cursor-pointer ${hybridRiskPercent === pct ? "border-brand-teal bg-brand-teal/10 text-brand-mint" : "border-slate-800 text-slate-500 hover:border-slate-600 hover:text-slate-300"}`}
+                      >
+                        {pct}%
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Reward Ratio Input */}
+              <div className="pt-2 pb-1 border-y border-brand-teal/10">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-slate-400 text-[10px] uppercase tracking-wider">Target Return Ratio</span>
+                  <span className="text-[#10b981] font-bold text-sm">
+                    {hybridRewardRatio}R (${((hybridRiskType === "FIXED" ? hybridRiskFixedAmount : (balance * hybridRiskPercent / 100)) * hybridRewardRatio).toFixed(2)})
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="1.5"
+                  max="6"
+                  step="0.5"
+                  value={hybridRewardRatio}
+                  onChange={(e) => saveHybridConfig({ hybridRewardRatio: parseFloat(e.target.value) })}
+                  className="w-full h-1 bg-[#1b211f] rounded-lg appearance-none cursor-pointer accent-brand-teal"
+                />
+              </div>
+
+              {/* Adverse Excursion Cutoff Toggle */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-slate-400 text-[10px] uppercase tracking-wider">15% Adverse Cutoff</span>
+                  <button
+                    onClick={() => saveHybridConfig({ hybridEarlyCutoffEnabled: !hybridEarlyCutoffEnabled })}
+                    className={`px-2 py-0.5 rounded text-[9px] uppercase font-bold transition cursor-pointer ${hybridEarlyCutoffEnabled ? "bg-red-500/10 border border-red-500/20 text-red-400" : "bg-slate-800 text-slate-400"}`}
+                  >
+                    {hybridEarlyCutoffEnabled ? "ENABLED" : "DISABLED"}
+                  </button>
+                </div>
+                {hybridEarlyCutoffEnabled && (
+                  <p className="text-[10px] text-slate-400 leading-relaxed bg-[#1b211f]/40 p-2 rounded border border-brand-teal/10">
+                    🛡️ Clamps maximum exposure drawdown to <span className="text-red-400 font-semibold">15% of your SL</span>. Max potential loss capped at -${((hybridRiskType === "FIXED" ? hybridRiskFixedAmount : (balance * hybridRiskPercent / 100)) * 0.15).toFixed(2)}.
+                  </p>
+                )}
+              </div>
+
+              {/* Greening Profit Trail */}
+              <div>
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="text-slate-400 text-[10px] uppercase tracking-wider">Greening Trigger</span>
+                  <span className="text-emerald-400 font-bold">
+                    {(hybridGreeningTriggerPct * 100).toFixed(0)}% of R
+                  </span>
+                </div>
+                <input
+                  type="range"
+                  min="0.25"
+                  max="1.0"
+                  step="0.05"
+                  value={hybridGreeningTriggerPct}
+                  onChange={(e) => saveHybridConfig({ hybridGreeningTriggerPct: parseFloat(e.target.value) })}
+                  className="w-full h-1 bg-[#1b211f] rounded-lg appearance-none cursor-pointer accent-brand-teal"
+                />
+                <p className="text-[10px] text-slate-400 leading-relaxed mt-1.5">
+                  ⭐ Moving Stop Loss to entry once you gain <span className="text-[#10b981] font-semibold">{(hybridGreeningTriggerPct * 100).toFixed(0)}% of R profit</span>. Secures the trade as 100% risk free.
+                </p>
+              </div>
+
             </div>
           </div>
 
@@ -1218,20 +1465,20 @@ export default function App() {
         </section>
 
         {/* MIDDLE COLUMN: EXPOSURES, SIGNAL CONFLUENCE SCOREBOARD & PARAMS (SPAN 5) */}
-        <section className="lg:col-span-5 space-y-6">
-          
+        <section className="lg:col-span-5 flex flex-col space-y-6 min-h-[800px]">
+
           {/* Active exposure slot */}
-          <div className="bg-slate-900/25 border border-slate-900 rounded p-5">
-            <span className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold flex items-center gap-1.5 mb-4">
+          <div className="bg-slate-900/25 border border-slate-900 rounded p-5 flex flex-col flex-1 shadow-2xl">
+            <span className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold flex items-center gap-1.5 mb-4 border-b border-indigo-500/20 pb-3">
               <Activity className="w-3.5 h-3.5" /> Open Exposure Ledger
             </span>
 
             {activePositions.length === 0 ? (
-              <div className="text-center py-8 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-500 text-sm font-mono">
+              <div className="flex-1 flex items-center justify-center py-12 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-500 text-sm font-mono tracking-widest uppercase">
                 No active stochastic contracts currently open
               </div>
             ) : (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4 auto-rows-max overflow-y-auto pr-1">
                 {activePositions.map((pos, idx) => {
                   const isProfit = pos.pnl >= 0;
                   return (
@@ -1239,7 +1486,7 @@ export default function App() {
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
                           <span className={`px-2 py-0.5 rounded text-sm font-mono font-bold ${pos.direction === "LONG" ? "bg-emerald-500/10 text-emerald-400" : "bg-red-500/10 text-red-400"}`}>
-                            {pos.direction} {pos.multiplier ? `${pos.multiplier}x` : ""}
+                            {pos.isHybridLinear ? "HYBRID " : ""}{pos.direction} {pos.multiplier ? `${pos.multiplier}x` : ""}
                           </span>
                           <span className="text-base font-mono text-slate-300 font-semibold">{pos.symbol}</span>
                         </div>
@@ -1255,9 +1502,15 @@ export default function App() {
 
                       <div className="flex items-center justify-between border-t border-slate-800/80 pt-2">
                         <div className="flex flex-col">
-                          <span className="text-sm text-slate-400 font-mono">Allocated Stake: ${pos.stake.toFixed(2)}</span>
-                          <span className={`text-base font-mono font-bold mt-0.5 ${isProfit ? "text-emerald-400" : "text-red-400"}`}>
-                            PnL: {isProfit ? "+" : ""}${pos.pnl.toFixed(2)}
+                          {pos.isHybridLinear ? (
+                            <span className="text-xs text-slate-400 font-mono">
+                              Risk R-Unit: ${pos.targetRiskAmount!.toFixed(2)} (Stake/Margin: ${pos.stake.toFixed(2)})
+                            </span>
+                          ) : (
+                            <span className="text-xs text-slate-400 font-mono">Allocated Stake: ${pos.stake.toFixed(2)}</span>
+                          )}
+                          <span className={`text-base font-mono font-bold mt-0.5 ${isProfit ? "text-[#10b981]" : "text-red-400"}`}>
+                            PnL: {isProfit ? "+" : ""}${pos.pnl.toFixed(2)} {pos.isHybridLinear ? `(${(pos.pnl / pos.targetRiskAmount!).toFixed(2)}R)` : ""}
                           </span>
                         </div>
                         <button
@@ -1280,7 +1533,78 @@ export default function App() {
             )}
           </div>
 
+          {/* TEMPORAL & DURATION ANALYTICS (PHASE 1) */}
+          <div className="bg-slate-900/40 border border-[#1e293b] rounded-xl p-5 shadow-xl space-y-4 shrink-0 transition-all duration-300 hover:shadow-cyan-900/10">
+            <span className="text-sm uppercase font-mono text-fuchsia-400 tracking-wider font-bold flex items-center gap-1.5 border-b border-[#1e293b] pb-2">
+              <Clock className="w-3.5 h-3.5" /> Temporal & Duration Diagnostics
+            </span>
+            {completedTrades.length === 0 ? (
+              <div className="text-center py-6 bg-slate-950/30 rounded border border-slate-800 border-dashed text-slate-500 text-[10px] font-mono">
+                Awaiting temporal data stream from network settled blocks...
+              </div>
+            ) : (() => {
+              const wins = completedTrades.filter(t => t.pnl > 0);
+              const losses = completedTrades.filter(t => t.pnl <= 0);
+              
+              const calcAvgDur = (arr: TradeRecord[]) => arr.length > 0 ? arr.reduce((sum, t) => sum + (t.exitEpoch - t.entryEpoch), 0) / arr.length : 0;
+              const formatDur = (s: number) => {
+                if(s === 0) return "--";
+                if(s < 60) return `${Math.round(s)}s`;
+                return `${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+              };
 
+              const avgWinDur = calcAvgDur(wins);
+              const avgLossDur = calcAvgDur(losses);
+              const durations = completedTrades.map(t => t.exitEpoch - t.entryEpoch);
+              const longestTrade = durations.length > 0 ? Math.max(...durations) : 0;
+              const validFastDurations = durations.filter(d => d > 0);
+              const fastestExecution = validFastDurations.length > 0 ? Math.min(...validFastDurations) : 0;
+
+              const quickCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) < 180).length;
+              const midCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) >= 180 && (t.exitEpoch - t.entryEpoch) <= 480).length;
+              const longCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) > 480).length;
+
+              return (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="bg-[#121614] rounded border border-emerald-500/20 p-3">
+                      <span className="text-[10px] uppercase font-mono text-emerald-500/60 block mb-1">Avg Win Duration</span>
+                      <span className="text-emerald-400 font-mono font-bold text-lg">{formatDur(avgWinDur)}</span>
+                    </div>
+                    <div className="bg-[#121614] rounded border border-red-500/20 p-3">
+                      <span className="text-[10px] uppercase font-mono text-red-500/60 block mb-1">Avg Loss Duration</span>
+                      <span className="text-red-400 font-mono font-bold text-lg">{formatDur(avgLossDur)}</span>
+                    </div>
+                  </div>
+                  
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-slate-500">Longest Settlement Session</span>
+                      <span className="text-slate-300 font-semibold">{formatDur(longestTrade)}</span>
+                    </div>
+                    <div className="flex items-center justify-between text-xs font-mono">
+                      <span className="text-slate-500">Fastest Market RoundTrip</span>
+                      <span className="text-fuchsia-400 font-semibold">{formatDur(fastestExecution)}</span>
+                    </div>
+                  </div>
+
+                  {/* Distribution Bar */}
+                  <div className="pt-2 border-t border-slate-900">
+                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-500 mb-1.5 uppercase tracking-wider">
+                      <span>Quick &lt;3m ({quickCount})</span>
+                      <span>Mid 3-8m ({midCount})</span>
+                      <span>Long &gt;8m ({longCount})</span>
+                    </div>
+                    <div className="w-full h-2 rounded-full flex overflow-hidden border border-slate-800 bg-slate-950">
+                       {quickCount > 0 && <div className="bg-emerald-500/80 transition-all" style={{ width: `${(quickCount / completedTrades.length) * 100}%` }} />}
+                       {midCount > 0 && <div className="bg-indigo-500/80 transition-all" style={{ width: `${(midCount / completedTrades.length) * 100}%` }} />}
+                       {longCount > 0 && <div className="bg-fuchsia-500/80 transition-all" style={{ width: `${(longCount / completedTrades.length) * 100}%` }} />}
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
 
         </section>
 
@@ -1288,17 +1612,24 @@ export default function App() {
         <section className="lg:col-span-3 space-y-6">
           
           {/* Diagnostic status block for circuit breakers */}
-          {circuitStats.cooldownRemaining > 0 && (
-            <div className="p-4 rounded bg-red-600/10 border border-red-500/20 text-sm font-mono space-y-1">
+          {(circuitStats.cooldownRemaining > 0 || circuitStats.sessionBlocked) && (
+            <div className={`p-4 rounded border text-sm font-mono space-y-1 ${circuitStats.sessionBlocked ? 'bg-red-950/40 border-red-500 shadow-red-900/50 shadow-lg' : 'bg-red-600/10 border-red-500/20'}`}>
               <div className="flex items-center gap-1.5 text-red-400 font-semibold">
-                <ShieldAlert className="w-4 h-4" /> LOCKOUT BREAKER TRIGGERED
+                <ShieldAlert className="w-4 h-4" /> {circuitStats.sessionBlocked ? 'TERMINAL BLOCK' : 'LOCKOUT BREAKER TRIGGERED'}
               </div>
               <p className="text-sm text-red-400/80 leading-relaxed">
                 {circuitStats.cooldownMessage}
               </p>
-              <div className="text-sm text-slate-400">
-                Cool down clearance trace: {circuitStats.cooldownRemaining}s
-              </div>
+              {!circuitStats.sessionBlocked && (
+                <div className="text-sm text-slate-400">
+                  Cool down clearance trace: {circuitStats.cooldownRemaining}s
+                </div>
+              )}
+              {circuitStats.sessionBlocked && (
+                <div className="text-sm text-red-300 font-bold mt-2 pt-2 border-t border-red-900/50">
+                  Trading is permanently disabled for this session due to crossing catastrophic loss limits. Please manually reset the session.
+                </div>
+              )}
             </div>
           )}
 
@@ -1599,9 +1930,13 @@ export default function App() {
                 <span className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold flex items-center gap-1.5">
                   <Settings className="w-3.5 h-3.5" /> Engine System log streams
                 </span>
-                <span className="text-[10px] font-mono text-slate-500 bg-slate-950/40 px-2 py-0.5 rounded border border-slate-900">
-                  SCROLL TO RE-AUDIT
-                </span>
+                <button
+                  onClick={forceReset}
+                  className="text-[10px] font-mono font-bold text-red-400 bg-red-950/20 hover:bg-red-950/50 px-2.5 py-1 rounded border border-red-550/30 transition cursor-pointer"
+                  title="Wipe current metrics from engine, reset balance, and purge database logs"
+                >
+                  RESET METRICS & WIPE LOGS
+                </button>
               </div>
 
               <div ref={logsContainerRef} className="w-full flex-1 bg-slate-950 rounded border border-slate-900 p-3 overflow-y-auto font-mono text-xs text-slate-400 space-y-1 scroll-smooth">
@@ -1934,6 +2269,227 @@ export default function App() {
               )}
             </div>
           </div>
+        </section>
+
+        {/* ==========================================
+            PHASE 2: ANALYTICS, DISTRIBUTIONS & MACRO RISK
+            ========================================== */}
+        <section className="lg:col-span-12 w-full grid grid-cols-1 xl:grid-cols-2 gap-6 mt-6 min-w-0">
+          
+          {/* LEFT SIDE: Leaderboards & Distributions */}
+          <div className="flex flex-col gap-6 min-w-0">
+            {/* LEADERBOARDS & EFFICACY */}
+            <div className="bg-slate-900/25 border border-slate-900 rounded p-5 flex flex-col">
+              <span className="text-sm uppercase font-mono text-fuchsia-400 tracking-wider font-semibold flex items-center gap-1.5 mb-4 border-b border-slate-800 pb-2">
+                <Award className="w-3.5 h-3.5" /> Sub-Algorithm Leaderboards & Efficacy
+              </span>
+              
+              {completedTrades.length === 0 ? (
+                <div className="h-32 flex items-center justify-center text-slate-500 font-mono text-xs uppercase animate-pulse">
+                  Awaiting algorithmic trade executions...
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-sm font-mono text-slate-400">
+                    <thead className="bg-[#121614] text-slate-500 text-[10px] uppercase border-y border-slate-900/60 shadow-lg">
+                      <tr>
+                        <th className="px-3 py-2 font-semibold">Sub-Model (Asset)</th>
+                        <th className="px-3 py-2 text-center font-semibold">Trades</th>
+                        <th className="px-3 py-2 text-center font-semibold">Efficacy %</th>
+                        <th className="px-3 py-2 text-right font-semibold">Net Yield</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-900">
+                      {(() => {
+                        const map: Record<string, { trades: number, wins: number, pnl: number }> = {};
+                        completedTrades.forEach(t => {
+                          if (!map[t.symbol]) map[t.symbol] = { trades: 0, wins: 0, pnl: 0 };
+                          map[t.symbol].trades++;
+                          if (t.pnl > 0) map[t.symbol].wins++;
+                          map[t.symbol].pnl += t.pnl;
+                        });
+                        const rows = Object.entries(map).sort((a,b) => b[1].pnl - a[1].pnl);
+                        return rows.map(([sym, d], i) => (
+                          <tr key={sym} className="hover:bg-slate-950/40 transition-colors">
+                            <td className="px-3 py-2">
+                              <span className="text-slate-300 font-bold">{sym}</span>
+                              <span className="text-[10px] text-slate-500 hidden sm:block truncate max-w-[120px]">
+                                {INSTRUMENTS[sym as keyof typeof INSTRUMENTS]?.name || sym}
+                              </span>
+                            </td>
+                            <td className="px-3 py-2 text-center text-indigo-300">{d.trades}</td>
+                            <td className="px-3 py-2 text-center font-bold">
+                              {(d.trades > 0 ? (d.wins / d.trades) * 100 : 0).toFixed(1)}%
+                            </td>
+                            <td className={`px-3 py-2 text-right font-bold ${d.pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                              {d.pnl >= 0 ? "+" : ""}${d.pnl.toFixed(2)}
+                            </td>
+                          </tr>
+                        ));
+                      })()}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+
+            {/* OUTCOME & EXECUTION DISTRIBUTION */}
+            <div className="bg-slate-900/25 border border-slate-900 rounded p-5 flex flex-col flex-1">
+              <span className="text-sm uppercase font-mono text-cyan-400 tracking-wider font-semibold flex items-center gap-1.5 mb-4 border-b border-slate-800 pb-2">
+                <PieChart className="w-3.5 h-3.5" /> Outcome & Execution Distribution
+              </span>
+              
+              {completedTrades.length === 0 ? (
+                <div className="flex-1 flex items-center justify-center text-slate-500 font-mono text-xs uppercase animate-pulse mt-4">
+                  No distributions processed.
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 flex-1">
+                  {/* Long vs Short PnL breakdown */}
+                  <div className="bg-slate-950/30 border border-slate-900 rounded p-3">
+                    <span className="text-[10px] uppercase font-mono text-slate-500 block mb-3 text-center border-b border-slate-900 pb-1">Directional Bias</span>
+                    <div className="h-[120px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart
+                          data={(() => {
+                            const longWins = completedTrades.filter(t => t.direction === "LONG" && t.pnl > 0).length;
+                            const longLoss = completedTrades.filter(t => t.direction === "LONG" && t.pnl <= 0).length;
+                            const shortWins = completedTrades.filter(t => t.direction === "SHORT" && t.pnl > 0).length;
+                            const shortLoss = completedTrades.filter(t => t.direction === "SHORT" && t.pnl <= 0).length;
+                            return [
+                              { name: 'LONG', Wins: longWins, Loss: longLoss },
+                              { name: 'SHORT', Wins: shortWins, Loss: shortLoss }
+                            ];
+                          })()}
+                          margin={{ top: 0, right: 0, left: 0, bottom: 0 }}
+                        >
+                          <XAxis dataKey="name" fontSize={9} tickLine={false} axisLine={false} stroke="#64748b" />
+                          <RechartsTooltip contentStyle={{ backgroundColor:"#020617", fontSize: '10px', borderColor:"#1e293b", color: "#cbd5e1" }} itemStyle={{color: "#38bdf8"}}/>
+                          <Bar dataKey="Wins" stackId="a" fill="#10b981" radius={[0, 0, 4, 4]} />
+                          <Bar dataKey="Loss" stackId="a" fill="#ef4444" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* Exit Reason breakdown */}
+                  <div className="bg-slate-950/30 border border-slate-900 rounded p-3">
+                    <span className="text-[10px] uppercase font-mono text-slate-500 block mb-3 text-center border-b border-slate-900 pb-1">Settlement Catalyst</span>
+                    <div className="h-[120px] w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart
+                          layout="vertical"
+                          data={(() => {
+                            const reasons: Record<string, number> = {};
+                            completedTrades.forEach(t => {
+                              reasons[t.exitReason] = (reasons[t.exitReason] || 0) + 1;
+                            });
+                            return Object.entries(reasons).map(([k, v]) => ({ name: k.replace('_', ' '), count: v }));
+                          })()}
+                          margin={{ top: 0, right: 10, left: -10, bottom: 0 }}
+                        >
+                          <XAxis type="number" hide />
+                          <YAxis dataKey="name" type="category" width={75} fontSize={8} tickLine={false} axisLine={false} stroke="#64748b" />
+                          <RechartsTooltip contentStyle={{ backgroundColor:"#020617", fontSize: '10px', borderColor:"#1e293b", color: "#cbd5e1" }} itemStyle={{color: "#c084fc"}}/>
+                          <Bar dataKey="count" fill="#a855f7" radius={[0, 4, 4, 0]}>
+                            {completedTrades.length > 0 && (() => {
+                              const reasons: Record<string, number> = {};
+                              completedTrades.forEach(t => reasons[t.exitReason] = (reasons[t.exitReason] || 0) + 1);
+                              return Object.entries(reasons).map((entry, index) => (
+                                  <Cell key={`cell-${index}`} fill={["#a855f7", "#3b82f6", "#14b8a6", "#f59e0b"][index % 4]} />
+                              ));
+                            })()}
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* RIGHT SIDE: MACRO RISK FOCUS & VOLATILITY EQUITY CURVE */}
+          <div className="bg-slate-900/40 border border-indigo-900/30 rounded p-5 flex flex-col justify-between overflow-hidden shadow-2xl relative min-w-0">
+            <div className="absolute inset-x-0 bottom-0 top-1/2 bg-gradient-to-t from-indigo-950/20 to-transparent pointer-events-none" />
+            <div className="flex flex-col xl:flex-row items-center justify-between z-10 space-y-4 xl:space-y-0">
+              <div className="text-center xl:text-left">
+                <span className="text-sm uppercase font-mono text-indigo-400 tracking-widest font-bold flex items-center justify-center xl:justify-start gap-2">
+                  <Activity className="w-4 h-4 text-indigo-500" /> Macro Risk & Volatility Dispersion
+                </span>
+                <span className="text-xs text-slate-500 font-sans block mt-1">
+                  Absolute capital variance and Sharpe-weighted distribution profiling across the session.
+                </span>
+              </div>
+              
+              {completedTrades.length > 0 && (() => {
+                const wins = completedTrades.filter(t => t.pnl > 0);
+                const losses = completedTrades.filter(t => t.pnl <= 0);
+                const grossWins = wins.reduce((sum, t) => sum + t.pnl, 0);
+                const grossLosses = Math.abs(losses.reduce((sum, t) => sum + t.pnl, 0));
+                const pf = grossLosses === 0 ? (grossWins > 0 ? "3.00+" : "0.00") : (grossWins / grossLosses).toFixed(2);
+                
+                return (
+                  <div className="flex bg-[#0f1411] border border-slate-800 rounded-lg shadow-inner shadow-black/50 p-2 gap-2 sm:gap-4 shrink-0">
+                    <div className="flex flex-col items-center justify-center px-2 sm:px-4">
+                      <span className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Profit Factor</span>
+                      <span className={`text-sm font-bold font-mono ${parseFloat(pf) >= 1.5 ? "text-emerald-400" : (parseFloat(pf) >= 1.0 ? "text-indigo-300" : "text-rose-400")}`}>{pf}</span>
+                    </div>
+                    <div className="flex items-center">
+                      <div className="w-px h-6 bg-slate-800" />
+                    </div>
+                    <div className="flex flex-col items-center justify-center px-2 sm:px-4">
+                      <span className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Drawdown Risk</span>
+                      <span className="text-sm font-bold font-mono text-rose-500">{stats.maxDrawdown}%</span>
+                    </div>
+                    <div className="flex items-center">
+                      <div className="w-px h-6 bg-slate-800" />
+                    </div>
+                    <div className="flex flex-col items-center justify-center px-2 sm:px-4">
+                      <span className="text-[9px] uppercase tracking-wider text-slate-500 mb-1">Max Return</span>
+                      <span className="text-sm font-bold font-mono text-emerald-400">
+                        +${wins.length > 0 ? Math.max(...wins.map(w => w.pnl)).toFixed(2) : "0.00"}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })()}
+            </div>
+            
+            {/* Drawdown relative map */}
+            <div className="flex-1 w-full pt-8 z-10 min-h-[350px]">
+              {completedTrades.length < 2 ? (
+                <div className="w-full h-full flex items-center justify-center border border-dashed border-slate-900 rounded bg-slate-950/20">
+                  <span className="text-slate-600 text-xs font-mono uppercase tracking-widest animate-pulse">Waiting for sufficient population...</span>
+                </div>
+              ) : (
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart
+                    data={completedTrades.map((t, idx) => ({
+                      name: `T${idx+1}`,
+                      value: t.pnl,
+                      fill: t.pnl > 0 ? "#10b981" : "#ef4444"
+                    }))}
+                    margin={{ top: 10, right: 10, left: -20, bottom: 0 }}
+                  >
+                    <CartesianGrid strokeDasharray="3 3" stroke="#0f172a" vertical={false} />
+                    <XAxis dataKey="name" stroke="#475569" fontSize={8} tickLine={false} axisLine={false} />
+                    <YAxis stroke="#475569" fontSize={8} tickLine={false} axisLine={false} tickFormatter={(v) => `$${v}`} />
+                    <RechartsTooltip 
+                       contentStyle={{ backgroundColor:"#020617", fontSize: '10px', borderColor:"#1e293b", color: "#cbd5e1" }}
+                       cursor={{fill: "#1e293b", opacity: 0.4}}
+                    />
+                    <Bar dataKey="value" name="Tick Settlement Return">
+                      {completedTrades.map((t, index) => (
+                        <Cell key={`cell-${index}`} fill={t.pnl >= 0 ? "#10b981" : "#ef4444"} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              )}
+            </div>
+          </div>
+
         </section>
 
       </footer>
@@ -2312,10 +2868,52 @@ export default function App() {
                               {sub.adxVal ? sub.adxVal.toFixed(2) : "N/A"} (Trend: {sub.adxVal > 25 ? "STRONG" : "NORMAL"})
                             </span>
                           </div>
-                          <div className="flex justify-between">
+                          <div className="flex justify-between pb-1 border-b border-slate-900/40">
                             <span className="text-slate-500">ATR Volatility Index value:</span>
                             <span className="text-slate-200 font-semibold">{sub.atrVal ? sub.atrVal.toFixed(4) : "N/A"}</span>
                           </div>
+                          <div className="flex justify-between pb-1 border-b border-slate-900/40">
+                            <span className="text-[#c084fc]">Hurst DFA-1 (Rolling):</span>
+                            <span className="text-purple-400 font-bold">
+                              {sub.hurstVal !== undefined ? sub.hurstVal.toFixed(3) : "N/A"}{" "}
+                              <span className="text-slate-500 text-xs font-normal">(R²: {sub.hurstRSquared !== undefined ? sub.hurstRSquared.toFixed(4) : "N/A"})</span>
+                            </span>
+                          </div>
+                          <div className="flex justify-between pb-1 border-b border-slate-900/40">
+                            <span className="text-indigo-400">Hurst R/S (Confirmation):</span>
+                            <span className="text-indigo-300 font-bold">{sub.hurstConfirm !== undefined ? sub.hurstConfirm.toFixed(3) : "N/A"}</span>
+                          </div>
+                          {sub.hurstMacro !== undefined && (
+                            <div className="flex justify-between pb-1 border-b border-slate-900/40">
+                              <span className="text-sky-400">Hurst Macro (2k-tick):</span>
+                              <span className="text-sky-300 font-bold">{sub.hurstMacro.toFixed(3)}</span>
+                            </div>
+                          )}
+                          {sub.convictionScore !== undefined && (
+                            <div className="flex justify-between pb-1 border-b border-slate-900/40">
+                              <span className="text-emerald-400 font-semibold">SFT-V2 Convición Score:</span>
+                              <span className="text-emerald-300 font-black">{(sub.convictionScore * 100).toFixed(1)}%</span>
+                            </div>
+                          )}
+                          {sub.tailExponent !== undefined && (
+                            <div className="flex justify-between">
+                              <span className="text-rose-400 font-semibold">Tail α̂ (Hill Exponent):</span>
+                              <span className={`font-black ${
+                                sub.tailExponent >= 3.0 ? "text-emerald-400" :
+                                sub.tailExponent >= 2.2 ? "text-amber-400" :
+                                "text-rose-500 animate-pulse"
+                              }`}>
+                                {sub.tailExponent.toFixed(3)}{" "}
+                                <span className="text-[10px] font-normal opacity-80">
+                                  ({
+                                    sub.tailExponent >= 3.0 ? "Moderate" :
+                                    sub.tailExponent >= 2.2 ? "Heavy" :
+                                    "Critical (Extreme)"
+                                  })
+                                </span>
+                              </span>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -2936,6 +3534,57 @@ export default function App() {
           </div>
         );
       })()}
+
+      {/* ==========================================
+          SOVEREIGN SYSTEM CLEAN SLATE TRIGGER CONFIRMATION MODAL
+          ========================================== */}
+      {showResetConfirm && (
+        <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-4 z-50">
+          <div className="bg-[#111615] border border-red-500/20 rounded-xl max-w-md w-full p-6 shadow-2xl relative space-y-4">
+            <div className="flex items-center gap-3 pb-3 border-b border-brand-teal/10">
+              <div className="p-2 rounded bg-red-950/30 border border-red-500/20">
+                <ShieldAlert className="w-5 h-5 text-red-100" />
+              </div>
+              <div>
+                <h3 className="text-sm uppercase font-mono text-red-400 font-bold tracking-wider">
+                  Sovereign Clean Slate Init
+                </h3>
+                <p className="text-[10px] uppercase font-mono text-slate-500">
+                  Critical Reset Execution Sequence
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 font-mono text-xs leading-relaxed text-slate-300">
+              <p>
+                You are initiating a <span className="text-red-400 font-semibold uppercase">complete database & stats overhaul</span>. 
+                This action is irreversible and performs the following routines:
+              </p>
+              <ul className="list-disc list-inside space-y-1 bg-[#1b211f]/50 p-3 rounded border border-brand-teal/10 text-slate-400">
+                <li>Wipes all active, pending, and past trade history logs</li>
+                <li>Resets demo/simulated virtual balance back to <span className="text-[#10b981] font-bold">$10,000.00</span></li>
+                <li>Synchronises live Deriv WS status stream and clears cooldown locks</li>
+                <li>Wipes the remote cloud database <span className="text-indigo-405">sovereign_trades</span> table on your Connected Supabase instances</li>
+              </ul>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 pt-4">
+              <button
+                onClick={() => setShowResetConfirm(false)}
+                className="px-4 py-2 border border-slate-800 bg-slate-950 text-slate-400 hover:text-slate-200 hover:bg-slate-900 transition-all rounded text-xs font-mono font-medium cursor-pointer"
+              >
+                Cancel, Abort
+              </button>
+              <button
+                onClick={triggerResetEngine}
+                className="px-4 py-2 bg-gradient-to-r from-red-650 to-rose-700 hover:from-red-505 hover:to-rose-600 shadow-md text-white transition-all rounded text-xs font-mono font-bold cursor-pointer uppercase"
+              >
+                Force Reset Now
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );
