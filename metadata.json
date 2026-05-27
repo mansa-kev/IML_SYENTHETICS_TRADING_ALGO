@@ -1,6 +1,6 @@
 {
   "name": "Sovereign Trade Engine",
-  "description": "An automated regime-adaptive trading bot and simulation workstation for synthetic indices. Features interactive live streaming, walk-forward backtesting, circuit breakers, and an adaptive machine-learning optimizer with server-side Gemini AI analysis.",
+  "description": "An automated regime-adaptive trading bot for synthetic indices. Features interactive live streaming, circuit breakers, and an adaptive machine-learning optimizer with server-side Gemini AI analysis.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

@@ -12,13 +12,6 @@ export enum MarketRegime {
   TRANSITION = "transition",
 }
 
-export interface Tick {
-  symbol: string;
-  price: number;
-  epoch: number;
-  tickIndex: number;
-}
-
 export interface Candle {
   symbol: string;
   epoch: number;
@@ -77,24 +70,6 @@ export interface TradeRecord {
   tickStreamSnapshot?: number[]; // To store raw price data for ML off-platform
 }
 
-export interface SessionStats {
-  sessionId: string;
-  symbol: string;
-  startEpoch: number;
-  tradingEnabled: boolean;
-  totalTrades: number;
-  winningTrades: number;
-  winningPnl: number;
-  losingPnl: number;
-  winRate: number;
-  totalPnl: number;
-  maxDrawdown: number;
-  avgStake: number;
-  consecutiveLosses: number;
-  consecutiveWins: number;
-  regimeStats: Record<string, { trades: number; wins: number; pnl: number }>;
-}
-
 export interface LearningParams {
   rsiOversoldThreshold: number;   // default: 33, range: [25, 42]
   rsiOverboughtThreshold: number;  // default: 67, range: [58, 75]
@@ -104,32 +79,6 @@ export interface LearningParams {
   minConfluenceScore: number;       // default: 4 (require 4 of 5 signals)
   atrStopMultiplier: number;        // default: 1.5
   regimeAdxThreshold: number;       // default: 20
-}
-
-export interface CircuitBreakerStats {
-  sessionStartBalance: number;
-  sessionLossLimitPct: number;    // default 0.03 (3%)
-  dailyLossLimitPct: number;      // default 0.05 (5%)
-  maxConsecutiveLosses: number;   // default 5
-  cooldownRemaining: number;      // in seconds. 0 if ok
-  cooldownMessage: string;
-  peakBalance: number;
-  sessionBlocked?: boolean;
-}
-
-export interface BacktestResult {
-  symbol: string;
-  tickCount: number;
-  totalTrades: number;
-  winningTrades: number;
-  winRate: number;
-  initialBalance: number;
-  finalBalance: number;
-  totalPnl: number;
-  maxDrawdown: number;
-  sharpeRatio: number;
-  profitFactor: number;
-  trades: TradeRecord[];
 }
 
 export interface InstrumentConfig {
@@ -192,4 +141,3 @@ export interface SubAlgorithm {
   kamaValue?: number; // Kaufman Adaptive Moving Average
   tailExponent?: number; // Hill Estimator tail exponent (alpha hat)
 }
-

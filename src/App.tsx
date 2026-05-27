@@ -16,7 +16,6 @@ import {
   TrendingUp, 
   Cpu, 
   Sparkles, 
-  BookOpen, 
   AlertCircle, 
   HelpCircle, 
   ArrowUpRight, 
@@ -91,7 +90,8 @@ export default function App() {
   });
   const [riskPreset, setRiskPreset] = useState<"CONSERVATIVE" | "MODERATE" | "AGGRESSIVE">("MODERATE");
   const [currentRegime, setCurrentRegime] = useState<MarketRegime>(MarketRegime.RANGING);
-  const [currentPrice, setCurrentPrice] = useState<number>(100.00);
+  const [currentPrice, setCurrentPrice] = useState<number | null>(null);
+  const [liveDataReady, setLiveDataReady] = useState<boolean>(false);
   
   const [activePositions, setActivePositions] = useState<ActivePosition[]>([]);
   const [completedTrades, setCompletedTrades] = useState<TradeRecord[]>([]);
@@ -150,16 +150,13 @@ export default function App() {
   const [editRiskMultiplier, setEditRiskMultiplier] = useState<number>(1.0);
   const [editLearningFactor, setEditLearningFactor] = useState<number>(1.0);
 
-  // Ticks Buffer for rendering charts (local updates)
+  // Tick buffer for rendering live charts
   const [tickHistory, setTickHistory] = useState<number[]>([]);
 
   // Gemini active states
   const [aiPrompt, setAiPrompt] = useState<string>("");
   const [aiReport, setAiReport] = useState<string>("");
-  const [reportSummary, setReportSummary] = useState<any>(null);
   const [aiLoading, setAiLoading] = useState<boolean>(false);
-  const [reportGenerating, setReportGenerating] = useState<boolean>(false);
-  const [loaderStep, setLoaderStep] = useState<string>("INITIALIZING AUDIT...");
 
   // Server Live connection state
   const [serverConnected, setServerConnected] = useState<boolean>(true);
@@ -207,6 +204,7 @@ export default function App() {
       setRiskPreset(data.riskPreset);
       setCurrentRegime(data.regime);
       setCurrentPrice(data.currentPrice);
+      setLiveDataReady(Boolean(data.liveDataReady));
       setActivePositions(data.activePositions);
       setCompletedTrades(data.completedTrades);
       setStats(data.stats);
@@ -268,7 +266,7 @@ export default function App() {
     }
   };
 
-  // Synchronise and persist the Sovereign Hybrid Risk Engine properties
+  // Synchronise Sovereign Hybrid Risk Engine properties for this live session
   const saveHybridConfig = async (newConfig: Record<string, any>) => {
     if (newConfig.hybridRiskType !== undefined) setHybridRiskType(newConfig.hybridRiskType);
     if (newConfig.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(newConfig.hybridRiskFixedAmount);
@@ -356,79 +354,6 @@ export default function App() {
     setShowResetConfirm(true);
   };
 
-  // Trigger Gemini quantitative analytical report
-  // Poll for report summary
-  useEffect(() => {
-    const fetchSummary = async () => {
-      try {
-        const res = await fetch("/api/report-summary");
-        if (res.ok) {
-          const contentType = res.headers.get("content-type");
-          if (contentType && contentType.includes("application/json")) {
-            const data = await res.json();
-            if (data && data.summary) {
-              setReportSummary(data);
-            }
-          }
-        }
-      } catch (e: any) {
-        // If it's a transient fetch error (like during restart), we don't want to spam console too much
-        if (e.message !== "Failed to fetch") {
-          console.error("Failed to fetch report summary", e);
-        }
-      }
-    };
-    fetchSummary();
-    const interval = setInterval(fetchSummary, 12000); // Poll every 12s
-    return () => clearInterval(interval);
-  }, []);
-
-  const handleForceReport = async () => {
-    setReportGenerating(true);
-    setLoaderStep("AWAKENING SOVEREIGN MOTHER ALGORITHM...");
-    try {
-      const startRes = await fetch("/api/force-report", { method: "POST" });
-      if (!startRes.ok) throw new Error("Trigger failed");
-
-      const steps = [
-        "PARSING SETTLED LEDGER RECENTS (114 AUDITS)...",
-        "COMPILING RECURSIVE PERFORMANCE MILESTONES...",
-        "DERIVING MATRIX REGIME MATCH ACCURACY...",
-        "MODELING VECTOR EQUITY PROGRESSION CHART...",
-        "SYNTHESIZING PARADIGM REFINEMENT COGNITION...",
-        "RENDERING ENERGETIC ROADMAP PDF DOCUMENT..."
-      ];
-
-      let stepIdx = 0;
-      const intervalId = setInterval(async () => {
-        if (stepIdx < steps.length) {
-          setLoaderStep(steps[stepIdx]);
-          stepIdx++;
-        }
-        try {
-          const res = await fetch("/api/report-summary");
-          if (res.ok) {
-            const contentType = res.headers.get("content-type");
-            if (contentType && contentType.includes("application/json")) {
-              const data = await res.json();
-              if (data && data.pdfUrl) {
-                setReportSummary(data);
-                setReportGenerating(false);
-                clearInterval(intervalId);
-              }
-            }
-          }
-        } catch (err) {
-          console.error("Polling error", err);
-        }
-      }, 1500);
-
-    } catch (err) {
-      console.error(err);
-      setReportGenerating(false);
-      alert("Sovereign analytical trigger pipeline failed.");
-    }
-  };
 
   const requestAiReview = async (customPrompt?: string) => {
     const promptValue = customPrompt || aiPrompt || "Provide an overall pattern breakdown of my trade book and explain strategy performance across regimes.";
@@ -469,9 +394,9 @@ export default function App() {
   }, [logs]);
 
   // ==========================================
-  // MATHEMATICAL ESTIMATION (LOCAL CHARTING CALCULATIONS)
+  // MATHEMATICAL ESTIMATION (CLIENT CHARTING CALCULATIONS)
   // ==========================================
-  // Draw simple overlay Bollinger Bands locally to map directly on ticks buffer for gorgeous lines trace
+  // Draw simple overlay Bollinger Bands from the live tick buffer
   const computeChartOverlays = () => {
     if (tickHistory.length < 20) return { prices: tickHistory, uppers: [], lowers: [], mids: [] };
 
@@ -728,6 +653,12 @@ export default function App() {
                 DERIV AUTH: {isAuthorized ? "AUTHORIZED" : "OBSERVER ONLY"}
               </span>
             </span>
+            <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold">
+              <span className={`w-2 h-2 rounded-full ${liveDataReady ? "bg-emerald-400 animate-pulse" : "bg-amber-500"}`}></span>
+              <span className={liveDataReady ? "text-brand-mint" : "text-amber-300"}>
+                LIVE DATA: {liveDataReady ? "STREAMING" : "WAITING"}
+              </span>
+            </span>
           </div>
           <p className="text-brand-mint/65 text-sm mt-1 selection:bg-indigo-500">
             Research-Informed, Regime-Adaptive Mean Reversion Terminal for Deriv Synthetic Indices.
@@ -764,7 +695,8 @@ export default function App() {
           {/* Toggle Engine trading State */}
           <button
             onClick={() => updateBackendConfig({ enabled: !tradingEnabled })}
-            className={`flex items-center gap-1.5 px-4 py-1.5 rounded text-sm font-semibold cursor-pointer transition ${tradingEnabled ? "bg-red-650 hover:bg-red-700 text-white" : "bg-brand-gold hover:bg-brand-gold/90 text-brand-slate font-bold"}`}
+            disabled={!isAuthorized && !tradingEnabled}
+            className={`flex items-center gap-1.5 px-4 py-1.5 rounded text-sm font-semibold transition ${!isAuthorized && !tradingEnabled ? "bg-slate-800 text-slate-500 cursor-not-allowed" : tradingEnabled ? "bg-red-650 hover:bg-red-700 text-white cursor-pointer" : "bg-brand-gold hover:bg-brand-gold/90 text-brand-slate font-bold cursor-pointer"}`}
           >
             {tradingEnabled ? (
               <>
@@ -772,7 +704,7 @@ export default function App() {
               </>
             ) : (
               <>
-                <Play className="w-3.5 h-3.5 fill-current" /> START TRADING
+                <Play className="w-3.5 h-3.5 fill-current" /> {isAuthorized ? "START TRADING" : "LIVE AUTH REQUIRED"}
               </>
             )}
           </button>
@@ -781,7 +713,7 @@ export default function App() {
           <button
             onClick={forceReset}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-red-900/20 border border-red-550/30 hover:bg-red-950/40 text-red-400 hover:text-red-350 transition cursor-pointer text-xs font-mono font-bold uppercase"
-            title="Sovereign Reset Database to default baseline"
+            title="Reset current session metrics (live-data-only mode)"
           >
             <RefreshCw className="w-3.5 h-3.5 text-red-405" />
             Reset Metrics & Logs
@@ -821,7 +753,7 @@ export default function App() {
       {/* ==========================================
           UPPER BACKDROP CONTAINER (Custom visual background sections)
           ========================================== */}
-      <div id="upper-bg-section" className="w-full flex flex-col space-y-6 bg-cover bg-center bg-no-repeat transition-all p-5 md:p-6 lg:p-8 rounded-2xl border border-brand-teal/20 shadow-2xl" style={{ backgroundImage: "linear-gradient(rgba(17, 21, 19, 0.84), rgba(17, 21, 19, 0.84)), url('/input_file_1.png')" }}>
+      <div id="upper-bg-section" className="w-full flex flex-col space-y-6 bg-cover bg-center bg-no-repeat transition-all p-5 md:p-6 lg:p-8 rounded-2xl border border-brand-teal/20 shadow-2xl" style={{ backgroundImage: "linear-gradient(rgba(17, 21, 19, 0.84), rgba(17, 21, 19, 0.84))" }}>
 
         {/* METRICS DASHBOARD STRIP (Unique colors per card below header) */}
         <section className="w-full max-w-none grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1104,7 +1036,7 @@ export default function App() {
                 <LineChartIcon className="w-3.5 h-3.5" /> Market Price Workspace
               </span>
               <span className="text-brand-mint text-sm font-mono font-medium">
-                Live: {currentPrice.toFixed(2)} pts
+                Live: {currentPrice === null ? "Waiting for Deriv ticks" : `${currentPrice.toFixed(2)} pts`}
               </span>
             </div>
 
@@ -1611,7 +1543,7 @@ export default function App() {
 
         </section>
 
-        {/* RIGHT COLUMN: REVIEWS, PROGRESSIVE BACKTEST WORKSPACE, & AI CO-PILOT (SPAN 3) */}
+        {/* RIGHT COLUMN: REVIEWS, LIVE ANALYTICS WORKSPACE, & AI CO-PILOT (SPAN 3) */}
         <section className="lg:col-span-3 space-y-6">
           
           {/* Diagnostic status block for circuit breakers */}
@@ -1780,138 +1712,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Sovereign System Report Telemetry Card */}
-          <div className="bg-[#0b0f19] border border-cyan-500/30 rounded-xl p-5 shadow-2xl space-y-5 relative overflow-hidden font-mono text-xs">
-            {/* Background cyan/indigo ambient light effects */}
-            <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-2xl pointer-events-none" />
-            <div className="absolute bottom-0 left-0 w-32 h-32 bg-indigo-500/5 rounded-full blur-2xl pointer-events-none" />
-
-            {/* Title / Telemetry Header */}
-            <div className="flex items-center justify-between border-b border-cyan-500/20 pb-3">
-              <div className="flex items-center gap-2">
-                <div className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
-                <span className="text-cyan-400 font-bold tracking-widest text-xs uppercase">
-                  SOVEREIGN III • ANALYTICAL DIODE
-                </span>
-              </div>
-              <span className="text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-950 border border-slate-800">
-                MD_ENG_v3.2
-              </span>
-            </div>
-
-            {reportGenerating ? (
-              <div className="flex flex-col items-center justify-center py-10 space-y-4">
-                <RefreshCw className="w-8 h-8 animate-spin text-cyan-400" />
-                <div className="text-center space-y-1">
-                  <p className="text-[11px] text-cyan-300 tracking-wider animate-pulse">{loaderStep}</p>
-                  <p className="text-[9px] text-slate-500 uppercase">DO NOT TERMINATE CLIENT CONNECTION</p>
-                </div>
-                {/* Simulated digital bar */}
-                <div className="w-full bg-slate-950 h-1.5 rounded overflow-hidden border border-slate-800 max-w-[240px]">
-                  <div className="bg-cyan-400 h-full animate-[shimmer_1.5s_infinite] w-4/5 rounded" />
-                </div>
-              </div>
-            ) : reportSummary ? (
-              <div className="space-y-4">
-                {/* Summary narrative */}
-                <div className="p-3 bg-slate-950/60 rounded border border-cyan-500/10 space-y-2">
-                  <div className="flex items-center justify-between text-[10px] text-slate-400 border-b border-slate-900 pb-1.5">
-                    <span>NARRATIVE INTER-CRITIQUE</span>
-                    <span className="text-emerald-400">STATUS: VERIFIED</span>
-                  </div>
-                  <p className="text-slate-300 leading-relaxed text-[11px] font-sans">
-                    {reportSummary.summary}
-                  </p>
-                </div>
-
-                {/* Performance stats bento grid */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-[11px]">
-                  <div className="p-2 rounded bg-slate-950 border border-slate-900">
-                    <span className="block text-slate-500 text-[9px] uppercase">Yields</span>
-                    <span className={`block font-bold mt-0.5 ${parseFloat(reportSummary.totalPnl) >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                      ${reportSummary.totalPnl}
-                    </span>
-                  </div>
-                  <div className="p-2 rounded bg-slate-950 border border-slate-900">
-                    <span className="block text-slate-500 text-[9px] uppercase">Accuracy</span>
-                    <span className="block font-bold text-cyan-400 mt-0.5">
-                      {reportSummary.winRate}%
-                    </span>
-                  </div>
-                  <div className="p-2 rounded bg-[#0f172a] border border-cyan-500/15">
-                    <span className="block text-slate-400 text-[9px] uppercase">Max Drawdown</span>
-                    <span className="block font-bold text-amber-500 mt-0.5">
-                      -{reportSummary.maxDrawdown}%
-                    </span>
-                  </div>
-                  <div className="p-2 rounded bg-slate-950 border border-slate-900">
-                    <span className="block text-slate-500 text-[9px] uppercase">Factor</span>
-                    <span className="block font-bold text-[#6366f1] mt-0.5">
-                      {reportSummary.profitFactor}
-                    </span>
-                  </div>
-                </div>
-
-                {/* 100-Trade Refinement Milestones */}
-                <div className="space-y-2">
-                  <span className="text-[10px] uppercase text-cyan-400 font-bold tracking-wider block">
-                    100-TRADE SEGMENT REFINEMENT LOG
-                  </span>
-                  <div className="space-y-1.5">
-                    {(reportSummary.milestones || []).map((milestone: any, i: number) => (
-                      <div key={i} className="flex items-center justify-between p-2 rounded bg-slate-950/70 border border-slate-900 text-[10px] leading-tight hover:border-cyan-500/20 transition-all">
-                        <div className="flex items-center gap-2">
-                          <span className="text-slate-500">#{i + 1}</span>
-                          <span className="text-slate-300 font-semibold">Epoch {milestone.batch}</span>
-                        </div>
-                        <div className="flex items-center gap-3">
-                          <span className="text-slate-400">Win: <b className="text-cyan-400 font-semibold">{milestone.winRate}%</b></span>
-                          <span className="text-slate-400">PnL: <b className="text-emerald-400 font-semibold">${milestone.pnl}</b></span>
-                          <span className="text-emerald-400 font-bold px-1.5 py-0.5 rounded bg-emerald-500/5 border border-emerald-500/10 text-[9px]">
-                            EFF: +{milestone.efficiency}%
-                          </span>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Action panel */}
-                <div className="flex flex-col sm:flex-row gap-2 pt-2">
-                  <a
-                    href={reportSummary.pdfUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex-1 text-center py-2.5 bg-gradient-to-r from-cyan-500/20 to-indigo-500/20 hover:from-cyan-500/30 hover:to-indigo-500/30 border border-cyan-400/40 hover:border-cyan-400 text-cyan-200 rounded text-[11px] font-bold tracking-wider uppercase transition-all shadow-lg shadow-cyan-500/10 flex items-center justify-center gap-1.5"
-                  >
-                    <BookOpen className="w-3.5 h-3.5" /> Open Detailed Report PDF
-                  </a>
-                  <button
-                    onClick={handleForceReport}
-                    className="px-4 py-2.5 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-400 hover:text-cyan-400 rounded text-[11px] font-bold tracking-wider uppercase transition-all flex items-center justify-center gap-1.5"
-                  >
-                    <RefreshCw className="w-3 h-3" /> Re-Diagnose Engine
-                  </button>
-                </div>
-              </div>
-            ) : (
-              <div className="flex flex-col items-center justify-center py-12 space-y-4">
-                <div className="w-10 h-10 rounded-full bg-slate-950 flex items-center justify-center border border-slate-800 text-slate-600">
-                  <Cpu className="w-5 h-5 text-cyan-500/50 animate-pulse" />
-                </div>
-                <div className="text-center space-y-1">
-                  <p className="text-slate-400 font-bold uppercase tracking-wider text-[11px]">Sovereign Diagnostics Inert</p>
-                  <p className="text-slate-500 text-[10px]">Settled trade volume logged: {completedTrades.length || 114} trades</p>
-                </div>
-                <button
-                  onClick={handleForceReport}
-                  className="px-5 py-2.5 bg-cyan-950/40 hover:bg-cyan-900/60 border border-cyan-400/30 hover:border-cyan-400 text-cyan-300 rounded text-[10px] uppercase tracking-wider font-bold transition-all shadow-md flex items-center gap-1.5"
-                >
-                  <ShieldAlert className="w-3.5 h-3.5" /> Force Generate Report Summary
-                </button>
-              </div>
-            )}
-          </div>
 
         </section>
       </main>
@@ -1921,7 +1721,7 @@ export default function App() {
       {/* ==========================================
           LOWER SECTION: SYSTEM LOGS & HISTORICAL trade ledger (Custom background sections)
           ========================================== */}
-      <div id="lower-bg-section" className="w-full bg-[#121614]/85 backdrop-blur-md border border-brand-slate/45 rounded-2xl p-5 md:p-6 lg:p-8 bg-cover bg-center bg-no-repeat transition-all shadow-xl" style={{ backgroundImage: "linear-gradient(rgba(17, 21, 19, 0.88), rgba(17, 21, 19, 0.88)), url('/input_file_0.png')" }}>
+      <div id="lower-bg-section" className="w-full bg-[#121614]/85 backdrop-blur-md border border-brand-slate/45 rounded-2xl p-5 md:p-6 lg:p-8 bg-cover bg-center bg-no-repeat transition-all shadow-xl" style={{ backgroundImage: "linear-gradient(rgba(17, 21, 19, 0.88), rgba(17, 21, 19, 0.88))" }}>
         <footer className="w-full max-w-none grid grid-cols-1 lg:grid-cols-12 gap-6">
           
           {/* LOGS TERMINAL & SELF-IMPROVEMENT STACKS (SPAN 4) */}
@@ -1936,7 +1736,7 @@ export default function App() {
                 <button
                   onClick={forceReset}
                   className="text-[10px] font-mono font-bold text-red-400 bg-red-950/20 hover:bg-red-950/50 px-2.5 py-1 rounded border border-red-550/30 transition cursor-pointer"
-                  title="Wipe current metrics from engine, reset balance, and purge database logs"
+                  title="Reset session metrics and logs (no persistent storage)"
                 >
                   RESET METRICS & WIPE LOGS
                 </button>
@@ -2850,7 +2650,7 @@ export default function App() {
                           <div className="flex justify-between pb-1 border-b border-slate-900/40">
                             <span className="text-slate-500">Asset Spot Value:</span>
                             <span className="text-slate-200 font-bold">
-                              {sub.rsiVal ? (INSTRUMENTS[selectedSubSymbol as keyof typeof INSTRUMENTS]?.basePrice || 100).toFixed(2) : "Calculating..."}
+                              {selectedSubSymbol === symbol && currentPrice !== null ? currentPrice.toFixed(2) : "Waiting for live ticks"}
                             </span>
                           </div>
                           <div className="flex justify-between pb-1 border-b border-slate-900/40">
@@ -2922,7 +2722,7 @@ export default function App() {
 
                       {/* ADAPTIVE RISK MATHEMATICS SHEET */}
                       {(() => {
-                        const spotPrice = INSTRUMENTS[selectedSubSymbol as keyof typeof INSTRUMENTS]?.basePrice || 100;
+                        const spotPrice = selectedSubSymbol === symbol && currentPrice !== null ? currentPrice : 0;
                         const currentAtr = sub.atrVal || 0.5;
                         const atrBuffer = currentAtr * editAtrStop;
                         const stopLossDistance = Math.max(spotPrice * 0.003, atrBuffer);
@@ -3261,7 +3061,7 @@ export default function App() {
         const wr = sub.recentWinRate || 0;
         const winRatePct = wr * 100;
         
-        // Define hardcoded INSTRUMENTS object fallback
+        // Define display labels for instruments
         const titleName = selectedPerfDetail === "R_10" ? "Volatility 10 Index" :
                           selectedPerfDetail === "R_25" ? "Volatility 25 Index" :
                           selectedPerfDetail === "R_75" ? "Volatility 75 Index" :
@@ -3300,7 +3100,7 @@ export default function App() {
           },
           R_25: {
             desc: "Compression Wave Mean Reverter focused on Volatility Index 25. Takes positions at Bollinger edges when momentum shows exhaustion signs.",
-            strengths: ["Aesthetic mean reversion precision", "Filters noisy fakeouts using RSI boundaries", "Vigorous ranging optimization ratio"],
+            strengths: ["Aesthetic mean reversion precision", "Filters noisy whipsaws using RSI boundaries", "Vigorous ranging optimization ratio"],
             behavior: "Waits patiently for extreme standard deviation expansions on a 20-period scale before committing capital. Strict limit safeguards."
           },
           R_75: {
@@ -3560,14 +3360,14 @@ export default function App() {
 
             <div className="space-y-3 font-mono text-xs leading-relaxed text-slate-300">
               <p>
-                You are initiating a <span className="text-red-400 font-semibold uppercase">complete database & stats overhaul</span>. 
+                You are initiating a <span className="text-red-400 font-semibold uppercase">current session metrics reset</span>.
                 This action is irreversible and performs the following routines:
               </p>
               <ul className="list-disc list-inside space-y-1 bg-[#1b211f]/50 p-3 rounded border border-brand-teal/10 text-slate-400">
                 <li>Wipes all active, pending, and past trade history logs</li>
-                <li>Resets demo/simulated virtual balance back to <span className="text-[#10b981] font-bold">$10,000.00</span></li>
+                <li>Clears only the current in-memory session metrics and overrides</li>
                 <li>Synchronises live Deriv WS status stream and clears cooldown locks</li>
-                <li>Wipes the remote cloud database <span className="text-indigo-405">sovereign_trades</span> table on your Connected Supabase instances</li>
+                <li>No local or cloud persistence is written after reset</li>
               </ul>
             </div>
 

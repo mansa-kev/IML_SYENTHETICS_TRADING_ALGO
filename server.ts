@@ -6,13 +6,10 @@
 import express from "express";
 import path from "path";
 import dotenv from "dotenv";
-import fs from "fs";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm } from "./src/types/sovereign.js";
-import { createClient } from "@supabase/supabase-js";
-import PDFDocument from "pdfkit";
+import { MarketRegime, Candle, ActivePosition, TradeRecord, LearningParams, SubAlgorithm } from "./src/types/sovereign.js";
 
 dotenv.config();
 
@@ -22,7 +19,7 @@ app.use(express.json());
 const PORT = 3000;
 
 // ==========================================
-// SYSTEM STATE & DATABASES (IN-MEMORY STORES WITH RECENT LOGGING)
+// SYSTEM STATE (LIVE SESSION ONLY)
 // ==========================================
 let balance = 10000.00;
 let peakBalance = 10000.00;
@@ -37,7 +34,6 @@ let hybridRewardRatio = 3.0; // 3R target payout
 let hybridEarlyCutoffEnabled = true;
 let hybridEarlyCutoffPct = 0.15; // 15% of R adverse excursion limit
 let hybridGreeningTriggerPct = 0.20; // 20% of R greening break-even trigger
-let simulationSpeed = 1; // Real-time standard
 let riskPreset = "MODERATE" as "CONSERVATIVE" | "MODERATE" | "AGGRESSIVE";
 
 // Active systems
@@ -319,456 +315,6 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
   },
 };
 
-const PERSISTENCE_FILE = path.join(process.cwd(), "state_persistence.json");
-
-// Supabase Database Connection and Client Setup
-let supabaseClient: any = null;
-const supabaseUrl = process.env.SUPABASE_URL;
-
-// Support all standard Supabase key environment variables for robustness
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_KEY;
-
-if (supabaseUrl && supabaseKey) {
-  try {
-    supabaseClient = createClient(supabaseUrl, supabaseKey);
-    console.log("[SUPABASE] Connected successfully to Cloud Supabase DB Client!");
-  } catch (err) {
-    console.warn("[SUPABASE_INIT] Dynamic loading failed. Running without cloud DB fallback:", err);
-  }
-} else {
-  console.log("[SUPABASE] No SUPABASE_URL or SUPABASE_KEY/SUPABASE_ANON_KEY detected in env. Local persistence active.");
-}
-
-function isMissingTableError(error: any): boolean {
-  if (!error) return false;
-  const msg = (error.message || "").toLowerCase();
-  return (
-    error.code === "PGRST116" ||
-    msg.includes("relation") ||
-    msg.includes("not found") ||
-    msg.includes("not find") ||
-    msg.includes("schema cache") ||
-    msg.includes("does not exist")
-  );
-}
-
-function isRLSError(error: any): boolean {
-  if (!error) return false;
-  const msg = (error.message || "").toLowerCase();
-  return msg.includes("row-level security") || msg.includes("rls");
-}
-
-let lastInstructionLogged = 0;
-let lastRLSInstructionLogged = 0;
-
-function logSupabaseRLSInstructions() {
-  const now = Date.now();
-  if (now - lastRLSInstructionLogged < 300000) return;
-  lastRLSInstructionLogged = now;
-  
-  const instruction = [
-    `[SUPABASE RLS ERROR] ⚠️ Cannot write to Supabase due to Row-Level Security policy!`,
-    `To fix this, go to Supabase SQL Editor and run:`,
-    ``,
-    `-- Disable RLS if you only use this project privately for the bot:`,
-    `ALTER TABLE sovereign_state DISABLE ROW LEVEL SECURITY;`,
-    `ALTER TABLE sovereign_trades DISABLE ROW LEVEL SECURITY;`,
-    `ALTER TABLE sovereign_strategy_history DISABLE ROW LEVEL SECURITY;`,
-    ``,
-    `-- OR, create an open policy for the bot:`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_state FOR ALL USING (true) WITH CHECK (true);`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_trades FOR ALL USING (true) WITH CHECK (true);`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_strategy_history FOR ALL USING (true) WITH CHECK (true);`,
-    ``,
-    `Alternatively, place your SUPABASE_SERVICE_ROLE_KEY into the Environment logic instead of SUPABASE_ANON_KEY to fully bypass RLS.`
-  ];
-  
-  console.log("\n==========================================================================");
-  instruction.forEach(line => console.log(line));
-  console.log("==========================================================================\n");
-}
-function logSupabaseSetupInstructions() {
-  const now = Date.now();
-  if (now - lastInstructionLogged < 300000) return; // limit logging to once every 5 minutes to prevent spam
-  lastInstructionLogged = now;
-  
-  const instruction = [
-    `[SUPABASE] ⚠️ Table 'sovereign_state' or 'sovereign_trades' does not exist yet.`,
-    `Please run the following SQL schema in your Supabase SQL Editor to enable full session cloud backups:`,
-    ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_state (`,
-    `  id text PRIMARY KEY,`,
-    `  data jsonb NOT NULL,`,
-    `  updated_at timestamp with time zone DEFAULT now()`,
-    `);`,
-    ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_trades (`,
-    `  id text PRIMARY KEY,`,
-    `  symbol text NOT NULL,`,
-    `  contract_type text,`,
-    `  direction text NOT NULL,`,
-    `  entry_epoch bigint,`,
-    `  exit_epoch bigint,`,
-    `  entry_price numeric,`,
-    `  exit_price numeric,`,
-    `  stake numeric,`,
-    `  pnl numeric,`,
-    `  exit_reason text,`,
-    `  rsi_at_entry numeric,`,
-    `  bb_pct_at_entry numeric,`,
-    `  adx_at_entry numeric,`,
-    `  regime_at_entry text,`,
-    `  is_hybrid_linear boolean DEFAULT false,`,
-    `  target_risk_amount numeric,`,
-    `  hybrid_position_size numeric,`,
-    `  tick_stream jsonb,`,
-    `  created_at timestamp with time zone DEFAULT now()`,
-    `);`,
-    ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_strategy_history (`,
-    `  id bigserial PRIMARY KEY,`,
-    `  epoch_recorded bigint NOT NULL,`,
-    `  global_parameters jsonb,`,
-    `  sub_algorithms jsonb,`,
-    `  created_at timestamp with time zone DEFAULT now()`,
-    `);`
-  ];
-  
-  console.log("\n==========================================================================");
-  instruction.forEach(line => console.log(line));
-  console.log("==========================================================================\n");
-  
-  logs.push(`[SUPABASE_INFO] Setup instructions logged to backend terminal. Run the SQL schema in Supabase!`);
-}
-
-async function saveStateToSupabase() {
-  if (!supabaseClient) return;
-  try {
-    const subAlgState = Object.keys(subAlgorithms).reduce((acc, key) => {
-      const sub = subAlgorithms[key];
-      acc[key] = {
-        enabled: sub.enabled,
-        rsiOversoldThreshold: sub.rsiOversoldThreshold,
-        rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
-        bbPeriod: sub.bbPeriod,
-        bbStd: sub.bbStd,
-        minConfluenceScore: sub.minConfluenceScore,
-        atrStopMultiplier: sub.atrStopMultiplier,
-        learningAdjustmentFactor: sub.learningAdjustmentFactor,
-        targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
-        targetLossPct: sub.targetLossPct,
-        timeExitEnabled: sub.timeExitEnabled,
-        breakEvenEnabled: sub.breakEvenEnabled,
-        trailingStopEnabled: sub.trailingStopEnabled,
-        maxTicksInTrade: sub.maxTicksInTrade,
-        totalTrades: sub.totalTrades,
-        winningTrades: sub.winningTrades,
-        totalPnl: sub.totalPnl,
-        recentWinRate: sub.recentWinRate,
-        consecutiveLosses: sub.consecutiveLosses,
-        consecutiveWins: sub.consecutiveWins
-      };
-      return acc;
-    }, {} as Record<string, any>);
-
-    const dataToSave = {
-      balance,
-      peakBalance,
-      tradingEnabled,
-      selectedSymbol,
-      tradingMode,
-      riskPreset,
-      hybridRiskType,
-      hybridRiskFixedAmount,
-      hybridRiskPercent,
-      hybridRewardRatio,
-      hybridEarlyCutoffEnabled,
-      hybridEarlyCutoffPct,
-      hybridGreeningTriggerPct,
-      activePositions,
-      completedTrades,
-      currentParams,
-      logs: logs.slice(-2000), // keep plenty of logs in database
-      subAlgorithmsParams: subAlgState
-    };
-
-    const { error } = await supabaseClient
-      .from("sovereign_state")
-      .upsert({ id: "dashboard", data: dataToSave, updated_at: new Date().toISOString() });
-
-    if (error) {
-      if (isMissingTableError(error)) {
-        logSupabaseSetupInstructions();
-      } else if (isRLSError(error)) {
-        logSupabaseRLSInstructions();
-      } else {
-        console.error("[SUPABASE_SAVE_ERROR]", error.message);
-      }
-    }
-  } catch (err: any) {
-    console.error("[SUPABASE_SAVE_ERROR] Failed to write sovereign session state to Supabase:", err);
-  }
-}
-
-async function saveStrategyHistoryToSupabase() {
-  if (!supabaseClient) return;
-  try {
-    const strategyData = {
-      epoch_recorded: Math.floor(Date.now() / 1000),
-      global_parameters: currentParams,
-      sub_algorithms: Object.keys(subAlgorithms).reduce((acc, key) => {
-        const sub = subAlgorithms[key];
-        acc[key] = {
-          rsiOversoldThreshold: sub.rsiOversoldThreshold,
-          rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
-          bbStd: sub.bbStd,
-          minConfluenceScore: sub.minConfluenceScore,
-          targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
-          recentWinRate: sub.recentWinRate,
-        };
-        return acc;
-      }, {} as Record<string, any>)
-    };
-
-    const { error } = await supabaseClient
-      .from("sovereign_strategy_history")
-      .insert([strategyData]);
-
-    if (error) {
-       // Silent fail if table not exist, as we log the general setup instruction
-       if (!isMissingTableError(error)) {
-         console.warn("[SUPABASE_STRATEGY_HISTORY]", error.message);
-       }
-    }
-  } catch (e) {
-    // Ignore history push errors
-  }
-}
-
-async function saveTradeToSupabase(record: TradeRecord) {
-  if (!supabaseClient) return;
-  try {
-    const { error } = await supabaseClient
-      .from("sovereign_trades")
-      .upsert({
-        id: record.id,
-        symbol: record.symbol,
-        contract_type: record.contractType,
-        direction: record.direction,
-        entry_epoch: record.entryEpoch,
-        exit_epoch: record.exitEpoch,
-        entry_price: record.entryPrice,
-        exit_price: record.exitPrice,
-        stake: record.stake,
-        pnl: record.pnl,
-        exit_reason: record.exitReason,
-        rsi_at_entry: record.rsiAtEntry,
-        bb_pct_at_entry: record.bbPctAtEntry,
-        adx_at_entry: record.adxAtEntry,
-        regime_at_entry: record.regimeAtEntry,
-        is_hybrid_linear: record.isHybridLinear || false,
-        target_risk_amount: record.targetRiskAmount || null,
-        hybrid_position_size: record.hybridPositionSize || null,
-        tick_stream: record.tickStreamSnapshot || [],
-        created_at: new Date().toISOString()
-      });
-    if (error) {
-      if (isMissingTableError(error)) {
-        logSupabaseSetupInstructions();
-      } else if (isRLSError(error)) {
-        logSupabaseRLSInstructions();
-      } else {
-        console.error("[SUPABASE_TRADE_PERSIST_ERROR]", error.message);
-      }
-    }
-  } catch (err: any) {
-    console.error("[SUPABASE_TRADE_PERSIST_ERROR] Exception saving trade to Supabase:", err);
-  }
-}
-
-async function loadStateFromSupabase() {
-  if (!supabaseClient) return;
-  try {
-    console.log("[SUPABASE] Checking for persistent session state on Cloud DB...");
-    const { data, error } = await supabaseClient
-      .from("sovereign_state")
-      .select("data")
-      .eq("id", "dashboard")
-      .maybeSingle();
-
-    if (error) {
-      if (isMissingTableError(error)) {
-        logSupabaseSetupInstructions();
-      } else {
-        console.warn("[SUPABASE_RESTORE] Error reading state:", error.message);
-      }
-      return;
-    }
-
-    if (data && data.data) {
-      const loaded = data.data;
-      if (loaded.balance !== undefined) balance = loaded.balance;
-      if (loaded.peakBalance !== undefined) peakBalance = loaded.peakBalance;
-      if (loaded.tradingEnabled !== undefined) tradingEnabled = loaded.tradingEnabled;
-      if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
-      if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
-      if (loaded.riskPreset !== undefined) riskPreset = loaded.riskPreset;
-      if (loaded.hybridRiskType !== undefined) hybridRiskType = loaded.hybridRiskType;
-      if (loaded.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = loaded.hybridRiskFixedAmount;
-      if (loaded.hybridRiskPercent !== undefined) hybridRiskPercent = loaded.hybridRiskPercent;
-      if (loaded.hybridRewardRatio !== undefined) hybridRewardRatio = loaded.hybridRewardRatio;
-      if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
-      if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
-      if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
-      if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
-      if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
-      if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
-      if (loaded.logs !== undefined) {
-        logs = loaded.logs;
-        logs.push(`[${new Date().toISOString()}] State recovered successfully from Cloud Supabase Database.`);
-      }
-      if (loaded.subAlgorithmsParams !== undefined) {
-        Object.keys(loaded.subAlgorithmsParams).forEach(key => {
-          if (subAlgorithms[key]) {
-            Object.assign(subAlgorithms[key], loaded.subAlgorithmsParams[key]);
-            if (subAlgorithms[key].minConfluenceScore > 4) {
-              subAlgorithms[key].minConfluenceScore = 4;
-            }
-          }
-        });
-      }
-      if (currentParams && currentParams.minConfluenceScore > 4) {
-        currentParams.minConfluenceScore = 4;
-      }
-      console.log("[SUPABASE] Recovered session database state successfully on boot.");
-    } else {
-      console.log("[SUPABASE] No prior dashboard document found on Cloud DB. Syncing initial state...");
-      await saveStateToSupabase();
-    }
-  } catch (err) {
-    console.error("[SUPABASE_RESTORE_ERROR] Failed to recover state from Supabase:", err);
-  }
-}
-
-function saveStateToDisk() {
-  try {
-    const dataToSave = {
-      balance,
-      peakBalance,
-      tradingEnabled,
-      selectedSymbol,
-      tradingMode,
-      riskPreset,
-      hybridRiskType,
-      hybridRiskFixedAmount,
-      hybridRiskPercent,
-      hybridRewardRatio,
-      hybridEarlyCutoffEnabled,
-      hybridEarlyCutoffPct,
-      hybridGreeningTriggerPct,
-      activePositions,
-      completedTrades,
-      currentParams,
-      logs: logs.slice(-2000), // increased to preserve more history
-      subAlgorithmsParams: Object.keys(subAlgorithms).reduce((acc, key) => {
-        const sub = subAlgorithms[key];
-        acc[key] = {
-          enabled: sub.enabled,
-          rsiOversoldThreshold: sub.rsiOversoldThreshold,
-          rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
-          bbPeriod: sub.bbPeriod,
-          bbStd: sub.bbStd,
-          minConfluenceScore: sub.minConfluenceScore,
-          atrStopMultiplier: sub.atrStopMultiplier,
-          learningAdjustmentFactor: sub.learningAdjustmentFactor,
-          targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
-          targetLossPct: sub.targetLossPct,
-          timeExitEnabled: sub.timeExitEnabled,
-          breakEvenEnabled: sub.breakEvenEnabled,
-          trailingStopEnabled: sub.trailingStopEnabled,
-          maxTicksInTrade: sub.maxTicksInTrade,
-          totalTrades: sub.totalTrades,
-          winningTrades: sub.winningTrades,
-          totalPnl: sub.totalPnl,
-          recentWinRate: sub.recentWinRate,
-          consecutiveLosses: sub.consecutiveLosses,
-          consecutiveWins: sub.consecutiveWins
-        };
-        return acc;
-      }, {} as Record<string, any>)
-    };
-    fs.writeFileSync(PERSISTENCE_FILE, JSON.stringify(dataToSave, null, 2), "utf-8");
-
-    // Replicate session in a non-blocking cloud routine
-    if (supabaseClient) {
-      saveStateToSupabase().catch(() => {});
-    }
-  } catch (err) {
-    console.error("[PERSISTENCE_ERROR] Failed to write state to disk:", err);
-  }
-}
-
-function loadStateFromDisk() {
-  try {
-    if (fs.existsSync(PERSISTENCE_FILE)) {
-      const dataStr = fs.readFileSync(PERSISTENCE_FILE, "utf-8");
-      if (!dataStr) return;
-      const loaded = JSON.parse(dataStr);
-      if (loaded.balance !== undefined) balance = loaded.balance;
-      if (loaded.peakBalance !== undefined) peakBalance = loaded.peakBalance;
-      if (loaded.tradingEnabled !== undefined) tradingEnabled = loaded.tradingEnabled;
-      if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
-      if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
-      if (loaded.riskPreset !== undefined) riskPreset = loaded.riskPreset;
-      if (loaded.hybridRiskType !== undefined) hybridRiskType = loaded.hybridRiskType;
-      if (loaded.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = loaded.hybridRiskFixedAmount;
-      if (loaded.hybridRiskPercent !== undefined) hybridRiskPercent = loaded.hybridRiskPercent;
-      if (loaded.hybridRewardRatio !== undefined) hybridRewardRatio = loaded.hybridRewardRatio;
-      if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
-      if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
-      if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
-      if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
-      if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
-      if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
-      if (loaded.logs !== undefined) {
-        logs = loaded.logs;
-        logs.push(`[${new Date().toISOString()}] State recovered successfully from persistent storage.`);
-      }
-      
-      if (loaded.subAlgorithmsParams !== undefined) {
-        Object.keys(loaded.subAlgorithmsParams).forEach(key => {
-          if (subAlgorithms[key]) {
-            const params = loaded.subAlgorithmsParams[key];
-            Object.assign(subAlgorithms[key], params);
-            // Optimization: Clamp minConfluenceScore to max 4 so the bot is highly responsive
-            if (subAlgorithms[key].minConfluenceScore > 4) {
-              subAlgorithms[key].minConfluenceScore = 4;
-            }
-          }
-        });
-      }
-      if (currentParams && currentParams.minConfluenceScore > 4) {
-        currentParams.minConfluenceScore = 4;
-      }
-      // Re-save normalized/clamped parameters to disk
-      setTimeout(() => {
-        saveStateToDisk();
-      }, 1000);
-    }
-  } catch (err) {
-    console.error("[PERSISTENCE_ERROR] Failed to load state from disk:", err);
-  }
-}
-
-// Global bootstrap to merge disk & cloud data safely
-async function runSystemBootstrap() {
-  loadStateFromDisk();
-  if (supabaseClient) {
-    await loadStateFromSupabase();
-  }
-}
-runSystemBootstrap();
-
 // Instrument configuration mappings
 const INSTRUMENTS = {
   R_10: { name: "Volatility 10 (1s)", volatility: 0.12, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 100.0 },
@@ -886,7 +432,7 @@ class DerivLiveBridge {
   public subscribeToTicks(symbol: string) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
-    // Map standard simulation symbols to Deriv WS API codes
+    // Map app symbols to Deriv WS API codes
     const derivSymbol = this.getDerivSymbolCode(symbol);
     if (this.subscribedSymbols.has(derivSymbol)) return;
 
@@ -923,9 +469,10 @@ class DerivLiveBridge {
       if (msg.msg_type === "authorize") {
         this.isAuthorized = true;
         const auth = msg.authorize;
-        balance = parseFloat(auth.balance) || balance;
+        const authBalance = Number.parseFloat(auth.balance);
+        if (Number.isFinite(authBalance)) balance = authBalance;
         peakBalance = Math.max(peakBalance, balance);
-        const accountType = auth.is_virtual ? "DEMO PAPER" : "REAL LIVE";
+        const accountType = auth.is_virtual ? "DERIV VIRTUAL" : "REAL LIVE";
         
         logs.push(`[DERIV_LIVE] 🏆 Authentication Succeeded! Account Type: [${accountType}] (${auth.email})`);
         logs.push(`[DERIV_LIVE] Live account balance updated to: $${balance.toFixed(2)} ${auth.currency || "USD"}`);
@@ -990,7 +537,8 @@ class DerivLiveBridge {
       // 1.1 Balance Updates Stream
       if (msg.msg_type === "balance" && msg.balance) {
         const bal = msg.balance;
-        balance = parseFloat(bal.balance) || balance;
+        const liveBalance = Number.parseFloat(bal.balance);
+        if (Number.isFinite(liveBalance)) balance = liveBalance;
         peakBalance = Math.max(peakBalance, balance);
         logs.push(`[DERIV_LIVE] 💰 Real balance updated: $${balance.toFixed(2)} ${bal.currency || "USD"}`);
       }
@@ -1107,7 +655,7 @@ class DerivLiveBridge {
     }
   }
 
-  // Sends the real order contract proposal directly to your Live / Demo account!
+  // Sends the real order contract proposal directly to your authorized Deriv account.
   public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number) {
     if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
@@ -1290,7 +838,7 @@ function computeATRAndADX(candles: Candle[], period = 14) {
 
   const atr = trSum / period;
 
-  // Simple ADX derivation for indicators simulation
+  // Simple ADX derivation for indicators
   const diPlus = trSum === 0 ? 0 : (plusDMSum / trSum) * 100;
   const diMinus = trSum === 0 ? 0 : (minusDMSum / trSum) * 100;
   const sumDM = diPlus + diMinus;
@@ -1307,11 +855,11 @@ function computeATRAndADX(candles: Candle[], period = 14) {
 function computeVWAP(prices: number[], period = 30): number {
   if (prices.length < 2) return prices[0] || 0;
   const slice = prices.slice(-period);
-  // Simulate standard weighted volume weights favoring current ticks
+  // Weight recent tick positions for a VWAP-like proxy
   let num = 0;
   let den = 0;
   slice.forEach((p, idx) => {
-    const vol = 100 + (idx % 5) * 50; // simulated stable static weights
+    const vol = 100 + (idx % 5) * 50;
     num += p * vol;
     den += vol;
   });
@@ -1559,13 +1107,14 @@ function getCurrentIndicators(symbol: string) {
   const prices = tickBuffers[symbol] || [];
   const candles = candleBuffers[symbol] || [];
   if (prices.length < 50) {
+    const latestPrice = prices[prices.length - 1] ?? null;
     return {
       rsiVal: 50,
-      upper: prices[prices.length - 1] || 100,
-      lower: prices[prices.length - 1] || 100,
-      mid: prices[prices.length - 1] || 100,
-      vwapVal: prices[prices.length - 1] || 100,
-      atr: 1.0,
+      upper: latestPrice,
+      lower: latestPrice,
+      mid: latestPrice,
+      vwapVal: latestPrice,
+      atr: 0,
       confluence: {
         isOversold: false,
         isRsiOversoldRange: false,
@@ -1954,6 +1503,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
   // 7. Execute Transaction Order Proposal
   if (triggerTrade && tradingEnabled) {
+    if (!liveBridgeInstance.getIsAuthorized()) {
+      tradingEnabled = false;
+      logs.push(`[EXECUTION_BLOCKED] Live Deriv authorization is required before automated trading can place orders. Set DERIV_API_TOKEN and reconnect to trade with real live data only.`);
+      return;
+    }
+
     logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}`);
     // ----------------------------------------------------
     // MITIGATION: Extra filtration based on contract mode
@@ -2005,14 +1560,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
     const auditRes = scrutinizeProposal(proposal);
     if (!auditRes.approved) {
-      logs.push(`[GOVERNOR_VETO] 🛡️ Sector Audit failed for ${symbol} signal. Reason: ${auditRes.reason}`);
+      logs.push(`[GOVERNOR_VETO] 🛡️ Sector Audit failed for ${symbol} signal. Reason: ${auditRes.reasoning}`);
       return;
     }
     
     // Apply polished parameters from Governor (Agentic autonomy in action)
     stake = auditRes.polishedStake;
-    if (auditRes.reason.includes("POLISHED") || auditRes.reason.includes("ELITE")) {
-      logs.push(`[GOVERNOR_AGENT] 🖋️ ${auditRes.reason}`);
+    if (auditRes.reasoning.includes("POLISHED") || auditRes.reasoning.includes("ELITE")) {
+      logs.push(`[GOVERNOR_AGENT] 🖋️ ${auditRes.reasoning}`);
     }
 
     logs.push(`[TRACE] Final stake approved: amount=${stake}, balance=${balance}`);
@@ -2109,13 +1664,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     // Place actual contract proposal request if live credentials are active
     const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
-    if (liveOrderPlaced) {
-      logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
+    if (!liveOrderPlaced) {
+      logs.push(`[DERIV_LIVE_TRADE] ❌ Live order was not accepted by the Deriv bridge; no local position was created.`);
+      return;
     }
 
+    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
     activePositions.push(position);
-    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Elite: ${isEliteGovernorTrade}]`);
-    saveStateToDisk();
+    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
 }
@@ -2203,6 +1759,11 @@ function executeProposal(
   conditions: string[],
   epoch: number
 ) {
+  if (!liveBridgeInstance.getIsAuthorized()) {
+    logs.push(`[MANUAL_TRIGGER_BLOCKED] Live Deriv authorization is required before manual orders can be submitted. No local position was created.`);
+    return false;
+  }
+
   // Check if trading amount exceeds balance
   let stake = calculateKellyStake(symbol);
   const sub = subAlgorithms[symbol];
@@ -2301,14 +1862,16 @@ function executeProposal(
 
   // Place actual contract proposal request if live credentials are active
   const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
-  if (liveOrderPlaced) {
-    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
+  if (!liveOrderPlaced) {
+    logs.push(`[DERIV_LIVE_TRADE] ❌ Manual live order was not accepted by the Deriv bridge; no local position was created.`);
+    return false;
   }
 
+  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
   activePositions.push(position);
 
   logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
-  saveStateToDisk();
+  return true;
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
@@ -2586,10 +2149,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
 
   finalPnl = parseFloat(finalPnl.toFixed(2));
   
-  // Refund is handled directly by active Deriv WebSocket contract settle streams.
-  if (!liveBridgeInstance.getIsAuthorized()) {
-    balance = parseFloat((balance + finalPnl).toFixed(2));
-  }
+  // Balance is sourced from Deriv's live balance stream only.
 
   if (balance > peakBalance) {
     peakBalance = balance;
@@ -2645,21 +2205,10 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   completedTrades.push(record);
   logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} (Pushed balance to $${balance})`);
 
-  // Check trade limit to pause and trigger report
+  // Check trade limit to pause for manual review
   if (completedTrades.length >= 100 && tradingEnabled) {
     tradingEnabled = false;
-    logs.push(`[SYSTEM] 🛑 Trading paused automatically after 100 trades. Awaiting analytical report.`);
-    logs.push(`[SYSTEM_REPORT_TRIGGER] Initiating intensive engine diagnostics for report generation...`);
-    initiateIntensiveReport().catch(err => {
-      console.error("[AUTO_REPORT_CRASH]", err);
-      logs.push(`[SYSTEM_ERROR] Automatic report generation failed: ${err.message || err}`);
-    });
-    saveStateToDisk();
-  }
-
-  // Log single trade document in Cloud DB
-  if (supabaseClient) {
-    saveTradeToSupabase(record);
+    logs.push(`[SYSTEM] 🛑 Trading paused automatically after 100 live trades. Review live telemetry before resuming.`);
   }
 
   // Evaluate Circuit Breakers
@@ -2669,387 +2218,6 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   if (completedTrades.length % 3 === 0) {
     runMachineLearningAdaptation();
   }
-  saveStateToDisk();
-}
-
-async function initiateIntensiveReport() {
-  logs.push(`[REPORT_SYSTEM] Intensive analysis initiated by mother algorithm.`);
-  
-  try {
-     const total = completedTrades.length;
-     // Create a working slice for metrics
-     const reportTrades = [...completedTrades];
-     
-     // Fallback to synthetic trades if empty so it doesn't crash on blank logs
-     if (reportTrades.length < 2) {
-       for (let i = 0; i < 114; i++) {
-         const pnl = Math.random() > 0.35 ? (Math.random() * 25 + 5) : -(Math.random() * 15 + 2);
-         reportTrades.push({
-           id: `T_AUTOGEN_${i + 1}`,
-           symbol: selectedSymbol,
-           contractType: "MULTUP",
-           direction: i % 2 === 0 ? "LONG" : "SHORT",
-           stake: 10,
-           entryPrice: 100 + i,
-           exitPrice: 100 + i + (pnl / 10),
-           pnl: parseFloat(pnl.toFixed(2)),
-           exitReason: pnl > 0 ? "take_profit" : "stop_loss",
-           regimeAtEntry: MarketRegime.RANGING,
-           entryEpoch: Math.floor(Date.now() / 1000) - 3600 * (120 - i),
-           exitEpoch: Math.floor(Date.now() / 1000) - 3600 * (120 - i) + 600,
-           rsiAtEntry: 48,
-           bbPctAtEntry: 0.5,
-           adxAtEntry: 22,
-           atrAtEntry: 1.5,
-           conditionsMet: ["rsi", "bb", "vwap"]
-         });
-       }
-     }
-
-     const finalTotal = reportTrades.length;
-     const wins = reportTrades.filter(t => t.pnl > 0).length;
-     const losses = finalTotal - wins;
-     const winRate = finalTotal > 0 ? (wins / finalTotal) * 100 : 0;
-     const totalPnl = reportTrades.reduce((sum, t) => sum + t.pnl, 0);
-     
-     const grossWins = reportTrades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
-     const grossLosses = Math.abs(reportTrades.filter(t => t.pnl <= 0).reduce((sum, t) => sum + t.pnl, 0));
-     const profitFactor = grossLosses === 0 ? grossWins : grossWins / grossLosses;
-     
-     // Max Drawdown calculation
-     let maxBal = 10000;
-     let currentBal = 10000;
-     let maxDD = 0;
-     reportTrades.forEach(t => {
-       currentBal += t.pnl;
-       if (currentBal > maxBal) maxBal = currentBal;
-       const dd = ((maxBal - currentBal) / maxBal) * 100;
-       if (dd > maxDD) maxDD = dd;
-     });
-
-     // Calculate milestones (every 100 trades or chunks of completed)
-     const milestones = [];
-     const chunkSize = Math.max(10, Math.ceil(finalTotal / 5)); // split into up to 5 epoch chunks
-     for (let i = 0; i < finalTotal; i += chunkSize) {
-       const batch = reportTrades.slice(i, i + chunkSize);
-       const batchPnl = batch.reduce((sum, t) => sum + t.pnl, 0);
-       const bWins = batch.filter(t => t.pnl > 0).length;
-       const bWinRate = (bWins / batch.length) * 100;
-       
-       milestones.push({
-         batch: `${i + 1}-${i + batch.length}`,
-         winRate: bWinRate.toFixed(1),
-         pnl: batchPnl.toFixed(2),
-         efficiency: (bWinRate * (batchPnl > 0 ? 1.2 : 0.8)).toFixed(0) // efficiency score
-       });
-     }
-
-     const reportPrompt = `
-       You are Sovereign AI, an elite institutional risk engineer.
-       Perform an intensive algorithmic review of the trade settlement book.
-       
-       Context:
-       - Total Settlement Trades: ${finalTotal}
-       - Win Rate Accuracy: ${winRate.toFixed(1)}% (${wins} Wins, ${losses} Losses)
-       - Total Cumulative PnL: $${totalPnl.toFixed(2)}
-       - Calculated Profit Factor: ${profitFactor.toFixed(2)}
-       - Maximum Peak Drawdown: ${maxDD.toFixed(1)}%
-       - Current Stochastic Config: ${JSON.stringify(currentParams)}
-       
-       Provide:
-       1. Executive Telemetry Critique.
-       2. Regime suitabilty & behavioral patterns.
-       3. Specific calibrated recommendations for indicator boundaries (RSI thresholds, ATR multipliers).
-       
-       Format as highly professional, concise, raw text and markdown. Avoid any conversational greeting.
-     `;
-
-     let analysis = "";
-     // Generate Analysis using Gemini if online
-     try {
-        const client = getGeminiClient();
-        if (client) {
-          const response = await client.models.generateContent({
-            model: "gemini-3.5-flash",
-            contents: reportPrompt,
-          });
-          analysis = response.text || "";
-        }
-     } catch (aiErr: any) {
-        console.error("[REPORT_GEMINI_ERROR] Reverting to local engine:", aiErr.message || aiErr);
-     }
-
-     if (!analysis) {
-       // Premium mathematical fallback analytics
-       analysis = `### SOVEREIGN SYSTEM DIAGNOSTICS: COMPLETED
-Analytic diagnostic compiled for high-frequency index models.
-
-1. EXECUTIVE TELEMETRY CRITIQUE
-The Sovereign engine demonstrated clean transaction flow across ${finalTotal} historical capture events.
-Cumulative settlement yields are $${totalPnl.toFixed(2)} with an established Profit Factor of ${profitFactor.toFixed(2)}. 
-Capital drawdown metrics remain extremely healthy, registering a peak drop of ${maxDD.toFixed(1)}%, well within institutional tolerances.
-
-2. REGIME & SYSTEM GAINS ANALYSIS
-Milestone segmentation indicates a continuous refinement of entry/exit boundaries. The transition from baseline volatility stages (Epoch 1) to the current active interval exhibits a win factor improvement of +4.5% efficiency.
-Bollinger band filters effectively prevented top-edge fades in trending models, but range bounds showed compression.
-
-3. CALIBRATED RECOMMENDATION PARAMETERS
-- RSI Lower Trigger: Adjust to ${currentParams.rsiOversoldThreshold + 2} (Safety Gated)
-- RSI Upper Trigger: Adjust to ${currentParams.rsiOverboughtThreshold - 2} for high frequency capture response.
-- ATR Stop Multiplier: Calibrate strictly to ${currentParams.atrStopMultiplier}x to limit trailing hazard vectors.`;
-     }
-
-     // 3. Generate PDF
-     const doc = new PDFDocument({ margin: 40 });
-     const reportFilename = `trade_report_${Date.now()}.pdf`;
-     const reportsDir = path.join(process.cwd(), "reports");
-     const reportPath = path.join(reportsDir, reportFilename);
-     
-     // Ensure reports directory exists
-     try {
-       if (!fs.existsSync(reportsDir)) {
-         fs.mkdirSync(reportsDir, { recursive: true });
-       }
-     } catch (mkdirErr: any) {
-       console.error("[REPORT_DIR_ERROR]", mkdirErr);
-       logs.push(`[REPORT_ERROR] Failed to create reports directory: ${mkdirErr.message || mkdirErr}`);
-       return;
-     }
-
-     logs.push(`[REPORT_SYSTEM] Starting document composition...`);
-     await new Promise<void>((resolve, reject) => {
-       const timeoutId = setTimeout(() => {
-         reject(new Error("PDF generation timed out after 30s"));
-       }, 30000);
-
-       let writeStream: fs.WriteStream;
-       try {
-         writeStream = fs.createWriteStream(reportPath);
-       } catch (wsErr: any) {
-         clearTimeout(timeoutId);
-         console.error("[REPORT_WRITE_STREAM_ERROR]", wsErr);
-         reject(wsErr);
-         return;
-       }
-       
-       writeStream.on("finish", () => {
-         clearTimeout(timeoutId);
-         resolve();
-       });
-       writeStream.on("error", (err) => {
-         clearTimeout(timeoutId);
-         reject(err);
-       });
-       
-       doc.pipe(writeStream);
-       
-       // Header Border
-       doc.rect(40, 40, 532, 10).fill('#0f172a');
-       doc.moveDown(1.5);
-       
-       // Page 1 Layout: Cover & Mathematical Grid
-       doc.fontSize(22).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN SYSTEM SECTOR REPORT', { align: 'center' });
-       doc.fontSize(10).font('Helvetica-Oblique').fillColor('#64748b').text('Autonomous Mother Algorithm Performance Ledger & AI Advisory', { align: 'center' });
-       doc.moveDown(1.5);
-       
-       // System Metadata Block
-       doc.fontSize(10).font('Helvetica-Bold').fillColor('#1e293b');
-       doc.text(`SESSION ID: ${botSessionId}`, 50, doc.y);
-       doc.font('Helvetica').text(`DATE GENERATED: ${new Date().toISOString()}`, 50, doc.y + 15);
-       doc.text(`TARGET INSTRUMENT: ${selectedSymbol} Volatility Model`, 50, doc.y + 30);
-       doc.moveDown(3);
-       
-       // Core Telemetry Grid
-       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('CORE PERFORMANCE METRICS', 50, doc.y);
-       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
-       doc.moveDown(1.5);
-       
-       const startY = doc.y;
-       doc.fontSize(10).font('Helvetica-Bold').fillColor('#1e293b');
-       doc.text(`Total Settlements:`, 50, startY);
-       doc.font('Helvetica').text(`${finalTotal}`, 180, startY);
-       
-       doc.font('Helvetica-Bold').text(`Win Accuracy:`, 50, startY + 18);
-       doc.font('Helvetica').text(`${winRate.toFixed(1)}% (${wins}W / ${losses}L)`, 180, startY + 18);
-       
-       doc.font('Helvetica-Bold').text(`Cumulative PnL:`, 50, startY + 36);
-       doc.font('Helvetica').fillColor(totalPnl >= 0 ? '#10b981' : '#ef4444').text(`$${totalPnl.toFixed(2)}`, 180, startY + 36);
-       
-       doc.fillColor('#1e293b').font('Helvetica-Bold').text(`Calculated Profit Factor:`, 320, startY);
-       doc.font('Helvetica').text(`${profitFactor.toFixed(2)}`, 460, startY);
-       
-       doc.font('Helvetica-Bold').text(`Max Peak Drawdown:`, 320, startY + 18);
-       doc.font('Helvetica').text(`${maxDD.toFixed(1)}%`, 460, startY + 18);
-       
-       doc.font('Helvetica-Bold').text(`Avg. PnL per Trade:`, 320, startY + 36);
-       doc.font('Helvetica').text(`$${(totalPnl / finalTotal).toFixed(2)}`, 460, startY + 36);
-       
-       doc.moveDown(3.5);
-       
-       // Render Vector Equity Curve Graph
-       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('EQUITY CURVE PROGRESSION', 50, doc.y);
-       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
-       doc.moveDown(1.5);
-       
-       const graphX = 50;
-       const graphY = doc.y;
-       const graphW = 512;
-       const graphH = 150;
-       
-       // Dark terminal background
-       doc.rect(graphX, graphY, graphW, graphH).fill('#0b0f19');
-       
-       // Grid Lines
-       doc.strokeColor('#1e293b').lineWidth(0.5);
-       for (let j = 1; j <= 4; j++) {
-         const gy = graphY + (graphH / 5) * j;
-         doc.moveTo(graphX, gy).lineTo(graphX + graphW, gy).stroke();
-       }
-       for (let j = 1; j <= 4; j++) {
-         const gx = graphX + (graphW / 5) * j;
-         doc.moveTo(gx, graphY).lineTo(gx, graphY + graphH).stroke();
-       }
-       
-       // Cumulative balance coordinates
-       const points: number[] = [0];
-       let currentSum = 0;
-       reportTrades.forEach(t => {
-         currentSum += t.pnl;
-         points.push(currentSum);
-       });
-       
-       const minPointsVal = Math.min(...points);
-       const maxPointsVal = Math.max(...points);
-       const range = maxPointsVal - minPointsVal || 10;
-       const padMin = minPointsVal - Math.abs(range) * 0.05;
-       const padMax = maxPointsVal + Math.abs(range) * 0.05;
-       const padRange = padMax - padMin;
-       
-       // Curve drawing
-       doc.strokeColor('#10b981').lineWidth(2);
-       doc.moveTo(graphX, graphY + graphH - ((points[0] - padMin) / padRange) * graphH);
-       for (let i = 1; i < points.length; i++) {
-         const cx = graphX + (i / (points.length - 1)) * graphW;
-         const cy = graphY + graphH - ((points[i] - padMin) / padRange) * graphH;
-         doc.lineTo(cx, cy);
-       }
-       doc.stroke();
-       
-       // Shaded gradient fill
-       doc.save();
-       doc.strokeColor('transparent');
-       doc.moveTo(graphX, graphY + graphH);
-       for (let i = 0; i < points.length; i++) {
-         const cx = graphX + (i / (points.length - 1)) * graphW;
-         const cy = graphY + graphH - ((points[i] - padMin) / padRange) * graphH;
-         doc.lineTo(cx, cy);
-       }
-       doc.lineTo(graphX + graphW, graphY + graphH);
-       doc.closePath();
-       doc.fillColor('rgba(16, 185, 129, 0.08)').fill();
-       doc.restore();
-       
-       // Draw Red Zero Line Reference
-       if (padMin < 0 && padMax > 0) {
-         const zeroY = graphY + graphH - ((0 - padMin) / padRange) * graphH;
-         doc.strokeColor('#ef4444').lineWidth(0.75).dash(4, { space: 2 });
-         doc.moveTo(graphX, zeroY).lineTo(graphX + graphW, zeroY).stroke();
-         doc.undash();
-       }
-       
-       // Labels for chart
-       doc.fontSize(7).fillColor('#64748b').font('Helvetica');
-       doc.text(`Peak PNL: +$${maxPointsVal.toFixed(2)}`, graphX + 10, graphY + 8);
-       doc.text(`Min PNL: $${minPointsVal.toFixed(2)}`, graphX + 10, graphY + graphH - 15);
-       doc.text(`Initial`, graphX + 5, graphY + graphH + 5);
-       doc.text(`Trade ${points.length - 1} (PnL: $${currentSum.toFixed(2)})`, graphX + graphW - 150, graphY + graphH + 5, { align: 'right', width: 145 });
-       
-       // Move down past graph
-       doc.y = graphY + graphH + 25;
-       
-       // Epoch Milestones table
-       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('PERFORMANCE MILESTONES (100-TRADE SEGMENTS)', 50, doc.y);
-       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
-       doc.moveDown(1.5);
-       
-       const mileY = doc.y;
-       doc.fontSize(9).font('Helvetica-Bold').fillColor('#475569');
-       doc.text('SEGMENT', 50, mileY);
-       doc.text('WIN RATE', 160, mileY);
-       doc.text('NET PnL', 280, mileY);
-       doc.text('REFINEMENT EFFICIENCY', 420, mileY);
-       
-       doc.strokeColor('#e2e8f0').lineWidth(0.5).moveTo(50, mileY + 12).lineTo(560, mileY + 12).stroke();
-       
-       doc.font('Helvetica').fillColor('#1e293b');
-       milestones.forEach((m, idx) => {
-         const my = mileY + 18 + (idx * 16);
-         doc.text(`Trades ${m.batch}`, 50, my);
-         doc.text(`${m.winRate}%`, 160, my);
-         doc.text(`$${m.pnl}`, 280, my);
-         doc.fillColor('#10b981').text(`+${m.efficiency}% [OK]`, 420, my);
-         doc.fillColor('#1e293b');
-       });
-       
-       // Page 2: Narrative insights & roadmap
-       doc.addPage();
-       
-       // Header Banner
-       doc.rect(40, 40, 532, 10).fill('#6366f1');
-       doc.moveDown(1.5);
-       
-       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN NARRATIVE ADVISORY', 50, doc.y);
-       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Cognitive Strategy Proposal & Adaptive Intelligence Logs', 50, doc.y + 16);
-       doc.moveDown(2.5);
-       
-       // Render narrative text blocks nicely, breaking on paragraphs
-       const paragraphs = analysis.split('\n\n');
-       doc.fontSize(10).font('Helvetica').fillColor('#334155');
-       
-       paragraphs.forEach(para => {
-         if (para.trim()) {
-           if (para.startsWith('###') || para.trim().match(/^[0-9]\./)) {
-             doc.fontSize(12).font('Helvetica-Bold').fillColor('#1e1b4b').text(para.replace('###', '').trim(), { width: 500 });
-             doc.moveDown(0.5);
-             doc.fontSize(10).font('Helvetica').fillColor('#475569');
-           } else {
-             doc.text(para.replace(/\*\*/g, '').replace(/\*/g, '').trim(), { width: 500, align: 'justify', lineGap: 3 });
-             doc.moveDown(1);
-           }
-         }
-       });
-       
-       // Signature seal block
-       doc.moveDown(2);
-       const sigY = doc.y;
-       if (sigY < 700) {
-         doc.strokeColor('#e2e8f0').lineWidth(1).moveTo(50, sigY).lineTo(560, sigY).stroke();
-         doc.moveDown(1);
-         doc.fontSize(9).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN RISKS SENTINEL SYSTEMS', 50, doc.y);
-         doc.fontSize(8).font('Helvetica').fillColor('#94a3b8').text('Neural Strategy Gating & Machine Learning Co-pilot • Active Security State', 50, doc.y + 12);
-       }
-       
-       doc.end();
-     });
-     
-     // Store summary in memory for frontend
-     const reportSummaryInMem = {
-       summary: analysis.substring(0, 400) + '...',
-       pdfUrl: `/reports/${reportFilename}`,
-       milestones: milestones,
-       totalTrades: finalTotal,
-       winRate: winRate.toFixed(1),
-       totalPnl: totalPnl.toFixed(2),
-       maxDrawdown: maxDD.toFixed(1),
-       profitFactor: profitFactor.toFixed(2)
-     };
-     
-     (globalThis as any).lastReportSummary = reportSummaryInMem;
-     logs.push(`[REPORT_SYSTEM] Detailed PDF report generated successfully at /reports/${reportFilename}`);
-  } catch (err: any) {
-       console.error("[REPORT_ERROR]", err);
-       logs.push(`[REPORT_ERROR] Failed to compile PDF report: ${err.message || err}`);
-  }
 }
 
 // ==========================================
@@ -3057,7 +2225,8 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
 // ==========================================
 function evaluateCircuitBreakers() {
   // Daily & Session limits monitoring
-  const initialCap = 10000.00; // Baseline session seed capital
+  const initialCap = peakBalance || balance;
+  if (initialCap <= 0) return;
   const lossFromBaseline = initialCap - balance;
   const drawdownPct = lossFromBaseline / initialCap;
   
@@ -3198,253 +2367,6 @@ function runMachineLearningAdaptation() {
       logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio metric is healthy (WR ${(globalWinRate * 100).toFixed(1)}%, PF ${globalPF.toFixed(2)}). Global macro parameters active.`);
     }
   }
-
-  // Push the adapted strategy iteration to Supabase for long-term ML processing
-  if (supabaseClient) {
-    saveStrategyHistoryToSupabase().catch(() => {});
-  }
-}
-
-// ==========================================
-// WALK-FORWARD BACKTEST COMPUTATION ENGINE
-// ==========================================
-function runBacktestStatistics(symbol: string, requestedTicks = 3000): BacktestResult {
-  const meta = INSTRUMENTS[symbol as keyof typeof INSTRUMENTS];
-  let simBalance = 1000.00;
-  let simPeak = 1000.00;
-  let simPeakDrawdown = 0;
-  const backtestTrades: TradeRecord[] = [];
-
-  // Generate deterministic randomized walk for tick data
-  let currentSimPrice = meta.basePrice;
-  const simTicks: number[] = [];
-  const simCandles: Candle[] = [];
-  
-  // Warmup seeding first
-  for (let i = 0; i < requestedTicks; i++) {
-    const cycle = Math.sin(i / 20) * meta.volatility * (meta.basePrice * 0.012);
-    const noise = (Math.random() - 0.5) * meta.volatility * (meta.basePrice * 0.008);
-    let drift = 0;
-    if (meta.idealStrategy === "mean_reversion") {
-      drift = (meta.basePrice - currentSimPrice) * 0.003;
-    }
-    // Apply simulated random spread slip (0.01%–0.03% of price) on entry and exit as per audit rec #5
-    const slippageFactor = (Math.random() * 0.0002) + 0.0001; 
-    currentSimPrice = Math.max(5.0, currentSimPrice + cycle * 0.05 + noise + drift);
-    
-    // Spread injection: Ask/Bid simulation
-    simTicks.push(currentSimPrice * (1 + (Math.random() * 0.0001)));
-
-    if (i % 5 === 0) {
-      const slice = simTicks.slice(-5);
-      simCandles.push({
-        symbol,
-        epoch: i,
-        open: slice[0],
-        high: Math.max(...slice),
-        low: Math.min(...slice),
-        close: slice[slice.length - 1],
-        volume: 150,
-      });
-    }
-  }
-
-  // Set simulation parameter state temporarily
-  let activeBtPositions: ActivePosition[] = [];
-  
-  // Walk through simulated periods
-  for (let i = 50; i < requestedTicks; i++) {
-    const tickPrice = simTicks[i];
-    
-    // Evaluate active simulated trade exits
-    const activeBtSettled: number[] = [];
-    activeBtPositions.forEach((pos, idx) => {
-      pos.currentPrice = tickPrice;
-      pos.ticksElapsed++;
-
-      let posPnl = 0;
-      if (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN") {
-        const isUp = pos.contractType === "MULTUP";
-        const diff = (tickPrice - pos.entryPrice) / pos.entryPrice;
-        posPnl = pos.stake * (isUp ? diff : -diff) * 100;
-        if (posPnl < -pos.stake) posPnl = -pos.stake;
-      }
-
-      pos.pnl = parseFloat(posPnl.toFixed(2));
-      
-      const subAlg = subAlgorithms[symbol];
-
-      // Initialize or update highest/lowest since entry
-      if (pos.highestPriceSinceEntry === undefined || tickPrice > pos.highestPriceSinceEntry) {
-        pos.highestPriceSinceEntry = tickPrice;
-      }
-      if (pos.lowestPriceSinceEntry === undefined || tickPrice < pos.lowestPriceSinceEntry) {
-        pos.lowestPriceSinceEntry = tickPrice;
-      }
-
-      // Trailing Stop & Break Even Logic for Backtester
-      if (subAlg && (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN")) {
-        // 1. Break Even
-        if (subAlg.breakEvenEnabled && !pos.breakEvenActive) {
-          if (pos.direction === "LONG") {
-            const tpDistance = pos.takeProfit - pos.entryPrice;
-            if (tickPrice >= pos.entryPrice + tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice + tpDistance * 0.05;
-              pos.breakEvenActive = true;
-            }
-          } else if (pos.direction === "SHORT") {
-            const tpDistance = pos.entryPrice - pos.takeProfit;
-            if (tickPrice <= pos.entryPrice - tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice - tpDistance * 0.05;
-              pos.breakEvenActive = true;
-            }
-          }
-        }
-
-        // 2. Trailing Stop
-        if (subAlg.trailingStopEnabled && pos.breakEvenActive) {
-          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * 0.25;
-          if (pos.direction === "LONG") {
-            const newSL = pos.highestPriceSinceEntry - trailDistance;
-            if (newSL > pos.stopLoss) pos.stopLoss = newSL;
-          } else if (pos.direction === "SHORT") {
-            const newSL = pos.lowestPriceSinceEntry + trailDistance;
-            if (newSL < pos.stopLoss) pos.stopLoss = newSL;
-          }
-        }
-      }
-
-      let exitTriggered = false;
-      let reason: "stop_loss" | "take_profit" | "time_exit" | "manual" = "time_exit";
-
-      if (pos.direction === "LONG" && tickPrice <= pos.stopLoss) {
-        exitTriggered = true;
-        reason = "stop_loss";
-      } else if (pos.direction === "SHORT" && tickPrice >= pos.stopLoss) {
-        exitTriggered = true;
-        reason = "stop_loss";
-      }
-
-      if (!exitTriggered) {
-        if (pos.direction === "LONG" && tickPrice >= pos.takeProfit) {
-          exitTriggered = true;
-          reason = "take_profit";
-        } else if (pos.direction === "SHORT" && tickPrice <= pos.takeProfit) {
-          exitTriggered = true;
-          reason = "take_profit";
-        }
-      }
-
-      if (!exitTriggered && pos.ticksElapsed >= currentParams.maxTicksInTrade) {
-        exitTriggered = true;
-        reason = "time_exit";
-      }
-
-      if (exitTriggered) {
-        activeBtSettled.push(idx);
-        simBalance = parseFloat((simBalance + pos.stake + pos.pnl).toFixed(2));
-        
-        if (simBalance > simPeak) {
-          simPeak = simBalance;
-        }
-        const drawdown = ((simPeak - simBalance) / simPeak) * 100;
-        if (drawdown > simPeakDrawdown) {
-          simPeakDrawdown = drawdown;
-        }
-
-        // Add complete trade record
-        backtestTrades.push({
-          id: pos.id,
-          symbol,
-          contractType: pos.contractType,
-          direction: pos.direction,
-          stake: pos.stake,
-          entryPrice: pos.entryPrice,
-          exitPrice: tickPrice,
-          pnl: pos.pnl,
-          exitReason: reason,
-          regimeAtEntry: MarketRegime.RANGING,
-          entryEpoch: pos.entryEpoch,
-          exitEpoch: i,
-          rsiAtEntry: 30,
-          bbPctAtEntry: 0.1,
-          adxAtEntry: 15,
-          atrAtEntry: 0.2,
-          conditionsMet: ["REGIME_CONFLUENCE"],
-        });
-      }
-    });
-
-    activeBtPositions = activeBtPositions.filter((_, idx) => !activeBtSettled.includes(idx));
-
-    // Evaluate Entry signals if empty
-    if (activeBtPositions.length === 0) {
-      const windowSlice = simTicks.slice(i - 40, i);
-      const rsiVal = computeRSI(windowSlice, 14);
-      const { upper, lower } = computeBollinger(windowSlice, currentParams.bbPeriod, currentParams.bbStd);
-      const candlesSlice = simCandles.filter(c => c.epoch <= i).slice(-30);
-      const { atr } = computeATRAndADX(candlesSlice, 14);
-
-      // Simple confluence trigger
-      const oversold = rsiVal <= currentParams.rsiOversoldThreshold && rsiVal >= 28 && tickPrice <= lower;
-      const overbought = rsiVal >= currentParams.rsiOverboughtThreshold && rsiVal <= 72 && tickPrice >= upper;
-
-      if (oversold || overbought) {
-        const direction = oversold ? "LONG" : "SHORT";
-        const stopDistance = Math.max(tickPrice * 0.005, atr * currentParams.atrStopMultiplier);
-        const takeDistance = stopDistance * 1.25;
-
-        const stopLoss = direction === "LONG" ? (tickPrice - stopDistance) : (tickPrice + stopDistance);
-        const takeProfit = direction === "LONG" ? (tickPrice + takeDistance) : (tickPrice - takeDistance);
-
-        const currentStake = simBalance * 0.015; // static safety stake for simulated test
-        if (currentStake <= simBalance) {
-          simBalance = parseFloat((simBalance - currentStake).toFixed(2));
-          activeBtPositions.push({
-            id: `SIM_${i}`,
-            symbol,
-            contractType: direction === "LONG" ? "MULTUP" : "MULTDOWN",
-            direction,
-            stake: currentStake,
-            entryPrice: tickPrice,
-            currentPrice: tickPrice,
-            stopLoss: parseFloat(stopLoss.toFixed(4)),
-            takeProfit: parseFloat(takeProfit.toFixed(4)),
-            pnl: 0,
-            ticksElapsed: 0,
-            entryEpoch: i,
-          });
-        }
-      }
-    }
-  }
-
-  const winningTrades = backtestTrades.filter(t => t.pnl > 0).length;
-  const winRate = backtestTrades.length > 0 ? (winningTrades / backtestTrades.length) * 100 : 0;
-  const profitFactor = (() => {
-    let grossWins = 0;
-    let grossLosses = 0;
-    backtestTrades.forEach(t => {
-      if (t.pnl > 0) grossWins += t.pnl;
-      else grossLosses += Math.abs(t.pnl);
-    });
-    return grossLosses === 0 ? grossWins : grossWins / grossLosses;
-  })();
-
-  return {
-    symbol,
-    tickCount: requestedTicks,
-    totalTrades: backtestTrades.length,
-    winningTrades,
-    winRate: parseFloat(winRate.toFixed(1)),
-    initialBalance: 1000.00,
-    finalBalance: parseFloat(simBalance.toFixed(2)),
-    totalPnl: parseFloat((simBalance - 1000.00).toFixed(2)),
-    maxDrawdown: parseFloat(simPeakDrawdown.toFixed(1)),
-    sharpeRatio: backtestTrades.length > 1 ? 1.45 : 0.0, // calculated average
-    profitFactor: parseFloat(profitFactor.toFixed(2)),
-    trades: backtestTrades.slice(-15),
-  };
 }
 
 // ==========================================
@@ -3550,51 +2472,11 @@ Failed to contact Gemini servers: ${err.message || err}. Reverting to local diag
 // REST API ROUTING
 // ==========================================
 
-// ML Data Export Endpoint
-app.get("/api/ml-export", async (req, res) => {
-  const format = req.query.format || "json";
-
-  let exportData = [...completedTrades];
-
-  if (supabaseClient) {
-    try {
-      const { data, error } = await supabaseClient
-        .from("sovereign_trades")
-        .select("*")
-        .order("created_at", { ascending: false })
-        .limit(10000); // Fetch up to 10k historical trades
-
-      if (data && !error) {
-        exportData = data;
-      }
-    } catch (err) {
-      console.error("[ML_EXPORT] Error fetching from Supabase:", err);
-    }
-  }
-
-  if (format === "csv") {
-    if (exportData.length === 0) {
-      return res.status(200).send("No trades available.");
-    }
-    const headers = Object.keys(exportData[0]).join(",");
-    const rows = exportData.map(row => 
-      Object.values(row).map(v => typeof v === "object" ? JSON.stringify(v) : v).join(",")
-    ).join("\n");
-    res.setHeader("Content-Type", "text/csv");
-    res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.csv"');
-    return res.status(200).send(`${headers}\n${rows}`);
-  }
-
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.json"');
-  res.json(exportData);
-});
-
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
   const currentRegime = detectRegime(selectedSymbol);
   const symbolPrices = tickBuffers[selectedSymbol] || [];
-  const currentPrice = symbolPrices[symbolPrices.length - 1] || 100.00;
+  const currentPrice = symbolPrices[symbolPrices.length - 1] ?? null;
 
   // Compile active statistical averages
   const total = completedTrades.length;
@@ -3610,6 +2492,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     idealStrategy: INSTRUMENTS[selectedSymbol as keyof typeof INSTRUMENTS]?.idealStrategy,
     baseVol: INSTRUMENTS[selectedSymbol as keyof typeof INSTRUMENTS]?.volatility,
     currentPrice,
+    liveDataReady: currentPrice !== null,
     balance: parseFloat(balance.toFixed(2)),
     peakBalance: parseFloat(peakBalance.toFixed(2)),
     isAuthorized: liveBridgeInstance.getIsAuthorized(),
@@ -3637,7 +2520,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     },
     indicators: getCurrentIndicators(selectedSymbol),
     activePositions,
-    completedTrades: completedTrades.slice(-300), // return recent (increased to show more historical trades)
+    completedTrades: completedTrades.slice(-300),
     parameters: currentParams,
     regime: currentRegime,
     circuitBreaker: {
@@ -3645,7 +2528,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       cooldownMessage,
       sessionBlocked,
     },
-    logs: logs.slice(-1000), // return last 1000 logs (increased to support tall terminal & scrollback searches)
+    logs: logs.slice(-1000),
   });
 });
 
@@ -3697,7 +2580,8 @@ app.post("/api/config", (req, res) => {
       if (liveBridgeInstance.getIsAuthorized()) {
         logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Active Live Terminal Trading)`);
       } else {
-        logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Real-Time Sandbox Paper Mode)`);
+        tradingEnabled = false;
+        return res.status(403).json({ error: "Live Deriv authorization is required before enabling automated trading." });
       }
     } else {
       logs.push(`[SYSTEM] Auto-trade DISABLED 🔴 (Engine Paused / Idle)`);
@@ -3730,7 +2614,6 @@ app.post("/api/config", (req, res) => {
     logs.push(`[SOVEREIGN_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
 
-  saveStateToDisk();
   res.json({ success: true, message: "Configuration updated" });
 });
 
@@ -3746,7 +2629,7 @@ app.get("/api/ticks", (req, res) => {
   });
 });
 
-// Manual Force Trade Placement (supports Sandbox & Live Authorized Modes)
+// Manual Force Trade Placement (live authorized mode only)
 app.post("/api/trade", (req, res) => {
   const { direction } = req.body;
   if (!direction || (direction !== "LONG" && direction !== "SHORT")) {
@@ -3756,7 +2639,10 @@ app.post("/api/trade", (req, res) => {
   const symbol = selectedSymbol;
   const symbolPrices = tickBuffers[symbol] || [];
   const candles = candleBuffers[symbol] || [];
-  const currentPrice = symbolPrices[symbolPrices.length - 1] || 100.00;
+  const currentPrice = symbolPrices[symbolPrices.length - 1];
+  if (currentPrice === undefined) {
+    return res.status(503).json({ error: "Live Deriv tick stream is not ready yet. Wait for real tick data before placing trades." });
+  }
   const currentRegime = detectRegime(symbol);
 
   // Derive indicators
@@ -3767,7 +2653,7 @@ app.post("/api/trade", (req, res) => {
   }
 
   // Trigger manual position
-  executeProposal(
+  const accepted = executeProposal(
     symbol, 
     direction, 
     currentPrice, 
@@ -3780,6 +2666,10 @@ app.post("/api/trade", (req, res) => {
     ["MANUAL_EXECUTION"], 
     Math.floor(Date.now() / 1000)
   );
+
+  if (!accepted) {
+    return res.status(403).json({ error: "Live Deriv authorization is required before placing real orders." });
+  }
 
   logs.push(`[MANUAL_TRIGGER] ⚡ Manually forced ${direction} contract order placement request on ${symbol}`);
   res.json({ success: true, message: `Forced ${direction} trade placement requested.` });
@@ -3799,7 +2689,10 @@ app.post("/api/close-position", (req, res) => {
 
   const pos = activePositions[index];
   const symbolPrices = tickBuffers[pos.symbol] || [];
-  const currentPrice = symbolPrices[symbolPrices.length - 1] || pos.currentPrice;
+  const currentPrice = symbolPrices[symbolPrices.length - 1];
+  if (currentPrice === undefined) {
+    return res.status(503).json({ error: "Live Deriv tick stream is not ready yet. Cannot settle without a real current price." });
+  }
 
   activePositions.splice(index, 1);
   settleContract(pos, currentPrice, "manual", Math.floor(Date.now() / 1000));
@@ -3814,31 +2707,6 @@ app.post("/api/analyze", async (req, res) => {
   res.json({ report });
 });
 
-// Manual trigger for report generation
-app.post("/api/force-report", (req, res) => {
-  console.log("[SERVER] Force report endpoint hit");
-  initiateIntensiveReport().catch(err => {
-      console.error("[SERVER] Error in report generation:", err);
-  });
-  res.json({ message: "Report generation initiated" });
-});
-
-// Report summary endpoint
-app.get("/api/report-summary", (req, res) => {
-  res.json((globalThis as any).lastReportSummary || { summary: "No report generated yet.", pdfUrl: null, milestones: [] });
-});
-
-// Serve generated reports
-app.get("/reports/:file", (req, res) => {
-  const file = req.params.file;
-  const filePath = path.join(process.cwd(), "reports", file);
-  if (fs.existsSync(filePath)) {
-    res.sendFile(filePath);
-  } else {
-    res.status(404).send("Report not found");
-  }
-});
-
 // Reset live indicators and stats
 app.post("/api/reset", async (req, res) => {
   activePositions = [];
@@ -3851,14 +2719,9 @@ app.post("/api/reset", async (req, res) => {
   sessionBlocked = false;
   currentParams = { ...defaultParams };
   
-  if (!liveBridgeInstance.getIsAuthorized()) {
-    balance = 10000.00;
-    peakBalance = 10000.00;
-  } else {
-    // If authorized, trigger live balance fetch to get the absolute live balance from Deriv
+  if (liveBridgeInstance.getIsAuthorized()) {
     try {
       liveBridgeInstance.refreshBalance();
-      // Initialize peakBalance to current balance as fallback
       peakBalance = balance;
     } catch (e) {
       console.error("[RESET] Failed requesting live Deriv balance update:", e);
@@ -3880,57 +2743,9 @@ app.post("/api/reset", async (req, res) => {
   
   logs = [`[${new Date().toISOString()}] Sovereign Engine active metrics and overrides have been reset safely.`];
   
-  if (supabaseClient) {
-    try {
-      // Clear all trade logging records from Supabase to start cleanly
-      const { error: delError } = await supabaseClient
-        .from("sovereign_trades")
-        .delete()
-        .neq("id", "trigger-nothing-to-delete-all");
-      if (delError) {
-        logs.push(`[SUPABASE_RESET_WARNING] Could not clear 'sovereign_trades' cache: ${delError.message}`);
-      } else {
-        logs.push(`[SUPABASE_RESET] Cloud 'sovereign_trades' logs wiped cleanly.`);
-      }
-    } catch (err: any) {
-      console.error("[SUPABASE_RESET_ERROR] Exception wiping trades:", err);
-    }
-  }
-
   liveBridgeInstance.requestHistoryForSymbols();
 
-  saveStateToDisk();
-
-  if (supabaseClient) {
-    await saveStateToSupabase();
-  }
-  
   res.json({ success: true, message: "Active trading metrics reset successfully." });
-});
-
-// Express routes to serve uploaded user files representing jet and trading setup images
-app.get("/input_file_0.png", (req, res) => {
-  const absolutePath = "/input_file_0.png";
-  const relativePath = path.join(process.cwd(), "input_file_0.png");
-  if (fs.existsSync(absolutePath)) {
-    res.sendFile(absolutePath);
-  } else if (fs.existsSync(relativePath)) {
-    res.sendFile(relativePath);
-  } else {
-    res.status(404).send("Trading setup image not found");
-  }
-});
-
-app.get("/input_file_1.png", (req, res) => {
-  const absolutePath = "/input_file_1.png";
-  const relativePath = path.join(process.cwd(), "input_file_1.png");
-  if (fs.existsSync(absolutePath)) {
-    res.sendFile(absolutePath);
-  } else if (fs.existsSync(relativePath)) {
-    res.sendFile(relativePath);
-  } else {
-    res.status(404).send("Jet image not found");
-  }
 });
 
 // ==========================================
