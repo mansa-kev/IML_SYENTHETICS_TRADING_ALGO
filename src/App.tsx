@@ -371,8 +371,11 @@ export default function App() {
             }
           }
         }
-      } catch (e) {
-        console.error("Failed to fetch report summary", e);
+      } catch (e: any) {
+        // If it's a transient fetch error (like during restart), we don't want to spam console too much
+        if (e.message !== "Failed to fetch") {
+          console.error("Failed to fetch report summary", e);
+        }
       }
     };
     fetchSummary();
