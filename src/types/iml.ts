@@ -30,9 +30,9 @@ export interface Candle {
 }
 
 export interface ActivePosition {
-  id: string; // contract_id
+  id: string;
   symbol: string;
-  contractType: "MULTUP" | "MULTDOWN" | "RISE" | "FALL" | "DIFFERS" | "OVER" | "UNDER" | "HYBRID_LINEAR_UP" | "HYBRID_LINEAR_DOWN"; // Extended contract types
+  contractType: "MULTUP" | "MULTDOWN" | "RISE" | "FALL" | "DIFFERS" | "OVER" | "UNDER" | "HYBRID_LINEAR_UP" | "HYBRID_LINEAR_DOWN";
   direction: "LONG" | "SHORT";
   stake: number;
   entryPrice: number;
@@ -50,6 +50,7 @@ export interface ActivePosition {
   targetRiskAmount?: number;
   hybridPositionSize?: number;
   isFractalTrend?: boolean;
+  maxAdverseExcursion?: number;
 }
 
 export interface TradeRecord {
@@ -65,16 +66,16 @@ export interface TradeRecord {
   regimeAtEntry: MarketRegime;
   entryEpoch: number;
   exitEpoch: number;
-  // Indicators at entry for adaptive adjustments
   rsiAtEntry: number;
   bbPctAtEntry: number;
   adxAtEntry: number;
   atrAtEntry: number;
-  conditionsMet: string[]; // JSON representation
+  conditionsMet: string[];
   isHybridLinear?: boolean;
   targetRiskAmount?: number;
   hybridPositionSize?: number;
-  tickStreamSnapshot?: number[]; // To store raw price data for ML off-platform
+  tickStreamSnapshot?: number[];
+  maxAdverseExcursion?: number;
 }
 
 export interface SessionStats {
@@ -96,22 +97,22 @@ export interface SessionStats {
 }
 
 export interface LearningParams {
-  rsiOversoldThreshold: number;   // default: 33, range: [25, 42]
-  rsiOverboughtThreshold: number;  // default: 67, range: [58, 75]
-  bbPeriod: number;                // default: 20
-  bbStd: number;                   // default: 2.0
-  maxTicksInTrade: number;         // default: 200
-  minConfluenceScore: number;       // default: 4 (require 4 of 5 signals)
-  atrStopMultiplier: number;        // default: 1.5
-  regimeAdxThreshold: number;       // default: 20
+  rsiOversoldThreshold: number;
+  rsiOverboughtThreshold: number;
+  bbPeriod: number;
+  bbStd: number;
+  maxTicksInTrade: number;
+  minConfluenceScore: number;
+  atrStopMultiplier: number;
+  regimeAdxThreshold: number;
 }
 
 export interface CircuitBreakerStats {
   sessionStartBalance: number;
-  sessionLossLimitPct: number;    // default 0.03 (3%)
-  dailyLossLimitPct: number;      // default 0.05 (5%)
-  maxConsecutiveLosses: number;   // default 5
-  cooldownRemaining: number;      // in seconds. 0 if ok
+  sessionLossLimitPct: number;
+  dailyLossLimitPct: number;
+  maxConsecutiveLosses: number;
+  cooldownRemaining: number;
   cooldownMessage: string;
   peakBalance: number;
   sessionBlocked?: boolean;
@@ -135,7 +136,7 @@ export interface BacktestResult {
 export interface InstrumentConfig {
   id: string;
   name: string;
-  volatility: number; // custom base volatility level
+  volatility: number;
   tickType: "1s" | "std";
   idealStrategy: "mean_reversion" | "breakout" | "trend" | "spike_fade" | "range_fade" | "hybrid";
   multiplierOptions: number[];
@@ -147,49 +148,38 @@ export interface SubAlgorithm {
   name: string;
   personality: string;
   enabled: boolean;
-  
-  // Specific base indicators setup
   rsiOversoldThreshold: number;
   rsiOverboughtThreshold: number;
   bbPeriod: number;
   bbStd: number;
   minConfluenceScore: number;
   atrStopMultiplier: number;
-  
-  // Dynamic directives from Governor (ML-adjusted value mapping)
-  learningAdjustmentFactor: number; // multiplier on thresholds (e.g. 1.0)
-  targetRiskStakeMultiplier: number; // Kelly scaling factor
-  cooldownUntil: number; // block trading if epoch < cooldownUntil
-  directiveMessage: string; // Dynamic message describing Governor's active posture
+  learningAdjustmentFactor: number;
+  targetRiskStakeMultiplier: number;
+  cooldownUntil: number;
+  directiveMessage: string;
   recentWinRate: number;
-
-  // Performance Adjustments (Solves miniaturized wins and large losses)
-  targetLossPct: number; // Max percentage of stake to risk at Stop Loss. E.g. 0.25 is 25%.
-  timeExitEnabled: boolean; // Toggle timed-out exits
-  maxTicksInTrade: number; // Custom tick limit before forced resolution
+  targetLossPct: number;
+  timeExitEnabled: boolean;
+  maxTicksInTrade: number;
   breakEvenEnabled?: boolean;
   trailingStopEnabled?: boolean;
-
-  // Stats
   totalTrades: number;
   winningTrades: number;
   totalPnl: number;
   consecutiveLosses: number;
   consecutiveWins: number;
-
-  // Live setups/indicators
   rsiVal: number;
   bbPct: number;
   adxVal: number;
   atrVal: number;
   confluenceScore: number;
   mRegime: MarketRegime;
-  hurstVal?: number; // DFA-1 256-tick rolling estimate
-  hurstConfirm?: number; // R/S 1024-tick confirmation
-  hurstRSquared?: number; // DFA fit quality (R2)
-  hurstMacro?: number; // R/S 2000-tick macro structural persistence
-  convictionScore?: number; // SFT-V2 Conviction Composite Score (0.00 to 1.00)
-  kamaValue?: number; // Kaufman Adaptive Moving Average
-  tailExponent?: number; // Hill Estimator tail exponent (alpha hat)
+  hurstVal?: number;
+  hurstConfirm?: number;
+  hurstRSquared?: number;
+  hurstMacro?: number;
+  convictionScore?: number;
+  kamaValue?: number;
+  tailExponent?: number;
 }
-

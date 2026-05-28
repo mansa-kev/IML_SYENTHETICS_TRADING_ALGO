@@ -30,7 +30,7 @@ import {
   Info,
   PieChart
 } from "lucide-react";
-import { MarketRegime, ActivePosition, TradeRecord, LearningParams } from "./types/sovereign";
+import { MarketRegime, ActivePosition, TradeRecord, LearningParams } from "./types/iml";
 import {
   ResponsiveContainer,
   AreaChart,
@@ -58,6 +58,10 @@ export default function App() {
   // Top level server states
   const [balance, setBalance] = useState<number>(0.00);
   const [peakBalance, setPeakBalance] = useState<number>(0.00);
+  const [sessionStartBalance, setSessionStartBalance] = useState<number>(0.00);
+  const [sessionClosedPnl, setSessionClosedPnl] = useState<number>(0.00);
+  const [sessionOpenPnl, setSessionOpenPnl] = useState<number>(0.00);
+  const [estimatedSessionEquity, setEstimatedSessionEquity] = useState<number>(0.00);
   const [tradingEnabled, setTradingEnabled] = useState<boolean>(false);
   const [symbol, setSymbol] = useState<string>("R_10");
   const [symbolName, setSymbolName] = useState<string>("Volatility 10 (1s)");
@@ -65,7 +69,7 @@ export default function App() {
   const [tradingMode, setTradingMode] = useState<"MULTIPLIER" | "HYBRID_LINEAR" | "AUTO">("AUTO");
   const [isAuthorized, setIsAuthorized] = useState<boolean>(false);
 
-  // Sovereign Hybrid Risk Engine (SHRE) configs:
+  // Infinity Markets Lab Hybrid Risk Engine (IML-HRE) configs:
   const [hybridRiskType, setHybridRiskType] = useState<"FIXED" | "PERCENT">("FIXED");
   const [hybridRiskFixedAmount, setHybridRiskFixedAmount] = useState<number>(25.0);
   const [hybridRiskPercent, setHybridRiskPercent] = useState<number>(1.0);
@@ -95,6 +99,10 @@ export default function App() {
   
   const [activePositions, setActivePositions] = useState<ActivePosition[]>([]);
   const [completedTrades, setCompletedTrades] = useState<TradeRecord[]>([]);
+  const [completedTradesTotal, setCompletedTradesTotal] = useState<number>(0);
+  const [completedTradesReturned, setCompletedTradesReturned] = useState<number>(0);
+  const [completedTradesCumulativeOffset, setCompletedTradesCumulativeOffset] = useState<number>(0);
+  const [symbolDistribution, setSymbolDistribution] = useState<Array<{symbol:string;name:string;count:number;pct:number}>>([]);
   const [stats, setStats] = useState({
     totalTrades: 0,
     wins: 0,
@@ -127,6 +135,8 @@ export default function App() {
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
   const [logs, setLogs] = useState<string[]>([]);
+  const [logStartDate, setLogStartDate] = useState<string>("");
+  const [logEndDate, setLogEndDate] = useState<string>("");
 
   // Sub-algorithm Config Modal View States
   const [selectedSubSymbol, setSelectedSubSymbol] = useState<string | null>(null);
@@ -186,6 +196,10 @@ export default function App() {
       
       setBalance(data.balance);
       setPeakBalance(data.peakBalance);
+      setSessionStartBalance(data.sessionStartBalance || data.balance);
+      setSessionClosedPnl(data.sessionClosedPnl || 0);
+      setSessionOpenPnl(data.sessionOpenPnl || 0);
+      setEstimatedSessionEquity(data.estimatedSessionEquity || data.balance);
       setTradingEnabled(data.tradingEnabled);
       setSymbol(data.symbol);
       setSymbolName(data.symbolName);
@@ -209,6 +223,10 @@ export default function App() {
       setCurrentPrice(data.currentPrice);
       setActivePositions(data.activePositions);
       setCompletedTrades(data.completedTrades);
+      setCompletedTradesTotal(data.completedTradesTotal || data.stats?.totalTrades || data.completedTrades?.length || 0);
+      setCompletedTradesReturned(data.completedTradesReturned || data.completedTrades?.length || 0);
+      setCompletedTradesCumulativeOffset(data.completedTradesCumulativeOffset || 0);
+      if (data.symbolDistribution) setSymbolDistribution(data.symbolDistribution);
       setStats(data.stats);
       setCurrentParams(data.parameters);
       setCircuitStats({
@@ -268,7 +286,7 @@ export default function App() {
     }
   };
 
-  // Synchronise and persist the Sovereign Hybrid Risk Engine properties
+  // Synchronise and persist the IML Hybrid Risk Engine properties
   const saveHybridConfig = async (newConfig: Record<string, any>) => {
     if (newConfig.hybridRiskType !== undefined) setHybridRiskType(newConfig.hybridRiskType);
     if (newConfig.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(newConfig.hybridRiskFixedAmount);
@@ -342,11 +360,21 @@ export default function App() {
   };
 
   const triggerResetEngine = async () => {
+    // Immediately wipe ALL local state for instant visual clear across every log/data section
+    setLogs([]);
+    setAiReport("");
+    setReportSummary(null);
+    setCompletedTrades([]);
+    setActivePositions([]);
+    setSymbolDistribution([]);
+    setCompletedTradesTotal(0);
+    setCompletedTradesReturned(0);
+    setCompletedTradesCumulativeOffset(0);
+    setStats({ totalTrades: 0, wins: 0, winRate: 0, totalPnl: 0, maxDrawdown: 0, streakLoss: 0, streakWin: 0 });
+    setShowResetConfirm(false);
     try {
       await fetch("/api/reset", { method: "POST" });
-      setAiReport("");
       fetchState();
-      setShowResetConfirm(false);
     } catch (err) {
       console.error(err);
     }
@@ -354,6 +382,19 @@ export default function App() {
 
   const forceReset = () => {
     setShowResetConfirm(true);
+  };
+
+  const downloadLogs = (range?: string) => {
+    const params = new URLSearchParams({ format: "csv" });
+    if (range) {
+      params.set("range", range);
+    } else if (logStartDate && logEndDate) {
+      params.set("start", logStartDate);
+      params.set("end", logEndDate);
+    } else {
+      params.set("range", "today");
+    }
+    window.open(`/api/logs/export?${params.toString()}`, "_blank");
   };
 
   // Trigger Gemini quantitative analytical report
@@ -385,7 +426,7 @@ export default function App() {
 
   const handleForceReport = async () => {
     setReportGenerating(true);
-    setLoaderStep("AWAKENING SOVEREIGN MOTHER ALGORITHM...");
+    setLoaderStep("AWAKENING IML MOTHER ALGORITHM...");
     try {
       const startRes = await fetch("/api/force-report", { method: "POST" });
       if (!startRes.ok) throw new Error("Trigger failed");
@@ -426,7 +467,7 @@ export default function App() {
     } catch (err) {
       console.error(err);
       setReportGenerating(false);
-      alert("Sovereign analytical trigger pipeline failed.");
+      alert("Infinity Markets Lab analytical trigger pipeline failed.");
     }
   };
 
@@ -716,7 +757,7 @@ export default function App() {
           <div className="flex flex-wrap items-center gap-3">
             <BookMarked className="w-7 h-7 text-brand-peach" />
             <h1 className="text-2xl font-display font-medium tracking-tight text-brand-mint">
-              SOVEREIGN TRADE ENGINE
+              INFINITY MARKETS LAB TRADING ALGORITHM
             </h1>
             <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono text-emerald-400 font-bold">
               <span className={`w-2 h-2 rounded-full ${tradingEnabled ? "bg-emerald-500 animate-pulse" : "bg-red-500"}`}></span>
@@ -725,7 +766,7 @@ export default function App() {
             <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold text-brand-gold">
               <span className={`w-2 h-2 rounded-full ${isAuthorized ? "bg-emerald-400 animate-pulse" : "bg-red-500"}`}></span>
               <span className={isAuthorized ? "text-brand-mint" : "text-red-400"}>
-                DERIV AUTH: {isAuthorized ? "AUTHORIZED" : "OBSERVER ONLY"}
+                DERIV AUTH: {isAuthorized ? "AUTHORIZED" : "NOT AUTHORIZED"}
               </span>
             </span>
           </div>
@@ -781,13 +822,72 @@ export default function App() {
           <button
             onClick={forceReset}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-red-900/20 border border-red-550/30 hover:bg-red-950/40 text-red-400 hover:text-red-350 transition cursor-pointer text-xs font-mono font-bold uppercase"
-            title="Sovereign Reset Database to default baseline"
+            title="Infinity Markets Lab reset database to default baseline"
           >
             <RefreshCw className="w-3.5 h-3.5 text-red-405" />
             Reset Metrics & Logs
           </button>
         </div>
       </header>
+
+      <section className="w-full max-w-none bg-[#101512] border border-brand-teal/25 rounded-xl p-3 flex flex-wrap items-center gap-2 shadow-lg">
+        <span className="text-brand-mint/70 text-xs uppercase font-mono font-bold mr-1">Engine Logs</span>
+        {[
+          ["today", "Today"],
+          ["3d", "3 Days"],
+          ["7d", "7 Days"],
+          ["30d", "30 Days"],
+        ].map(([range, label]) => (
+          <button
+            key={range}
+            onClick={() => downloadLogs(range)}
+            className="px-2.5 py-1 rounded bg-brand-teal/20 border border-brand-teal/30 text-brand-mint text-xs font-mono hover:bg-brand-teal/35 transition"
+          >
+            {label}
+          </button>
+        ))}
+        <div className="w-px h-5 bg-brand-teal/30 mx-1" />
+        <span className="text-indigo-400/80 text-xs uppercase font-mono font-bold mr-1">Self-Improve Lab</span>
+        {[["today","Today"],["7d","7 Days"],["30d","30 Days"]].map(([range, label]) => (
+          <button key={`lab-${range}`}
+            onClick={() => {
+              const params = new URLSearchParams({ format: "csv", range, category: "GOVERNOR_POLICE,GOVERNOR_INTERVENTION,GOVERNOR_DECISION" });
+              window.open(`/api/logs/export?${params}`, "_blank");
+            }}
+            className="px-2.5 py-1 rounded bg-indigo-900/30 border border-indigo-700/40 text-indigo-300 text-xs font-mono hover:bg-indigo-900/50 transition"
+          >{label}</button>
+        ))}
+        <div className="w-px h-5 bg-brand-teal/30 mx-1" />
+        <span className="text-fuchsia-400/80 text-xs uppercase font-mono font-bold mr-1">Optimization Stream</span>
+        {[["today","Today"],["7d","7 Days"],["30d","30 Days"]].map(([range, label]) => (
+          <button key={`opt-${range}`}
+            onClick={() => {
+              const params = new URLSearchParams({ format: "csv", range, category: "PARAMS,RISK_CONTROL,REPORT_SYSTEM,SYSTEM" });
+              window.open(`/api/logs/export?${params}`, "_blank");
+            }}
+            className="px-2.5 py-1 rounded bg-fuchsia-900/30 border border-fuchsia-700/40 text-fuchsia-300 text-xs font-mono hover:bg-fuchsia-900/50 transition"
+          >{label}</button>
+        ))}
+        <input
+          type="date"
+          value={logStartDate}
+          onChange={(e) => setLogStartDate(e.target.value)}
+          className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 py-1 text-xs font-mono"
+        />
+        <input
+          type="date"
+          value={logEndDate}
+          onChange={(e) => setLogEndDate(e.target.value)}
+          className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 py-1 text-xs font-mono"
+        />
+        <button
+          onClick={() => downloadLogs()}
+          className="px-2.5 py-1 rounded bg-brand-gold text-brand-slate text-xs font-mono font-bold hover:bg-brand-gold/90 transition"
+        >
+          Custom Period
+        </button>
+        <span className="text-brand-mint/45 text-xs font-mono">Kenya day boundary: midnight Africa/Nairobi</span>
+      </section>
 
       {/* ==========================================
           POWER-LAW SAFETY HALVING TRIGGER BANNER
@@ -828,15 +928,18 @@ export default function App() {
           
           {/* Metric 1: Absolute Capital Equity Balance - UNIQUE COLOURED: Deep Teal */}
           <div className="bg-brand-teal border border-brand-teal/40 rounded-xl p-5 flex flex-col justify-between shadow-xl hover:translate-y-[-2px] transition-all duration-300 min-h-[110px]">
-            <span className="text-brand-mint/75 text-sm uppercase font-mono tracking-wider block font-bold">Net Capital Equity balance</span>
+            <span className="text-brand-mint/75 text-sm uppercase font-mono tracking-wider block font-bold">Deriv Account Balance (Live)</span>
             <div className="flex items-baseline gap-2 mt-1.5">
               <span className="text-2xl font-mono font-extrabold text-brand-mint">${balance.toFixed(2)}</span>
               <span className={`text-sm font-mono font-bold px-1.5 py-0.5 rounded ${stats.totalPnl >= 0 ? "bg-emerald-500/25 text-emerald-300" : "bg-red-500/25 text-red-300"}`}>
-                {stats.totalPnl >= 0 ? "+" : ""}${stats.totalPnl.toFixed(2)}
+                Closed {sessionClosedPnl >= 0 ? "+" : ""}${sessionClosedPnl.toFixed(2)}
               </span>
             </div>
             <span className="text-brand-mint/60 text-sm block mt-1.5 font-mono">
-              Peak Capital: <span className="font-semibold text-brand-mint">${peakBalance.toFixed(2)}</span>
+              Local Closed+Open Est: <span className="font-semibold text-brand-mint">${(sessionStartBalance + sessionClosedPnl + sessionOpenPnl).toFixed(2)}</span>
+            </span>
+            <span className="text-brand-mint/50 text-xs block mt-1 font-mono">
+              Start ${sessionStartBalance.toFixed(2)} • Open {sessionOpenPnl >= 0 ? "+" : ""}${sessionOpenPnl.toFixed(2)} • Peak ${peakBalance.toFixed(2)}
             </span>
           </div>
 
@@ -915,7 +1018,7 @@ export default function App() {
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
           {Object.keys(subAlgorithms).length === 0 ? (
             <div className="col-span-5 text-center py-12 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-600 text-base font-mono">
-              Bootstrapping sovereign subprocess registries and indicator warming tables...
+              Bootstrapping IML subprocess registries and indicator warming tables...
             </div>
           ) : (
             Object.values(subAlgorithms).map((sub: any) => {
@@ -1158,7 +1261,7 @@ export default function App() {
               <div className="flex items-start gap-1.5">
                 <ShieldAlert className="w-4 h-4 text-brand-mint shrink-0 mt-0.5" />
                 <div>
-                  <span className="text-brand-mint font-medium font-mono">Sovereign Edge Rules Engage</span>
+                  <span className="text-brand-mint font-medium font-mono">IML Edge Rules Engage</span>
                   <p className="text-sm text-brand-mint/70 mt-0.5 leading-relaxed font-mono">
                     Staking employs adaptive Half-Kelly formulations. Risk constraints prevent Martingale staking or averaging down losing exposures. Entries strictly toggle off during volatile <span className="text-brand-mint font-bold italic">TRANSITION</span> regimes.
                   </p>
@@ -1168,7 +1271,7 @@ export default function App() {
           </div>
 
 
-          {/* SOVEREIGN HYBRID RISK ENGINE (SHRE) PROFILE */}
+          {/* IML HYBRID RISK ENGINE (SHRE) PROFILE */}
           <div className="bg-[#111615] border border-brand-teal/20 rounded-xl p-5 shadow-xl space-y-4">
             <div className="flex items-center justify-between pb-2 border-b border-brand-teal/10">
               <span className="text-sm uppercase font-mono text-brand-mint font-semibold flex items-center gap-1.5">
@@ -1320,14 +1423,14 @@ export default function App() {
             </div>
           </div>
 
-          {/* SOVEREIGN ENGINE ALGORITHM PERFORMANCE HUB */}
+          {/* IML ENGINE ALGORITHM PERFORMANCE HUB */}
           <div className="bg-slate-900/40 border border-[#1e293b] rounded-xl p-5 shadow-xl space-y-4">
             <div className="flex flex-col gap-1">
               <span className="text-sm uppercase font-mono text-brand-peach tracking-wider font-bold flex items-center gap-1.5">
-                <Award className="w-4 h-4 text-brand-peach" /> Sovereign Multi-Algorithm Performance Hub
+                <Award className="w-4 h-4 text-brand-peach" /> IML Multi-Algorithm Performance Hub
               </span>
               <p className="text-xs text-slate-400 font-sans leading-normal">
-                Sovereign Master allocation metrics. Select any motherboard algorithm or asset subprocess below to expand full audit traces.
+                IML master allocation metrics. Select any motherboard algorithm or asset subprocess below to expand full audit traces.
               </p>
             </div>
 
@@ -1344,7 +1447,7 @@ export default function App() {
               <div className="flex justify-between items-start">
                 <div className="space-y-1">
                   <h4 className="text-sm font-bold font-mono text-brand-mint flex items-center gap-1.5 uppercase">
-                    <Cpu className="w-3.5 h-3.5 text-brand-peach" /> Sovereign Mother Algorithm
+                    <Cpu className="w-3.5 h-3.5 text-brand-peach" /> IML Mother Algorithm
                   </h4>
                   <p className="text-xs text-brand-mint/60 font-sans max-w-[260px]">
                     Master risk supervisor, Half-Kelly allocation engine, & circuit breaker sentinel.
@@ -1616,21 +1719,33 @@ export default function App() {
           
           {/* Diagnostic status block for circuit breakers */}
           {(circuitStats.cooldownRemaining > 0 || circuitStats.sessionBlocked) && (
-            <div className={`p-4 rounded border text-sm font-mono space-y-1 ${circuitStats.sessionBlocked ? 'bg-red-950/40 border-red-500 shadow-red-900/50 shadow-lg' : 'bg-red-600/10 border-red-500/20'}`}>
+            <div className={`p-4 rounded border text-sm font-mono space-y-1 ${circuitStats.sessionBlocked ? 'bg-red-950/40 border-red-500 shadow-red-900/50 shadow-lg' : 'bg-amber-600/10 border-amber-500/30'}`}>
               <div className="flex items-center gap-1.5 text-red-400 font-semibold">
-                <ShieldAlert className="w-4 h-4" /> {circuitStats.sessionBlocked ? 'TERMINAL BLOCK' : 'LOCKOUT BREAKER TRIGGERED'}
+                <ShieldAlert className="w-4 h-4" /> {circuitStats.sessionBlocked ? 'MANUAL EQUITY INTERVENTION' : 'GOVERNOR AUTO-RESUME LOCKOUT'}
               </div>
-              <p className="text-sm text-red-400/80 leading-relaxed">
+              <p className={`text-sm leading-relaxed ${circuitStats.sessionBlocked ? 'text-red-400/80' : 'text-amber-300/90'}`}>
                 {circuitStats.cooldownMessage}
               </p>
               {!circuitStats.sessionBlocked && (
                 <div className="text-sm text-slate-400">
-                  Cool down clearance trace: {circuitStats.cooldownRemaining}s
+                  Auto-resume countdown: {Math.floor(circuitStats.cooldownRemaining / 60)}m {String(circuitStats.cooldownRemaining % 60).padStart(2, "0")}s
                 </div>
               )}
               {circuitStats.sessionBlocked && (
-                <div className="text-sm text-red-300 font-bold mt-2 pt-2 border-t border-red-900/50">
-                  Trading is permanently disabled for this session due to crossing catastrophic loss limits. Please manually reset the session.
+                <div className="mt-2 pt-2 border-t border-red-900/50 space-y-2">
+                  <div className="text-sm text-red-300 font-bold">
+                    Trading stopped: 3% live equity loss limit reached. Review your risk settings, then resume manually.
+                  </div>
+                  <button
+                    onClick={async () => {
+                      try {
+                        await fetch("/api/resume-session", { method: "POST" });
+                      } catch {}
+                    }}
+                    className="w-full px-3 py-1.5 rounded bg-amber-600/20 border border-amber-500/40 text-amber-300 hover:bg-amber-600/35 hover:text-amber-200 transition text-xs font-mono font-bold uppercase tracking-wider cursor-pointer"
+                  >
+                    ✅ I Have Reviewed Risk — Resume Session (No Data Lost)
+                  </button>
                 </div>
               )}
             </div>
@@ -1685,7 +1800,7 @@ export default function App() {
           {/* QUANTITATIVE MODEL ADVISER - GEMINI TERMINAL */}
           <div className="bg-slate-900/25 border border-slate-900 rounded p-5">
             <span className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold flex items-center gap-2 mb-3">
-              <Sparkles className="w-4 h-4 text-purple-400" /> Sovereign AI Analyst
+              <Sparkles className="w-4 h-4 text-purple-400" /> IML AI Analyst
             </span>
             <p className="text-sm text-slate-400 leading-relaxed mb-4">
               Prompt server-side Gemini 3.5-flash to diagnostics pattern drift in volatility indices:
@@ -1712,7 +1827,7 @@ export default function App() {
               <div className="flex gap-2">
                 <input
                   type="text"
-                  placeholder="Ask Sovereign AI..."
+                  placeholder="Ask IML AI Analyst..."
                   value={aiPrompt}
                   onChange={(e) => setAiPrompt(e.target.value)}
                   className="flex-1 bg-slate-950 text-slate-200 border border-slate-800 rounded px-2.5 py-1.5 text-sm font-mono outline-none"
@@ -1750,7 +1865,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Confluence criteria widget panel - Moved here below Sovereign AI Analyst */}
+          {/* Confluence criteria widget panel - Moved here below IML AI Analyst */}
           <div className="bg-slate-900/25 border border-slate-900 rounded p-5">
             <div className="flex items-center justify-between mb-4">
               <span className="text-sm uppercase font-mono text-indigo-400 tracking-wider font-semibold">
@@ -1780,7 +1895,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* Sovereign System Report Telemetry Card */}
+          {/* IML System Report Telemetry Card */}
           <div className="bg-[#0b0f19] border border-cyan-500/30 rounded-xl p-5 shadow-2xl space-y-5 relative overflow-hidden font-mono text-xs">
             {/* Background cyan/indigo ambient light effects */}
             <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/5 rounded-full blur-2xl pointer-events-none" />
@@ -1791,7 +1906,7 @@ export default function App() {
               <div className="flex items-center gap-2">
                 <div className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
                 <span className="text-cyan-400 font-bold tracking-widest text-xs uppercase">
-                  SOVEREIGN III • ANALYTICAL DIODE
+                  IML III • ANALYTICAL DIODE
                 </span>
               </div>
               <span className="text-[10px] text-slate-500 px-2 py-0.5 rounded bg-slate-950 border border-slate-800">
@@ -1900,8 +2015,8 @@ export default function App() {
                   <Cpu className="w-5 h-5 text-cyan-500/50 animate-pulse" />
                 </div>
                 <div className="text-center space-y-1">
-                  <p className="text-slate-400 font-bold uppercase tracking-wider text-[11px]">Sovereign Diagnostics Inert</p>
-                  <p className="text-slate-500 text-[10px]">Settled trade volume logged: {completedTrades.length || 114} trades</p>
+                  <p className="text-slate-400 font-bold uppercase tracking-wider text-[11px]">IML Diagnostics Inert</p>
+                  <p className="text-slate-500 text-[10px]">Settled trade volume logged: {completedTrades.length} trades</p>
                 </div>
                 <button
                   onClick={handleForceReport}
@@ -2182,17 +2297,41 @@ export default function App() {
                 </div>
                 
                 {completedTrades.length > 0 && (
-                  <div className="flex items-center gap-4 text-sm font-mono">
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-slate-500">Gross Return:</span>
-                      <span className={`font-bold ${completedTrades.reduce((sum, t) => sum + t.pnl, 0) >= 0 ? "text-emerald-400" : "text-red-400"}`}>
-                        {completedTrades.reduce((sum, t) => sum + t.pnl, 0) >= 0 ? "+" : ""}${completedTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2)}
-                      </span>
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-4 text-sm font-mono flex-wrap">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-slate-500">Gross Return:</span>
+                        <span className={`font-bold ${stats.totalPnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>
+                          {stats.totalPnl >= 0 ? "+" : ""}${stats.totalPnl.toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-slate-500">Total Runs:</span>
+                        <span className="text-slate-200 font-bold">{completedTradesTotal} Trades</span>
+                        <span className="text-slate-500 text-xs">({completedTradesReturned} shown)</span>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-slate-500">Total Runs:</span>
-                      <span className="text-slate-200 font-bold">{completedTrades.length} Trades</span>
-                    </div>
+                    {symbolDistribution.length > 0 && (
+                      <div className="pt-2 border-t border-slate-800/50">
+                        <div className="text-[10px] uppercase font-mono text-slate-500 mb-1.5 tracking-wider">Symbol Concentration</div>
+                        <div className="w-full h-2 rounded-full overflow-hidden flex border border-slate-800 mb-1.5">
+                          {symbolDistribution.map((s, i) => {
+                            const colors = ["bg-indigo-500","bg-emerald-500","bg-amber-500","bg-rose-500","bg-fuchsia-500","bg-cyan-500"];
+                            return <div key={s.symbol} className={`${colors[i % colors.length]} transition-all`} style={{width:`${s.pct}%`}} title={`${s.symbol}: ${s.pct}%`} />;
+                          })}
+                        </div>
+                        <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+                          {symbolDistribution.map((s, i) => {
+                            const colors = ["text-indigo-400","text-emerald-400","text-amber-400","text-rose-400","text-fuchsia-400","text-cyan-400"];
+                            return (
+                              <span key={s.symbol} className={`text-[10px] font-mono ${colors[i % colors.length]}`}>
+                                {s.symbol} <span className="text-slate-500">{s.pct}%</span>
+                              </span>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -2208,13 +2347,13 @@ export default function App() {
                   <ResponsiveContainer width="100%" height="100%">
                     <AreaChart
                       data={(() => {
-                        let total = 0;
+                        let total = completedTradesCumulativeOffset;
                         return [
-                          { name: "INIT", cumulative: 0, pnl: 0, label: "Start" },
+                          { name: completedTradesTotal > completedTrades.length ? `#${completedTradesTotal - completedTrades.length}` : "INIT", cumulative: completedTradesCumulativeOffset, pnl: 0, label: "Prior cumulative PnL" },
                           ...completedTrades.map((t, index) => {
                             total = parseFloat((total + t.pnl).toFixed(2));
                             return {
-                              name: `#${index + 1}`,
+                              name: `#${Math.max(1, completedTradesTotal - completedTrades.length + index + 1)}`,
                               cumulative: total,
                               pnl: t.pnl,
                               label: `${t.symbol} (${t.pnl >= 0 ? "+" : ""}${t.pnl.toFixed(1)})`
@@ -2493,6 +2632,131 @@ export default function App() {
             </div>
           </div>
 
+        </section>
+
+        {/* ==========================================
+            DRAWDOWN DEPTH ANALYSIS CHART
+            ========================================== */}
+        <section className="lg:col-span-12 w-full mt-6 min-w-0">
+          <div className="bg-slate-900/40 border border-rose-900/30 rounded-xl p-5 shadow-2xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-4">
+              <div>
+                <span className="text-sm uppercase font-mono text-rose-400 tracking-wider font-bold flex items-center gap-2">
+                  📉 Drawdown Depth Analysis — Open Position MAE & Rolling Equity Drawdown
+                </span>
+                <span className="text-xs text-slate-500 font-sans mt-0.5 block">
+                  Maximum Adverse Excursion (how deep each trade went) and rolling peak-to-valley equity curve.
+                </span>
+              </div>
+              <div className="flex items-center gap-4 text-xs font-mono shrink-0">
+                <div className="flex items-center gap-1.5">
+                  <div className="w-3 h-1 rounded bg-rose-500" />
+                  <span className="text-slate-400">MAE per Trade</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <div className="w-3 h-1 rounded bg-amber-400" />
+                  <span className="text-slate-400">Rolling Drawdown %</span>
+                </div>
+              </div>
+            </div>
+            {completedTrades.length < 2 ? (
+              <div className="h-[260px] flex items-center justify-center border border-dashed border-rose-900/30 rounded bg-slate-950/20">
+                <span className="text-slate-600 text-xs font-mono uppercase tracking-widest animate-pulse">Awaiting trade settlements to build drawdown history...</span>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {/* Left: MAE bar chart per trade */}
+                <div>
+                  <span className="text-[10px] uppercase font-mono text-rose-400/70 block mb-2">Maximum Adverse Excursion (MAE) Per Trade</span>
+                  <div className="h-[220px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <BarChart
+                        data={completedTrades.map((t, i) => ({
+                          name: `#${Math.max(1, completedTradesTotal - completedTrades.length + i + 1)}`,
+                          mae: Math.abs((t as any).maxAdverseExcursion || 0),
+                          pnl: t.pnl,
+                        }))}
+                        margin={{ top: 5, right: 5, left: -20, bottom: 0 }}
+                      >
+                        <CartesianGrid strokeDasharray="3 3" stroke="#0f172a" vertical={false} />
+                        <XAxis dataKey="name" stroke="#475569" fontSize={7} tickLine={false} axisLine={false} />
+                        <YAxis stroke="#475569" fontSize={8} tickLine={false} axisLine={false} tickFormatter={(v) => `$${v}`} />
+                        <RechartsTooltip
+                          contentStyle={{ backgroundColor: "#020617", fontSize: "9px", borderColor: "#1e293b", color: "#cbd5e1" }}
+                          formatter={(val: any, name: string) => [`$${parseFloat(val).toFixed(2)}`, name === "mae" ? "Max Adverse Excursion" : "Final PnL"]}
+                        />
+                        <Bar dataKey="mae" name="mae" radius={[2, 2, 0, 0]}>
+                          {completedTrades.map((t, idx) => (
+                            <Cell key={`mae-${idx}`} fill={t.pnl >= 0 ? "#f97316" : "#ef4444"} fillOpacity={0.75} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+                {/* Right: Rolling peak-to-valley equity drawdown % curve */}
+                <div>
+                  <span className="text-[10px] uppercase font-mono text-amber-400/70 block mb-2">Rolling Peak-to-Valley Equity Drawdown (%)</span>
+                  <div className="h-[220px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart
+                        data={(() => {
+                          let peak = 0;
+                          let running = completedTradesCumulativeOffset;
+                          return [
+                            { name: "INIT", dd: 0 },
+                            ...completedTrades.map((t, i) => {
+                              running = parseFloat((running + t.pnl).toFixed(2));
+                              if (running > peak) peak = running;
+                              const dd = peak > 0 ? parseFloat((((peak - running) / Math.max(1, Math.abs(peak))) * 100).toFixed(2)) : 0;
+                              return { name: `#${Math.max(1, completedTradesTotal - completedTrades.length + i + 1)}`, dd };
+                            })
+                          ];
+                        })()}
+                        margin={{ top: 5, right: 5, left: -15, bottom: 0 }}
+                      >
+                        <defs>
+                          <linearGradient id="ddGradient" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="5%" stopColor="#f59e0b" stopOpacity={0.3} />
+                            <stop offset="95%" stopColor="#ef4444" stopOpacity={0.05} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="#0f172a" vertical={false} />
+                        <XAxis dataKey="name" stroke="#475569" fontSize={7} tickLine={false} axisLine={false} />
+                        <YAxis stroke="#475569" fontSize={8} tickLine={false} axisLine={false} tickFormatter={(v) => `${v}%`} />
+                        <RechartsTooltip
+                          contentStyle={{ backgroundColor: "#020617", fontSize: "9px", borderColor: "#1e293b", color: "#cbd5e1" }}
+                          formatter={(val: any) => [`${parseFloat(val).toFixed(2)}%`, "Drawdown from Peak"]}
+                        />
+                        <Area type="monotone" dataKey="dd" stroke="#f59e0b" strokeWidth={2} fillOpacity={1} fill="url(#ddGradient)" name="Drawdown %" />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+                {/* Open positions current depth */}
+                {activePositions.length > 0 && (
+                  <div className="xl:col-span-2 mt-1 p-3 bg-rose-950/20 border border-rose-900/30 rounded-lg">
+                    <span className="text-[10px] uppercase font-mono text-rose-400/80 block mb-2">Live Open Position Depth</span>
+                    <div className="flex flex-wrap gap-3">
+                      {activePositions.map(pos => (
+                        <div key={pos.id} className="flex items-center gap-2 bg-slate-950/60 border border-slate-800 rounded px-3 py-1.5">
+                          <span className="text-xs font-mono text-slate-400">{pos.symbol}</span>
+                          <span className={`text-xs font-bold font-mono ${pos.pnl >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
+                            {pos.pnl >= 0 ? "+" : ""}${pos.pnl.toFixed(2)}
+                          </span>
+                          {(pos as any).maxAdverseExcursion !== undefined && (pos as any).maxAdverseExcursion < 0 && (
+                            <span className="text-[10px] font-mono text-orange-400">
+                              MAE: ${Math.abs((pos as any).maxAdverseExcursion).toFixed(2)}
+                            </span>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         </section>
 
       </footer>
@@ -3129,7 +3393,7 @@ export default function App() {
       })()}
 
       {/* ==========================================
-          SOVEREIGN DETAILED PERFORMANCE & ANALYTICS OVERLAY
+          IML DETAILED PERFORMANCE & ANALYTICS OVERLAY
           ========================================== */}
       {selectedPerfDetail && (() => {
         if (selectedPerfDetail === "MOTHER") {
@@ -3145,7 +3409,7 @@ export default function App() {
                     <Award className="w-5 h-5 text-brand-peach" />
                     <div>
                       <h3 className="text-base font-bold font-mono text-slate-100 uppercase tracking-wide">
-                        Sovereign Mother Algorithm
+                        IML Mother Algorithm
                       </h3>
                       <p className="text-xs text-slate-400 font-sans">
                         Master Governance Module &bull; Multi-Regime Strategy Allocator
@@ -3524,7 +3788,7 @@ export default function App() {
               {/* FOOTER */}
               <div className="border-t border-slate-900 px-6 py-4 flex justify-between items-center bg-slate-950">
                 <div className="flex items-center gap-1.5 text-xs text-slate-500 font-mono">
-                  <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" /> Complete coverage under Sovereign Risk Management rulesets.
+                  <ShieldCheck className="w-3.5 h-3.5 text-indigo-400" /> Complete coverage under Infinity Markets Lab Risk Management rulesets.
                 </div>
                 <button
                   onClick={() => setSelectedPerfDetail(null)}
@@ -3539,7 +3803,7 @@ export default function App() {
       })()}
 
       {/* ==========================================
-          SOVEREIGN SYSTEM CLEAN SLATE TRIGGER CONFIRMATION MODAL
+          IML SYSTEM CLEAN SLATE TRIGGER CONFIRMATION MODAL
           ========================================== */}
       {showResetConfirm && (
         <div className="fixed inset-0 bg-slate-950/90 backdrop-blur-sm flex items-center justify-center p-4 z-50">
@@ -3550,7 +3814,7 @@ export default function App() {
               </div>
               <div>
                 <h3 className="text-sm uppercase font-mono text-red-400 font-bold tracking-wider">
-                  Sovereign Clean Slate Init
+                  IML Clean Slate Init
                 </h3>
                 <p className="text-[10px] uppercase font-mono text-slate-500">
                   Critical Reset Execution Sequence
@@ -3567,7 +3831,7 @@ export default function App() {
                 <li>Wipes all active, pending, and past trade history logs</li>
                 <li>Resets demo/simulated virtual balance back to <span className="text-[#10b981] font-bold">$10,000.00</span></li>
                 <li>Synchronises live Deriv WS status stream and clears cooldown locks</li>
-                <li>Wipes the remote cloud database <span className="text-indigo-405">sovereign_trades</span> table on your Connected Supabase instances</li>
+                <li>Wipes the remote cloud database <span className="text-indigo-405">iml_trades</span> table on your Connected Supabase instances</li>
               </ul>
             </div>
 

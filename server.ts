@@ -10,7 +10,7 @@ import fs from "fs";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm } from "./src/types/sovereign.js";
+import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm } from "./src/types/iml.js";
 import { createClient } from "@supabase/supabase-js";
 import PDFDocument from "pdfkit";
 
@@ -27,9 +27,9 @@ const PORT = 3000;
 let balance = 10000.00;
 let peakBalance = 10000.00;
 let tradingEnabled = false;
-let selectedSymbol = "R_10"; // Volatility 10 (1s)
+let selectedSymbol = "R_75"; // Volatility 75 high-frequency focus
 let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
-// Sovereign Hybrid Risk Engine (SHRE) state variables
+// Infinity Markets Lab Hybrid Risk Engine (IML-HRE) state variables
 let hybridRiskType = "FIXED" as "FIXED" | "PERCENT";
 let hybridRiskFixedAmount = 25.00;
 let hybridRiskPercent = 0.5; // 0.5% of account balance (e.g. $50 on $10k)
@@ -46,21 +46,25 @@ const startEpoch = Math.floor(Date.now() / 1000);
 
 let activePositions: ActivePosition[] = [];
 let completedTrades: TradeRecord[] = [];
-let logs: string[] = [`[${new Date().toISOString()}] Sovereign Engine initializing under session key ${botSessionId}`];
+let logs: string[] = [`[${new Date().toISOString()}] Infinity Markets Lab Engine initializing under session key ${botSessionId}`];
 
 // Learning Engine Parameter defaults
 let currentParams: LearningParams = {
   rsiOversoldThreshold: 30,   // default: 30, range [25, 42]
   rsiOverboughtThreshold: 70,  // default: 70, range [58, 75]
   bbPeriod: 20,                // default: 20
-  bbStd: 2.25,                  // default: 2.25
-  maxTicksInTrade: 120,         // default: 120 ticks
+  bbStd: 2.50,                  // Rec: 2.50 — reduces false entries near bands
+  maxTicksInTrade: 60,          // Rec: 60 — hard temporal stop, prevents infinite holding
   minConfluenceScore: 3,       // require 3 of 5 indicators for entry
-  atrStopMultiplier: 3.15,      // default: 3.15
-  regimeAdxThreshold: 25,      // default: 25
+  atrStopMultiplier: 2.75,      // Rec: 2.75 — functional ATR stop (was corrupted to 9.22e30)
+  regimeAdxThreshold: 20,      // Rec: 20 — gate mean-reversion earlier in trend regimes
 };
 
 const defaultParams: LearningParams = { ...currentParams };
+const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
+
+// Pending Deriv order queue — maps local position ID to Deriv contract_id on buy confirmation
+const pendingOrderQueue: Array<{ localId: string; symbol: string; direction: string }> = [];
 
 // Circuit Breakers states
 let circuitBreakerCooldown = 0; // seconds remaining
@@ -68,6 +72,9 @@ let cooldownMessage = "";
 let consecutiveLosses = 0;
 let consecutiveWins = 0;
 let sessionBlocked = false;
+let sessionStartBalance = 0;
+let circuitBreakerResumeAt = 0;
+let tradingAutoResumePending = false;
 
 // Historical pricing buffers (rolling arrays of size 2000)
 const maxBufferLength = 2000;
@@ -104,7 +111,7 @@ interface StrategyProposal {
 }
 
 let governorFocusSymbol = "R_10";
-let governorStatus = "SOVEREIGN AGENTIC CORE: ONLINE";
+let governorStatus = "IML AGENTIC CORE: ONLINE";
 let governorAgenticScore = 1.0; // 100% Agentic goal
 
 const governorMemory: {
@@ -129,17 +136,19 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOversoldThreshold: 30,
     rsiOverboughtThreshold: 70,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.20,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.50,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
     targetLossPct: 0.15,
     timeExitEnabled: true,
-    maxTicksInTrade: 120,
+    breakEvenEnabled: true,
+    trailingStopEnabled: true,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -157,14 +166,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Volatility 25 (1s)",
     personality: "Sentinel Divergence Sniper",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 31,
+    rsiOverboughtThreshold: 69,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.30,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.60,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -172,7 +181,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 50,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -188,16 +197,16 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
   R_75: {
     symbol: "R_75",
     name: "Volatility 75 (1s)",
-    personality: "Apex Volatility Breakout",
+    personality: "Apex Volatility HFT Scalar",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 32,
+    rsiOverboughtThreshold: 68,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.50,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.75,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -205,7 +214,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 60,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -223,14 +232,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Crash 500 Index",
     personality: "Crash Extreme Recovery Scalar",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 22,
+    rsiOverboughtThreshold: 75,
     bbPeriod: 20,
-    bbStd: 2.25,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    bbStd: 2.75,
+    minConfluenceScore: 4,
+    atrStopMultiplier: 2.25,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -238,7 +247,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -256,14 +265,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Boom 500 Index",
     personality: "Boom Consolidator Ridge Sniper",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 25,
+    rsiOverboughtThreshold: 78,
     bbPeriod: 20,
-    bbStd: 2.25,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    bbStd: 2.75,
+    minConfluenceScore: 4,
+    atrStopMultiplier: 2.25,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -271,7 +280,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -289,14 +298,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Volatility 100 Index",
     personality: "Spike Breakout Raider",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 28,
+    rsiOverboughtThreshold: 72,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.75,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 3.00,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -304,7 +313,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 75,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -371,14 +380,14 @@ function logSupabaseRLSInstructions() {
     `To fix this, go to Supabase SQL Editor and run:`,
     ``,
     `-- Disable RLS if you only use this project privately for the bot:`,
-    `ALTER TABLE sovereign_state DISABLE ROW LEVEL SECURITY;`,
-    `ALTER TABLE sovereign_trades DISABLE ROW LEVEL SECURITY;`,
-    `ALTER TABLE sovereign_strategy_history DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE iml_state DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE iml_trades DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE iml_strategy_history DISABLE ROW LEVEL SECURITY;`,
     ``,
     `-- OR, create an open policy for the bot:`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_state FOR ALL USING (true) WITH CHECK (true);`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_trades FOR ALL USING (true) WITH CHECK (true);`,
-    `CREATE POLICY "Allow all operations for anon" ON sovereign_strategy_history FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON iml_state FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON iml_trades FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON iml_strategy_history FOR ALL USING (true) WITH CHECK (true);`,
     ``,
     `Alternatively, place your SUPABASE_SERVICE_ROLE_KEY into the Environment logic instead of SUPABASE_ANON_KEY to fully bypass RLS.`
   ];
@@ -393,16 +402,16 @@ function logSupabaseSetupInstructions() {
   lastInstructionLogged = now;
   
   const instruction = [
-    `[SUPABASE] ⚠️ Table 'sovereign_state' or 'sovereign_trades' does not exist yet.`,
+    `[SUPABASE] ⚠️ Table 'iml_state' or 'iml_trades' does not exist yet.`,
     `Please run the following SQL schema in your Supabase SQL Editor to enable full session cloud backups:`,
     ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_state (`,
+    `CREATE TABLE IF NOT EXISTS iml_state (`,
     `  id text PRIMARY KEY,`,
     `  data jsonb NOT NULL,`,
     `  updated_at timestamp with time zone DEFAULT now()`,
     `);`,
     ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_trades (`,
+    `CREATE TABLE IF NOT EXISTS iml_trades (`,
     `  id text PRIMARY KEY,`,
     `  symbol text NOT NULL,`,
     `  contract_type text,`,
@@ -425,11 +434,22 @@ function logSupabaseSetupInstructions() {
     `  created_at timestamp with time zone DEFAULT now()`,
     `);`,
     ``,
-    `CREATE TABLE IF NOT EXISTS sovereign_strategy_history (`,
+    `CREATE TABLE IF NOT EXISTS iml_strategy_history (`,
     `  id bigserial PRIMARY KEY,`,
     `  epoch_recorded bigint NOT NULL,`,
     `  global_parameters jsonb,`,
     `  sub_algorithms jsonb,`,
+    `  created_at timestamp with time zone DEFAULT now()`,
+    `);`,
+    ``,
+    `CREATE TABLE IF NOT EXISTS iml_logs (`,
+    `  id bigserial PRIMARY KEY,`,
+    `  session_id text NOT NULL,`,
+    `  level text,`,
+    `  category text,`,
+    `  message text NOT NULL,`,
+    `  raw text NOT NULL,`,
+    `  kenya_day date NOT NULL,`,
     `  created_at timestamp with time zone DEFAULT now()`,
     `);`
   ];
@@ -439,6 +459,112 @@ function logSupabaseSetupInstructions() {
   console.log("==========================================================================\n");
   
   logs.push(`[SUPABASE_INFO] Setup instructions logged to backend terminal. Run the SQL schema in Supabase!`);
+}
+
+function getKenyaDay(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Africa/Nairobi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(date);
+}
+
+function inferLogCategory(raw: string) {
+  const match = raw.match(/^\[([A-Z0-9_]+)\]/);
+  return match ? match[1] : "SYSTEM";
+}
+
+function inferLogLevel(raw: string) {
+  if (/ERROR|FAILED|VETO|BLOCKED|BREACHED|🛑|🔴/i.test(raw)) return "error";
+  if (/WARN|WARNING|⚠️/i.test(raw)) return "warn";
+  return "info";
+}
+
+let logPersistQueue: any[] = [];
+let logPersistFlushTimer: NodeJS.Timeout | null = null;
+let logPersistDisabledUntil = 0;
+let logPersistInFlight = false;
+let lastStateSaveAt = 0;
+let stateSaveTimer: NodeJS.Timeout | null = null;
+
+async function flushLogQueueToSupabase() {
+  if (!supabaseClient) return;
+  if (Date.now() < logPersistDisabledUntil) return;
+  if (logPersistInFlight || logPersistQueue.length === 0) return;
+  logPersistInFlight = true;
+  const batch = logPersistQueue.splice(0, 250);
+  try {
+    const { error } = await supabaseClient
+      .from("iml_logs")
+      .insert(batch);
+    if (error) {
+      logPersistQueue = batch.concat(logPersistQueue).slice(0, 1000);
+      logPersistDisabledUntil = Date.now() + 5 * 60 * 1000;
+      if (isMissingTableError(error)) {
+        logSupabaseSetupInstructions();
+      } else if (isRLSError(error)) {
+        logSupabaseRLSInstructions();
+      } else {
+        console.error("[SUPABASE_LOG_SAVE_ERROR]", error.message);
+      }
+    }
+  } catch (err: any) {
+    logPersistQueue = batch.concat(logPersistQueue).slice(0, 1000);
+    logPersistDisabledUntil = Date.now() + 5 * 60 * 1000;
+    console.error("[SUPABASE_LOG_SAVE_ERROR] Exception saving log to Supabase:", err.message || err);
+  } finally {
+    logPersistInFlight = false;
+  }
+}
+
+const rawLogPush = logs.push.bind(logs);
+logs.push = (...items: string[]) => {
+  const result = rawLogPush(...items);
+  if (logs.length > 5000) {
+    logs.splice(0, logs.length - 5000);
+  }
+  if (supabaseClient && Date.now() >= logPersistDisabledUntil) {
+    items.forEach(item => {
+      const createdAt = new Date();
+      logPersistQueue.push({
+        session_id: botSessionId,
+        level: inferLogLevel(item),
+        category: inferLogCategory(item),
+        message: item.replace(/^\[[^\]]+\]\s*/, ""),
+        raw: item,
+        kenya_day: getKenyaDay(createdAt),
+        created_at: createdAt.toISOString(),
+      });
+    });
+    if (logPersistQueue.length > 1000) {
+      logPersistQueue.splice(0, logPersistQueue.length - 1000);
+    }
+    if (!logPersistFlushTimer) {
+      logPersistFlushTimer = setTimeout(() => {
+        logPersistFlushTimer = null;
+        flushLogQueueToSupabase().catch(() => {});
+      }, 30000);
+    }
+  }
+  return result;
+};
+
+function scheduleStateSaveToSupabase(force = false) {
+  if (!supabaseClient) return;
+  const now = Date.now();
+  if (force || now - lastStateSaveAt >= 30000) {
+    lastStateSaveAt = now;
+    saveStateToSupabase().catch(() => {});
+    return;
+  }
+  if (!stateSaveTimer) {
+    stateSaveTimer = setTimeout(() => {
+      stateSaveTimer = null;
+      lastStateSaveAt = Date.now();
+      saveStateToSupabase().catch(() => {});
+    }, 30000 - (now - lastStateSaveAt));
+  }
 }
 
 async function saveStateToSupabase() {
@@ -474,6 +600,9 @@ async function saveStateToSupabase() {
     const dataToSave = {
       balance,
       peakBalance,
+      sessionStartBalance,
+      consecutiveLosses,
+      consecutiveWins,
       tradingEnabled,
       selectedSymbol,
       tradingMode,
@@ -493,7 +622,7 @@ async function saveStateToSupabase() {
     };
 
     const { error } = await supabaseClient
-      .from("sovereign_state")
+      .from("iml_state")
       .upsert({ id: "dashboard", data: dataToSave, updated_at: new Date().toISOString() });
 
     if (error) {
@@ -506,7 +635,7 @@ async function saveStateToSupabase() {
       }
     }
   } catch (err: any) {
-    console.error("[SUPABASE_SAVE_ERROR] Failed to write sovereign session state to Supabase:", err);
+    console.error("[SUPABASE_SAVE_ERROR] Failed to write IML session state to Supabase:", err);
   }
 }
 
@@ -531,7 +660,7 @@ async function saveStrategyHistoryToSupabase() {
     };
 
     const { error } = await supabaseClient
-      .from("sovereign_strategy_history")
+      .from("iml_strategy_history")
       .insert([strategyData]);
 
     if (error) {
@@ -549,7 +678,7 @@ async function saveTradeToSupabase(record: TradeRecord) {
   if (!supabaseClient) return;
   try {
     const { error } = await supabaseClient
-      .from("sovereign_trades")
+      .from("iml_trades")
       .upsert({
         id: record.id,
         symbol: record.symbol,
@@ -586,12 +715,62 @@ async function saveTradeToSupabase(record: TradeRecord) {
   }
 }
 
+// Bulk-sync all in-memory completed trades to Supabase in batches (non-destructive upsert)
+async function bulkSyncTradesToSupabase() {
+  if (!supabaseClient || completedTrades.length === 0) return;
+  // Deduplicate by ID before batching — prevents "ON CONFLICT DO UPDATE command cannot affect row a second time"
+  const seen = new Set<string>();
+  const uniqueTrades = completedTrades.filter(t => { if (seen.has(t.id)) return false; seen.add(t.id); return true; });
+  const BATCH = 50;
+  let synced = 0;
+  for (let i = 0; i < uniqueTrades.length; i += BATCH) {
+    const batch = uniqueTrades.slice(i, i + BATCH).map(record => ({
+      id: record.id,
+      symbol: record.symbol,
+      contract_type: record.contractType,
+      direction: record.direction,
+      entry_epoch: record.entryEpoch,
+      exit_epoch: record.exitEpoch,
+      entry_price: record.entryPrice,
+      exit_price: record.exitPrice,
+      stake: record.stake,
+      pnl: record.pnl,
+      exit_reason: record.exitReason,
+      rsi_at_entry: record.rsiAtEntry,
+      bb_pct_at_entry: record.bbPctAtEntry,
+      adx_at_entry: record.adxAtEntry,
+      regime_at_entry: record.regimeAtEntry,
+      is_hybrid_linear: record.isHybridLinear || false,
+      target_risk_amount: record.targetRiskAmount || null,
+      hybrid_position_size: record.hybridPositionSize || null,
+      tick_stream: record.tickStreamSnapshot || [],
+    }));
+    try {
+      const { error } = await supabaseClient.from("iml_trades").upsert(batch, { onConflict: "id" });
+      if (error && !isMissingTableError(error)) {
+        console.warn("[BULK_SYNC] Batch error:", error.message);
+        await new Promise(r => setTimeout(r, 2000)); // back-off on error
+      } else {
+        synced += batch.length;
+      }
+    } catch (e: any) {
+      console.warn("[BULK_SYNC] Exception:", e.message);
+    }
+    await new Promise(r => setTimeout(r, 300)); // 300ms between batches to avoid I/O exhaustion
+  }
+  if (synced > 0) {
+    const dupeCount = completedTrades.length - uniqueTrades.length;
+    logs.push(`[SUPABASE_SYNC] ✅ Bulk trade sync complete: ${synced} trades upserted to iml_trades.${dupeCount > 0 ? ` (${dupeCount} duplicate IDs skipped)` : ''}`);
+    console.log(`[BULK_SYNC] Synced ${synced}/${uniqueTrades.length} unique trades to Supabase.${dupeCount > 0 ? ` Skipped ${dupeCount} duplicate IDs.` : ''}`);
+  }
+}
+
 async function loadStateFromSupabase() {
   if (!supabaseClient) return;
   try {
     console.log("[SUPABASE] Checking for persistent session state on Cloud DB...");
     const { data, error } = await supabaseClient
-      .from("sovereign_state")
+      .from("iml_state")
       .select("data")
       .eq("id", "dashboard")
       .maybeSingle();
@@ -609,6 +788,9 @@ async function loadStateFromSupabase() {
       const loaded = data.data;
       if (loaded.balance !== undefined) balance = loaded.balance;
       if (loaded.peakBalance !== undefined) peakBalance = loaded.peakBalance;
+      if (loaded.sessionStartBalance !== undefined && loaded.sessionStartBalance > 0) sessionStartBalance = loaded.sessionStartBalance;
+      if (loaded.consecutiveLosses !== undefined) consecutiveLosses = loaded.consecutiveLosses;
+      if (loaded.consecutiveWins !== undefined) consecutiveWins = loaded.consecutiveWins;
       if (loaded.tradingEnabled !== undefined) tradingEnabled = loaded.tradingEnabled;
       if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
       if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
@@ -622,7 +804,18 @@ async function loadStateFromSupabase() {
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
       if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
-      if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
+      if (loaded.currentParams !== undefined) {
+        currentParams = loaded.currentParams;
+        // Sanity clamp — prevent corrupted ML values from persisting across reboots
+        if (!isFinite(currentParams.atrStopMultiplier) || currentParams.atrStopMultiplier > 5.0) {
+          console.warn(`[SANITY] Corrupted atrStopMultiplier (${currentParams.atrStopMultiplier}) clamped to 2.75`);
+          currentParams.atrStopMultiplier = 2.75;
+        }
+        currentParams.atrStopMultiplier = Math.max(0.5, Math.min(5.0, currentParams.atrStopMultiplier));
+        currentParams.bbStd             = Math.max(1.8, Math.min(4.0, currentParams.bbStd));
+        currentParams.maxTicksInTrade   = Math.max(20,  Math.min(500, currentParams.maxTicksInTrade));
+        currentParams.regimeAdxThreshold = Math.max(10, Math.min(40, currentParams.regimeAdxThreshold));
+      }
       if (loaded.logs !== undefined) {
         logs = loaded.logs;
         logs.push(`[${new Date().toISOString()}] State recovered successfully from Cloud Supabase Database.`);
@@ -631,9 +824,13 @@ async function loadStateFromSupabase() {
         Object.keys(loaded.subAlgorithmsParams).forEach(key => {
           if (subAlgorithms[key]) {
             Object.assign(subAlgorithms[key], loaded.subAlgorithmsParams[key]);
-            if (subAlgorithms[key].minConfluenceScore > 4) {
-              subAlgorithms[key].minConfluenceScore = 4;
-            }
+            const sub = subAlgorithms[key];
+            // Clamp per-sub params to prevent ML corruption carry-over
+            if (!isFinite(sub.atrStopMultiplier) || sub.atrStopMultiplier > 5.0) sub.atrStopMultiplier = 2.75;
+            sub.atrStopMultiplier = Math.max(0.5, Math.min(5.0, sub.atrStopMultiplier));
+            sub.bbStd             = Math.max(1.8, Math.min(3.5, sub.bbStd));
+            sub.maxTicksInTrade   = Math.max(20,  Math.min(500, sub.maxTicksInTrade));
+            if (sub.minConfluenceScore > 4) sub.minConfluenceScore = 4;
           }
         });
       }
@@ -651,120 +848,20 @@ async function loadStateFromSupabase() {
 }
 
 function saveStateToDisk() {
-  try {
-    const dataToSave = {
-      balance,
-      peakBalance,
-      tradingEnabled,
-      selectedSymbol,
-      tradingMode,
-      riskPreset,
-      hybridRiskType,
-      hybridRiskFixedAmount,
-      hybridRiskPercent,
-      hybridRewardRatio,
-      hybridEarlyCutoffEnabled,
-      hybridEarlyCutoffPct,
-      hybridGreeningTriggerPct,
-      activePositions,
-      completedTrades,
-      currentParams,
-      logs: logs.slice(-2000), // increased to preserve more history
-      subAlgorithmsParams: Object.keys(subAlgorithms).reduce((acc, key) => {
-        const sub = subAlgorithms[key];
-        acc[key] = {
-          enabled: sub.enabled,
-          rsiOversoldThreshold: sub.rsiOversoldThreshold,
-          rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
-          bbPeriod: sub.bbPeriod,
-          bbStd: sub.bbStd,
-          minConfluenceScore: sub.minConfluenceScore,
-          atrStopMultiplier: sub.atrStopMultiplier,
-          learningAdjustmentFactor: sub.learningAdjustmentFactor,
-          targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
-          targetLossPct: sub.targetLossPct,
-          timeExitEnabled: sub.timeExitEnabled,
-          breakEvenEnabled: sub.breakEvenEnabled,
-          trailingStopEnabled: sub.trailingStopEnabled,
-          maxTicksInTrade: sub.maxTicksInTrade,
-          totalTrades: sub.totalTrades,
-          winningTrades: sub.winningTrades,
-          totalPnl: sub.totalPnl,
-          recentWinRate: sub.recentWinRate,
-          consecutiveLosses: sub.consecutiveLosses,
-          consecutiveWins: sub.consecutiveWins
-        };
-        return acc;
-      }, {} as Record<string, any>)
-    };
-    fs.writeFileSync(PERSISTENCE_FILE, JSON.stringify(dataToSave, null, 2), "utf-8");
-
-    // Replicate session in a non-blocking cloud routine
-    if (supabaseClient) {
-      saveStateToSupabase().catch(() => {});
-    }
-  } catch (err) {
-    console.error("[PERSISTENCE_ERROR] Failed to write state to disk:", err);
-  }
+  // Local disk persistence removed. State is synced exclusively via Supabase.
+  scheduleStateSaveToSupabase();
 }
 
 function loadStateFromDisk() {
-  try {
-    if (fs.existsSync(PERSISTENCE_FILE)) {
-      const dataStr = fs.readFileSync(PERSISTENCE_FILE, "utf-8");
-      if (!dataStr) return;
-      const loaded = JSON.parse(dataStr);
-      if (loaded.balance !== undefined) balance = loaded.balance;
-      if (loaded.peakBalance !== undefined) peakBalance = loaded.peakBalance;
-      if (loaded.tradingEnabled !== undefined) tradingEnabled = loaded.tradingEnabled;
-      if (loaded.selectedSymbol !== undefined) selectedSymbol = loaded.selectedSymbol;
-      if (loaded.tradingMode !== undefined) tradingMode = loaded.tradingMode;
-      if (loaded.riskPreset !== undefined) riskPreset = loaded.riskPreset;
-      if (loaded.hybridRiskType !== undefined) hybridRiskType = loaded.hybridRiskType;
-      if (loaded.hybridRiskFixedAmount !== undefined) hybridRiskFixedAmount = loaded.hybridRiskFixedAmount;
-      if (loaded.hybridRiskPercent !== undefined) hybridRiskPercent = loaded.hybridRiskPercent;
-      if (loaded.hybridRewardRatio !== undefined) hybridRewardRatio = loaded.hybridRewardRatio;
-      if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
-      if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
-      if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
-      if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
-      if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
-      if (loaded.currentParams !== undefined) currentParams = loaded.currentParams;
-      if (loaded.logs !== undefined) {
-        logs = loaded.logs;
-        logs.push(`[${new Date().toISOString()}] State recovered successfully from persistent storage.`);
-      }
-      
-      if (loaded.subAlgorithmsParams !== undefined) {
-        Object.keys(loaded.subAlgorithmsParams).forEach(key => {
-          if (subAlgorithms[key]) {
-            const params = loaded.subAlgorithmsParams[key];
-            Object.assign(subAlgorithms[key], params);
-            // Optimization: Clamp minConfluenceScore to max 4 so the bot is highly responsive
-            if (subAlgorithms[key].minConfluenceScore > 4) {
-              subAlgorithms[key].minConfluenceScore = 4;
-            }
-          }
-        });
-      }
-      if (currentParams && currentParams.minConfluenceScore > 4) {
-        currentParams.minConfluenceScore = 4;
-      }
-      // Re-save normalized/clamped parameters to disk
-      setTimeout(() => {
-        saveStateToDisk();
-      }, 1000);
-    }
-  } catch (err) {
-    console.error("[PERSISTENCE_ERROR] Failed to load state from disk:", err);
-  }
+  // Local disk persistence removed. State is loaded exclusively from Supabase on boot.
 }
 
 // Global bootstrap to merge disk & cloud data safely
 async function runSystemBootstrap() {
-  loadStateFromDisk();
   if (supabaseClient) {
     await loadStateFromSupabase();
+    // Bulk-sync any in-memory trades (e.g. recovered from state) that are missing from Supabase
+    setTimeout(() => bulkSyncTradesToSupabase(), 5000);
   }
 }
 runSystemBootstrap();
@@ -806,9 +903,8 @@ class DerivLiveBridge {
         if (DERIV_API_TOKEN) {
           this.authorizeUser();
         } else {
-          logs.push(`[DERIV_LIVE] ⚠️ DERIV_API_TOKEN not found in environment variables. Automated trading is restricted to MONITORING mode.`);
+          logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Live trading is disabled. Price data stream active (read-only).`);
           this.requestHistoryForSymbols();
-          // Parallel subscriptions for all active instruments in monitoring mode
           Object.keys(INSTRUMENTS).forEach((symbol) => {
             this.subscribeToTicks(symbol);
           });
@@ -850,7 +946,7 @@ class DerivLiveBridge {
         authorize: DERIV_API_TOKEN
       }));
     } else {
-      logs.push(`[DERIV_LIVE] ⚠️ DERIV_API_TOKEN not found in environment variables. Automated trading is restricted to MONITORING mode. Please set DERIV_API_TOKEN to enable active live-only trading.`);
+      logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Trading is fully disabled until a valid token is provided.`);
     }
   }
 
@@ -968,19 +1064,29 @@ class DerivLiveBridge {
                   direction = "SHORT";
                 }
 
+                const ghostEntry = parseFloat(contract.entry_tick || "0") || parseFloat(contract.current_spot || "0");
+                const ghostSpot  = parseFloat(contract.current_spot || "0");
+                const ghostStake = parseFloat(contract.buy_price || "0");
+                // Compute ATR-based SL/TP if Deriv reports none (limit_order absent = old contract)
+                // Always compute price-level SL/TP from ATR — never use Deriv dollar amounts as prices
+                // (Deriv limit_order.stop_loss.order_amount is a dollar loss threshold, not a price level)
+                const ghostAtrBuf = ghostSpot * 0.003; // 0.3% of spot — ATR fallback
+                const ghostSL = direction === "LONG" ? ghostEntry - ghostAtrBuf : ghostEntry + ghostAtrBuf;
+                const ghostTP = direction === "LONG" ? ghostEntry + ghostAtrBuf * 2 : ghostEntry - ghostAtrBuf * 2;
                 activePositions.push({
                   id: contractIdStr,
                   symbol: internalSymbol,
                   contractType: type as any,
                   direction: direction,
-                  stake: parseFloat(contract.buy_price || "0"),
-                  entryPrice: parseFloat(contract.entry_tick || "0"),
-                  currentPrice: parseFloat(contract.current_spot || "0"),
-                  stopLoss: parseFloat(contract.limit_order?.stop_loss?.order_amount || "0"),
-                  takeProfit: parseFloat(contract.limit_order?.take_profit?.order_amount || "0"),
+                  stake: ghostStake,
+                  entryPrice: ghostEntry,
+                  currentPrice: ghostSpot,
+                  stopLoss: ghostSL,
+                  takeProfit: ghostTP,
                   pnl: parseFloat(contract.profit || "0"),
                   ticksElapsed: 0,
-                  entryEpoch: contract.date_start || Math.floor(Date.now() / 1000)
+                  entryEpoch: contract.date_start || Math.floor(Date.now() / 1000),
+                  multiplier: parseFloat(contract.multiplier || "40"),
                 });
              }
           }
@@ -991,6 +1097,9 @@ class DerivLiveBridge {
       if (msg.msg_type === "balance" && msg.balance) {
         const bal = msg.balance;
         balance = parseFloat(bal.balance) || balance;
+        if (sessionStartBalance <= 0 && balance > 0) {
+          sessionStartBalance = balance;
+        }
         peakBalance = Math.max(peakBalance, balance);
         logs.push(`[DERIV_LIVE] 💰 Real balance updated: $${balance.toFixed(2)} ${bal.currency || "USD"}`);
       }
@@ -1053,10 +1162,20 @@ class DerivLiveBridge {
         }
       }
 
-      // 3. Purchase Response
+      // 3. Purchase Response — link Deriv contract_id back to local position
       if (msg.msg_type === "buy") {
         const buyInfo = msg.buy;
-        logs.push(`[DERIV_LIVE_TRADE] ✅ Order successfully accepted. Contract ID: ${buyInfo.contract_id}. Payout criteria set.`);
+        const derivContractId = String(buyInfo.contract_id);
+        logs.push(`[DERIV_LIVE_TRADE] ✅ Order accepted. Deriv Contract ID: ${derivContractId}. Linking to local registry...`);
+        // Match the most recently queued pending order and update its position ID
+        const pending = pendingOrderQueue.shift();
+        if (pending) {
+          const pos = activePositions.find(p => p.id === pending.localId);
+          if (pos) {
+            pos.id = derivContractId;
+            logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Ghost-position elimination active.`);
+          }
+        }
       }
     } catch (e) {
       // Log critical exceptions in the socket loop safely
@@ -1108,30 +1227,40 @@ class DerivLiveBridge {
   }
 
   // Sends the real order contract proposal directly to your Live / Demo account!
-  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number) {
+  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number) {
     if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
 
     const derivSymbol = this.getDerivSymbolCode(symbol);
     const effMode = getEffectiveTradeType();
+    const supportedMultipliers = DERIV_SUPPORTED_MULTIPLIERS;
+    const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200;
+    const finalMultiplier = multiplier && supportedMultipliers.includes(multiplier) ? multiplier : fallbackMultiplier;
+    if (effMode === "HYBRID_LINEAR" && multiplier === undefined) {
+      logs.push(`[DERIV_LIVE_TRADE] ℹ️ HYBRID_LINEAR signal routed through supported Deriv multiplier contract x${finalMultiplier}.`);
+    }
     
-    // Submission protocol for Multipliers parameters
-    const proposal = {
-      buy: 1,
-      price: stake,
-      parameters: {
-        amount: stake,
-        basis: "stake",
-        contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
-        currency: "USD",
-        symbol: derivSymbol,
-        multiplier: multiplier || (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200),
-      }
+    // Submission protocol for Multipliers parameters — includes server-side SL/TP limit orders
+    const parameters: any = {
+      amount: stake,
+      basis: "stake",
+      contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
+      currency: "USD",
+      symbol: derivSymbol,
+      multiplier: finalMultiplier,
     };
+    // Attach server-side stop_loss and take_profit so Deriv manages exits even through disconnections
+    if (stopLossAmount && stopLossAmount > 0) {
+      parameters.limit_order = {
+        stop_loss: parseFloat(Math.min(stopLossAmount, stake).toFixed(2)),
+        ...(takeProfitAmount && takeProfitAmount > 0 ? { take_profit: parseFloat(takeProfitAmount.toFixed(2)) } : {})
+      };
+    }
+    const proposal = { buy: 1, price: stake, parameters };
 
     this.ws.send(JSON.stringify(proposal));
-    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${multiplier || "default"}): ${direction} on ${derivSymbol} (Stake: $${stake})`);
+    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
     return true;
   }
 }
@@ -1653,7 +1782,7 @@ async function runGovernorAudit() {
     }
   }
   
-  governorStatus = "SOVEREIGN AGENTIC CORE: ONLINE";
+  governorStatus = "IML AGENTIC CORE: ONLINE";
 }
 
 // Tick-based recurring audit trigger
@@ -1712,9 +1841,9 @@ function scrutinizeProposal(proposal: StrategyProposal): { approved: boolean; po
   
   // 1. Structural Regime Conflict Check
   const sub = subAlgorithms[symbol];
-  if (sub.hurstVal !== undefined && sub.hurstVal < 0.52 && conviction < 0.4) {
+  if (sub.hurstVal !== undefined && sub.hurstVal < 0.52 && conviction < 0.4 && score < 3) {
     governorMemory.vetoes++;
-    return { approved: false, polishedStake: 0, reasoning: "VETO: Market is in anti-persistent noise state. High probability of chop." };
+    return { approved: false, polishedStake: 0, reasoning: "VETO: Weak low-confluence signal inside anti-persistent noise." };
   }
 
   // 2. Correlation & Exposure Gating
@@ -1745,14 +1874,7 @@ function scrutinizeProposal(proposal: StrategyProposal): { approved: boolean; po
 }
 
 function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: number) {
-  // Update cooling down markers globally
-  if (circuitBreakerCooldown > 0) {
-    circuitBreakerCooldown--;
-    if (circuitBreakerCooldown === 0) {
-      cooldownMessage = "";
-      logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Circuit breaker cooldown cleared. Resuming normal logic.`);
-    }
-  }
+  updateCircuitBreakerCooldown();
 
   // 1. Process and track any existing positions for this specific symbol
   updateOpenPositions(symbol, currentPrice, epoch);
@@ -1828,26 +1950,36 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   if (epoch % 50 === 0) {
     if (Math.abs(syntheticDelta) > 0.4) {
       const creativeReason = syntheticDelta > 0 ? "Potential Structural Breakout" : "Structural Deceleration Warning";
-      logs.push(`[CREATIVE_SYNTH] 🧠 ${sub.name} synthesized a new Strategic Pivot: '${creativeReason}' (Δ: ${syntheticDelta.toFixed(2)}). Submitting for Governor scrutiny...`);
+      if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🧠 ${sub.name} synthesized a new Strategic Pivot: '${creativeReason}' (Δ: ${syntheticDelta.toFixed(2)}). Submitting for Governor scrutiny...`);
       
-      // Auto-tuning: Sub-algorithms now update their own focus based on synthetic insights
+      // Auto-tuning runs whether paused or not — recalibrate during downtime
       if (syntheticDelta < -0.3) {
-         sub.minConfluenceScore = Math.min(5, sub.minConfluenceScore + 1);
-         logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
+         sub.minConfluenceScore = Math.min(4, sub.minConfluenceScore + 1);
+         if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
       } else if (syntheticDelta > 0.3 && sub.minConfluenceScore > 2) {
          sub.minConfluenceScore--;
-         logs.push(`[CREATIVE_SYNTH] ⚡ ${sub.name} relaxed execution barriers due to high structural momentum.`);
+         if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] ⚡ ${sub.name} relaxed execution barriers due to high structural momentum.`);
       }
     }
   }
 
   // 5. Early exit checks before active trade trigger
+  updateCircuitBreakerCooldown();
   if (circuitBreakerCooldown > 0) return;
   if (!sub.enabled) return;
   if (epoch < sub.cooldownUntil) return;
 
   // Match: if a position is open on this symbol, do not open another
   if (activePositions.some(p => p.symbol === symbol)) {
+    return;
+  }
+
+  // ── PAUSED MODE: indicators stay warm, positions managed above — skip signal analysis & logging ──
+  if (!tradingEnabled) {
+    // Single terse heartbeat every 5 minutes on the primary symbol only — proves engine is alive
+    if (epoch % 300 === 0 && symbol === selectedSymbol) {
+      logs.push(`[IML_MONITOR] 🔍 PAUSED — Monitoring ${symbol} | RSI: ${rsiVal.toFixed(1)} | ADX: ${adx.toFixed(1)} | Regime: ${currentRegime} | H_μ: ${hMicro.toFixed(3)} | Conviction: ${(conviction * 100).toFixed(0)}% | Positions: ${activePositions.length}`);
+    }
     return;
   }
 
@@ -1886,10 +2018,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
   } else {
     // FALLBACK: Standard Mean-Fader signals for stationary/random-walk regimes
-    // Calibration: Do not trade Mean Reversion if ADX > 22
-    if (adx > 22) {
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_REGIME] 🚫 Mean Reversion signal ignored. ADX (${adx.toFixed(1)}) > 22 threshold.`);
-      return;
+    const highAdxMeanReversionPenalty = adx > 45 ? 1 : 0;
+    if (highAdxMeanReversionPenalty && Math.random() < 0.05) {
+      logs.push(`[SFT_V2_REGIME] ⚠️ High ADX (${adx.toFixed(1)}) detected. Mean Reversion requires stronger confluence instead of being hard-blocked.`);
     }
     const isOversold = currentPrice <= lower;
     const isRsiOversoldRange = rsiVal <= sub.rsiOversoldThreshold;
@@ -1918,9 +2049,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     // Audit Fix #3: Implement Dynamic Confluence Scaling
     // Automatically scale down the required confluence criteria to (N-1) during high-volatility regimes (ADX > 30)
     let dynamicMinConfluence = sub.minConfluenceScore;
-    if (adx > 30) {
-      dynamicMinConfluence = Math.max(2, sub.minConfluenceScore - 1);
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_DYNAMIC] ⚖️ High momentum detected (ADX: ${adx.toFixed(1)}). Scaling confluence from ${sub.minConfluenceScore} down to ${dynamicMinConfluence}.`);
+    if (adx > 45) {
+      dynamicMinConfluence = Math.min(5, sub.minConfluenceScore + highAdxMeanReversionPenalty);
+      if (Math.random() < 0.05) logs.push(`[SFT_V2_DYNAMIC] ⚖️ High momentum detected (ADX: ${adx.toFixed(1)}). Scaling mean-reversion confluence from ${sub.minConfluenceScore} up to ${dynamicMinConfluence}.`);
     }
 
     sub.confluenceScore = Math.max(longScore, shortScore);
@@ -1985,7 +2116,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.05)).toFixed(2));
     
     // Ensure Multiplier mode respects Fixed USD risk if configured
-    if (tradingMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
+    if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
       stake = Math.min(stake, hybridRiskFixedAmount);
     }
 
@@ -2005,14 +2136,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
     const auditRes = scrutinizeProposal(proposal);
     if (!auditRes.approved) {
-      logs.push(`[GOVERNOR_VETO] 🛡️ Sector Audit failed for ${symbol} signal. Reason: ${auditRes.reason}`);
+      logs.push(`[GOVERNOR_VETO] 🛡️ Sector Audit failed for ${symbol} signal. Reason: ${auditRes.reasoning}`);
       return;
     }
     
     // Apply polished parameters from Governor (Agentic autonomy in action)
     stake = auditRes.polishedStake;
-    if (auditRes.reason.includes("POLISHED") || auditRes.reason.includes("ELITE")) {
-      logs.push(`[GOVERNOR_AGENT] 🖋️ ${auditRes.reason}`);
+    if (auditRes.reasoning.includes("POLISHED") || auditRes.reasoning.includes("ELITE")) {
+      logs.push(`[GOVERNOR_AGENT] 🖋️ ${auditRes.reasoning}`);
     }
 
     logs.push(`[TRACE] Final stake approved: amount=${stake}, balance=${balance}`);
@@ -2026,8 +2157,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     logs.push(`[TRACE] Setting stopLoss and takeProfit distances...`);
     const atrBuffer = atr * sub.atrStopMultiplier;
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
-    let takeProfitDistance = stopLossDistance * 2.0; // Optimized standard exit ratio (Sovereign recommended higher R)
-    let chosenMultiplier = 50;
+    let takeProfitDistance = stopLossDistance * 2.0; // Optimized standard exit ratio (IML recommended higher R)
+    let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
     let targetRisk = 25.00;
 
     if (tickEffMode === "HYBRID_LINEAR") {
@@ -2036,12 +2167,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       takeProfitDistance = stopLossDistance * hybridRewardRatio;
       stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
       logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
-    } else if (tradingMode === "MULTIPLIER") {
+    } else if (tickEffMode === "MULTIPLIER") {
       const targetLossPct = sub.targetLossPct || 0.15; // default 15% max risk on stake
       const slPct = stopLossDistance / currentPrice;
       const desiredMultiplier = targetLossPct / slPct;
 
-      const multiplierOptions = [50, 100, 200, 400];
+      const multiplierOptions = DERIV_SUPPORTED_MULTIPLIERS;
       chosenMultiplier = multiplierOptions[0];
       let minDiff = Math.abs(desiredMultiplier - chosenMultiplier);
       for (let i = 1; i < multiplierOptions.length; i++) {
@@ -2053,7 +2184,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
 
       // If at chosenMultiplier our expected stop loss is too wide, downshift to avoid large losses
-      while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > 50) {
+      while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > multiplierOptions[0]) {
         const idx = multiplierOptions.indexOf(chosenMultiplier);
         if (idx > 0) {
           chosenMultiplier = multiplierOptions[idx - 1];
@@ -2098,7 +2229,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       pnl: 0.0,
       ticksElapsed: 0,
       entryEpoch: epoch,
-      multiplier: (tradingMode === "MULTIPLIER" && tickEffMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+      multiplier: tickEffMode === "MULTIPLIER" ? chosenMultiplier : undefined,
       isHybridLinear: tickEffMode === "HYBRID_LINEAR" ? true : undefined,
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
@@ -2106,16 +2237,32 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
-    // Place actual contract proposal request if live credentials are active
-    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
-    logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
-    if (liveOrderPlaced) {
-      logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
+    // Live authorization and successful order dispatch are both required to track this position
+    if (!liveBridgeInstance.getIsAuthorized()) {
+      logs.push(`[ORDER_BLOCKED] Live authorization required. Trade rejected — set DERIV_API_TOKEN to enable live trading.`);
+      return;
     }
+    // Compute server-side SL/TP dollar amounts for Deriv limit orders
+    const slAmount = parseFloat(Math.min(
+      (stopLossDistance / currentPrice) * stake * (position.multiplier || 40),
+      stake  // can never lose more than the stake
+    ).toFixed(3));
+    const tpAmount = parseFloat(
+      ((takeProfitDistance / currentPrice) * stake * (position.multiplier || 40)).toFixed(3)
+    );
+    // Register in pending queue BEFORE dispatch so the buy confirmation can link the contract_id
+    pendingOrderQueue.push({ localId: positionId, symbol, direction });
+    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount);
+    logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
+    if (!liveOrderPlaced) {
+      pendingOrderQueue.pop(); // rollback the queue entry if dispatch failed
+      logs.push(`[ORDER_FAILED] Live order dispatch failed for Sub-algorithm ${sub.name}. Position not tracked.`);
+      return;
+    }
+    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
 
     activePositions.push(position);
-    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Elite: ${isEliteGovernorTrade}]`);
-    saveStateToDisk();
+    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Elite: ${auditRes.reasoning.includes("ELITE")}]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
 }
@@ -2224,7 +2371,7 @@ function executeProposal(
   const atrBuffer = atr * atrStopMult;
   let stopLossDistance = Math.max(entryPrice * 0.003, atrBuffer);
   let takeProfitDistance = stopLossDistance * 1.25; // optimized 1.25x exit ratio for high hit rate
-  let chosenMultiplier = 50;
+  let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
   let targetRisk = 25.00;
 
   const effMode = getEffectiveTradeType();
@@ -2235,11 +2382,11 @@ function executeProposal(
     takeProfitDistance = stopLossDistance * hybridRewardRatio;
     stake = parseFloat(Math.max(0.35, Math.min(targetRisk * 2.0, balance * 0.1)).toFixed(2));
     logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
-  } else if (tradingMode === "MULTIPLIER") {
+  } else if (effMode === "MULTIPLIER") {
     const slPct = stopLossDistance / entryPrice;
     const desiredMultiplier = targetLossPct / slPct;
 
-    const multiplierOptions = [50, 100, 200, 400];
+    const multiplierOptions = DERIV_SUPPORTED_MULTIPLIERS;
     chosenMultiplier = multiplierOptions[0];
     let minDiff = Math.abs(desiredMultiplier - chosenMultiplier);
     for (let i = 1; i < multiplierOptions.length; i++) {
@@ -2251,7 +2398,7 @@ function executeProposal(
     }
 
     // If at chosenMultiplier our expected stop loss is too wide, downshift to avoid large losses
-    while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > 50) {
+    while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > multiplierOptions[0]) {
       const idx = multiplierOptions.indexOf(chosenMultiplier);
       if (idx > 0) {
         chosenMultiplier = multiplierOptions[idx - 1];
@@ -2278,7 +2425,7 @@ function executeProposal(
     contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
   }
 
-  const id = `TX_${Math.floor(Math.random() * 89999 + 10000)}`;
+  const id = `TX_${Date.now().toString(36).toUpperCase()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
   const position: ActivePosition = {
     id,
@@ -2293,22 +2440,38 @@ function executeProposal(
     pnl: 0.0,
     ticksElapsed: 0,
     entryEpoch: epoch,
-    multiplier: (tradingMode === "MULTIPLIER" && effMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+    multiplier: effMode === "MULTIPLIER" ? chosenMultiplier : undefined,
     isHybridLinear: effMode === "HYBRID_LINEAR" ? true : undefined,
     targetRiskAmount: effMode === "HYBRID_LINEAR" ? targetRisk : undefined,
     hybridPositionSize: effMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
   };
 
-  // Place actual contract proposal request if live credentials are active
-  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
-  if (liveOrderPlaced) {
-    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
+  // Live authorization and successful order dispatch are both required to track this position
+  if (!liveBridgeInstance.getIsAuthorized()) {
+    logs.push(`[ORDER_BLOCKED] Live authorization required. Manual trade rejected — set DERIV_API_TOKEN.`);
+    return;
   }
+  // Compute server-side SL/TP dollar amounts for Deriv limit orders (same as automated engine)
+  const manualSlAmount = parseFloat(Math.min(
+    (stopLossDistance / entryPrice) * stake * (position.multiplier || 40),
+    stake
+  ).toFixed(3));
+  const manualTpAmount = parseFloat(
+    ((takeProfitDistance / entryPrice) * stake * (position.multiplier || 40)).toFixed(3)
+  );
+  // Register in pending queue BEFORE dispatch so buy confirmation can link the contract_id
+  pendingOrderQueue.push({ localId: id, symbol, direction });
+  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount);
+  if (!liveOrderPlaced) {
+    pendingOrderQueue.pop(); // rollback queue entry if dispatch failed
+    logs.push(`[ORDER_FAILED] Live order dispatch failed. Manual position not tracked.`);
+    return;
+  }
+  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}`);
 
   activePositions.push(position);
 
   logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
-  saveStateToDisk();
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
@@ -2339,6 +2502,12 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
     }
 
     pos.pnl = parseFloat(posPnl.toFixed(2));
+    // Track Maximum Adverse Excursion (worst unrealised loss this position has seen)
+    if (posPnl < 0) {
+      if (pos.maxAdverseExcursion === undefined || posPnl < pos.maxAdverseExcursion) {
+        pos.maxAdverseExcursion = parseFloat(posPnl.toFixed(2));
+      }
+    }
     
     const subAlg = subAlgorithms[pos.symbol];
 
@@ -2586,10 +2755,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
 
   finalPnl = parseFloat(finalPnl.toFixed(2));
   
-  // Refund is handled directly by active Deriv WebSocket contract settle streams.
-  if (!liveBridgeInstance.getIsAuthorized()) {
-    balance = parseFloat((balance + finalPnl).toFixed(2));
-  }
+  // Balance is updated exclusively via live Deriv WebSocket balance stream events.
 
   if (balance > peakBalance) {
     peakBalance = balance;
@@ -2640,21 +2806,22 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     atrAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).atr,
     tickStreamSnapshot: (tickBuffers[pos.symbol] || []).slice(-150),
     conditionsMet: pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"],
+    maxAdverseExcursion: pos.maxAdverseExcursion ?? 0,
   };
 
   completedTrades.push(record);
-  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} (Pushed balance to $${balance})`);
+  // Balance is authoritative from Deriv WS stream — do not write locally here.
+  // peakBalance tracking is maintained from the stream handler.
+  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Awaiting Deriv balance stream confirmation`);
 
-  // Check trade limit to pause and trigger report
-  if (completedTrades.length >= 100 && tradingEnabled) {
-    tradingEnabled = false;
-    logs.push(`[SYSTEM] 🛑 Trading paused automatically after 100 trades. Awaiting analytical report.`);
+  // Check trade limit to trigger report without interrupting live trading
+  if (completedTrades.length > 0 && completedTrades.length % 100 === 0) {
+    logs.push(`[SYSTEM] 📊 100-trade settlement checkpoint reached. Generating analytical report while trading remains active.`);
     logs.push(`[SYSTEM_REPORT_TRIGGER] Initiating intensive engine diagnostics for report generation...`);
     initiateIntensiveReport().catch(err => {
       console.error("[AUTO_REPORT_CRASH]", err);
       logs.push(`[SYSTEM_ERROR] Automatic report generation failed: ${err.message || err}`);
     });
-    saveStateToDisk();
   }
 
   // Log single trade document in Cloud DB
@@ -2666,10 +2833,9 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   evaluateCircuitBreakers();
 
   // Trigger Adaptive parameter optimization incrementally
-  if (completedTrades.length % 3 === 0) {
+  if (completedTrades.length % 50 === 0) {
     runMachineLearningAdaptation();
   }
-  saveStateToDisk();
 }
 
 async function initiateIntensiveReport() {
@@ -2680,30 +2846,9 @@ async function initiateIntensiveReport() {
      // Create a working slice for metrics
      const reportTrades = [...completedTrades];
      
-     // Fallback to synthetic trades if empty so it doesn't crash on blank logs
      if (reportTrades.length < 2) {
-       for (let i = 0; i < 114; i++) {
-         const pnl = Math.random() > 0.35 ? (Math.random() * 25 + 5) : -(Math.random() * 15 + 2);
-         reportTrades.push({
-           id: `T_AUTOGEN_${i + 1}`,
-           symbol: selectedSymbol,
-           contractType: "MULTUP",
-           direction: i % 2 === 0 ? "LONG" : "SHORT",
-           stake: 10,
-           entryPrice: 100 + i,
-           exitPrice: 100 + i + (pnl / 10),
-           pnl: parseFloat(pnl.toFixed(2)),
-           exitReason: pnl > 0 ? "take_profit" : "stop_loss",
-           regimeAtEntry: MarketRegime.RANGING,
-           entryEpoch: Math.floor(Date.now() / 1000) - 3600 * (120 - i),
-           exitEpoch: Math.floor(Date.now() / 1000) - 3600 * (120 - i) + 600,
-           rsiAtEntry: 48,
-           bbPctAtEntry: 0.5,
-           adxAtEntry: 22,
-           atrAtEntry: 1.5,
-           conditionsMet: ["rsi", "bb", "vwap"]
-         });
-       }
+       logs.push(`[REPORT_SYSTEM] Insufficient live trade data for analysis (${reportTrades.length} settled trades). Minimum 2 live trades required.`);
+       return;
      }
 
      const finalTotal = reportTrades.length;
@@ -2745,7 +2890,7 @@ async function initiateIntensiveReport() {
      }
 
      const reportPrompt = `
-       You are Sovereign AI, an elite institutional risk engineer.
+       You are Infinity Markets Lab AI, an elite institutional risk engineer.
        Perform an intensive algorithmic review of the trade settlement book.
        
        Context:
@@ -2770,7 +2915,7 @@ async function initiateIntensiveReport() {
         const client = getGeminiClient();
         if (client) {
           const response = await client.models.generateContent({
-            model: "gemini-3.5-flash",
+            model: "gemini-1.5-flash",
             contents: reportPrompt,
           });
           analysis = response.text || "";
@@ -2781,11 +2926,11 @@ async function initiateIntensiveReport() {
 
      if (!analysis) {
        // Premium mathematical fallback analytics
-       analysis = `### SOVEREIGN SYSTEM DIAGNOSTICS: COMPLETED
+       analysis = `### INFINITY MARKETS LAB SYSTEM DIAGNOSTICS: COMPLETED
 Analytic diagnostic compiled for high-frequency index models.
 
 1. EXECUTIVE TELEMETRY CRITIQUE
-The Sovereign engine demonstrated clean transaction flow across ${finalTotal} historical capture events.
+The Infinity Markets Lab engine demonstrated clean transaction flow across ${finalTotal} historical capture events.
 Cumulative settlement yields are $${totalPnl.toFixed(2)} with an established Profit Factor of ${profitFactor.toFixed(2)}. 
 Capital drawdown metrics remain extremely healthy, registering a peak drop of ${maxDD.toFixed(1)}%, well within institutional tolerances.
 
@@ -2848,7 +2993,7 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.moveDown(1.5);
        
        // Page 1 Layout: Cover & Mathematical Grid
-       doc.fontSize(22).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN SYSTEM SECTOR REPORT', { align: 'center' });
+       doc.fontSize(22).font('Helvetica-Bold').fillColor('#0f172a').text('INFINITY MARKETS LAB SYSTEM SECTOR REPORT', { align: 'center' });
        doc.fontSize(10).font('Helvetica-Oblique').fillColor('#64748b').text('Autonomous Mother Algorithm Performance Ledger & AI Advisory', { align: 'center' });
        doc.moveDown(1.5);
        
@@ -2856,7 +3001,16 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.fontSize(10).font('Helvetica-Bold').fillColor('#1e293b');
        doc.text(`SESSION ID: ${botSessionId}`, 50, doc.y);
        doc.font('Helvetica').text(`DATE GENERATED: ${new Date().toISOString()}`, 50, doc.y + 15);
-       doc.text(`TARGET INSTRUMENT: ${selectedSymbol} Volatility Model`, 50, doc.y + 30);
+       // Determine actual dominant trading symbol from completed trade history
+       const symCounts: Record<string, number> = {};
+       completedTrades.forEach(t => { symCounts[t.symbol] = (symCounts[t.symbol] || 0) + 1; });
+       const dominantSymbol = Object.keys(symCounts).sort((a,b) => symCounts[b] - symCounts[a])[0] || selectedSymbol;
+       const dominantPct = completedTrades.length > 0 ? ((symCounts[dominantSymbol] / completedTrades.length) * 100).toFixed(1) : "0";
+       const subAlgName = subAlgorithms[dominantSymbol]?.name || dominantSymbol;
+       doc.text(`TARGET INSTRUMENT: ${subAlgName} (${dominantSymbol}) — ${dominantPct}% of session trades`, 50, doc.y + 30);
+       // Per-symbol breakdown line
+       const symBreakdown = Object.keys(symCounts).sort((a,b) => symCounts[b]-symCounts[a]).map(k => `${k}: ${symCounts[k]}`).join(" | ");
+       doc.font('Helvetica').fontSize(8).fillColor('#64748b').text(`Symbol distribution: ${symBreakdown}`, 50, doc.y + 50);
        doc.moveDown(3);
        
        // Core Telemetry Grid
@@ -2998,7 +3152,7 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.rect(40, 40, 532, 10).fill('#6366f1');
        doc.moveDown(1.5);
        
-       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN NARRATIVE ADVISORY', 50, doc.y);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('IML NARRATIVE ADVISORY', 50, doc.y);
        doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Cognitive Strategy Proposal & Adaptive Intelligence Logs', 50, doc.y + 16);
        doc.moveDown(2.5);
        
@@ -3025,11 +3179,627 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        if (sigY < 700) {
          doc.strokeColor('#e2e8f0').lineWidth(1).moveTo(50, sigY).lineTo(560, sigY).stroke();
          doc.moveDown(1);
-         doc.fontSize(9).font('Helvetica-Bold').fillColor('#0f172a').text('SOVEREIGN RISKS SENTINEL SYSTEMS', 50, doc.y);
+         doc.fontSize(9).font('Helvetica-Bold').fillColor('#0f172a').text('IML RISKS SENTINEL SYSTEMS', 50, doc.y);
          doc.fontSize(8).font('Helvetica').fillColor('#94a3b8').text('Neural Strategy Gating & Machine Learning Co-pilot • Active Security State', 50, doc.y + 12);
        }
        
-       doc.end();
+
+       // ══════════════════════════════════════════════════════════════════════
+       // PAGE 3: QUANTITATIVE RISK ANALYTICS
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#0f172a');
+       doc.moveDown(1.5);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('QUANTITATIVE RISK ANALYTICS', 50, doc.y);
+       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Statistical edge metrics, exit behaviour, directional bias & tail risk', 50, doc.y + 16);
+       doc.moveDown(2.5);
+
+       // ── Pre-compute advanced stats ─────────────────────────────────────
+       const avgWin     = wins   > 0 ? grossWins   / wins   : 0;
+       const avgLoss    = losses > 0 ? grossLosses / losses : 0;
+       const avgPnl     = finalTotal > 0 ? totalPnl / finalTotal : 0;
+       const expectancy = (winRate / 100 * avgWin) - ((1 - winRate / 100) * avgLoss);
+       const kellySafe  = avgLoss > 0 ? Math.max(0, (winRate / 100) - ((1 - winRate / 100) / (avgWin / avgLoss))) * 100 : 0;
+       const pnlVals    = reportTrades.map(t => t.pnl);
+       const pnlMean    = avgPnl;
+       const pnlStdDev  = Math.sqrt(pnlVals.reduce((s, v) => s + Math.pow(v - pnlMean, 2), 0) / Math.max(1, finalTotal));
+       const sharpeProxy = pnlStdDev > 0 ? (avgPnl / pnlStdDev) * Math.sqrt(finalTotal) : 0;
+       const calmar     = maxDD > 0 ? totalPnl / maxDD : 0;
+       const avgStake   = reportTrades.reduce((s, t) => s + t.stake, 0) / Math.max(1, finalTotal);
+       const avgWinTicks = reportTrades.filter(t=>t.pnl>0 && t.exitEpoch && t.entryEpoch)
+         .reduce((s,t,_,a) => s + (t.exitEpoch - t.entryEpoch) / Math.max(1, a.length), 0);
+       const avgLossTicks = reportTrades.filter(t=>t.pnl<=0 && t.exitEpoch && t.entryEpoch)
+         .reduce((s,t,_,a) => s + (t.exitEpoch - t.entryEpoch) / Math.max(1, a.length), 0);
+
+       // ── Risk Statistics 2-column grid ─────────────────────────────────
+       const rsY = doc.y;
+       const rsCol2 = 300;
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('EDGE STATISTICS', 50, rsY);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, rsY + 14).lineTo(560, rsY + 14).stroke();
+
+       const stats3 = [
+         ['Trade Expectancy',       `$${expectancy.toFixed(3)} per trade`],
+         ['Kelly % (Safe)',          `${kellySafe.toFixed(2)}% of capital`],
+         ['Sharpe Proxy (session)',  `${sharpeProxy.toFixed(3)}`],
+         ['Calmar Ratio',           `${calmar.toFixed(3)}`],
+         ['Avg Win  / Avg Loss',    `$${avgWin.toFixed(3)} / $${avgLoss.toFixed(3)}`],
+         ['Win/Loss Ratio (R)',      `${avgLoss > 0 ? (avgWin/avgLoss).toFixed(3) : "∞"}`],
+         ['Avg Stake',              `$${avgStake.toFixed(3)}`],
+         ['PnL Std Deviation',      `$${pnlStdDev.toFixed(3)}`],
+       ];
+       doc.fontSize(9);
+       stats3.forEach(([label, val], i) => {
+         const col = i % 2 === 0 ? 50 : rsCol2;
+         const row = Math.floor(i / 2);
+         const yy = rsY + 22 + row * 16;
+         doc.font('Helvetica-Bold').fillColor('#475569').text(label + ':', col, yy);
+         doc.font('Helvetica').fillColor('#1e293b').text(val, col + 145, yy);
+       });
+       doc.moveDown(6);
+
+       // ── Duration Analysis ──────────────────────────────────────────────
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#475569').text('Duration: Winners avg', 50, doc.y);
+       doc.font('Helvetica').fillColor('#1e293b').text(`${avgWinTicks.toFixed(0)}s`, 210, doc.y);
+       doc.font('Helvetica-Bold').fillColor('#475569').text('Duration: Losers avg', 300, doc.y);
+       doc.font('Helvetica').fillColor('#1e293b').text(`${avgLossTicks.toFixed(0)}s`, 450, doc.y);
+       doc.moveDown(1.8);
+
+       // ── Exit Reason Breakdown ──────────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('EXIT REASON BREAKDOWN', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.5);
+
+       const exitGroups: Record<string, {count:number;pnl:number;wins:number}> = {};
+       reportTrades.forEach(t => {
+         const k = t.exitReason || 'unknown';
+         if (!exitGroups[k]) exitGroups[k] = { count: 0, pnl: 0, wins: 0 };
+         exitGroups[k].count++;
+         exitGroups[k].pnl += t.pnl;
+         if (t.pnl > 0) exitGroups[k].wins++;
+       });
+       const exY = doc.y;
+       doc.fontSize(8).font('Helvetica-Bold').fillColor('#94a3b8');
+       doc.text('EXIT REASON', 50, exY);
+       doc.text('COUNT', 180, exY);
+       doc.text('% OF TRADES', 250, exY);
+       doc.text('AVG PnL', 340, exY);
+       doc.text('WIN RATE', 420, exY);
+       doc.text('NET PnL', 490, exY);
+       doc.strokeColor('#e2e8f0').lineWidth(0.5).moveTo(50, exY + 11).lineTo(560, exY + 11).stroke();
+       doc.font('Helvetica').fillColor('#1e293b');
+       Object.entries(exitGroups).sort((a,b)=>b[1].count-a[1].count).forEach(([reason, d], i) => {
+         const ey = exY + 18 + i * 15;
+         const wr = d.count > 0 ? ((d.wins/d.count)*100).toFixed(1) : '0';
+         const pct = ((d.count / finalTotal) * 100).toFixed(1);
+         const avgP = (d.pnl / d.count).toFixed(3);
+         doc.fontSize(8).fillColor('#334155').text(reason.replace(/_/g,' ').toUpperCase(), 50, ey);
+         doc.fillColor('#1e293b').text(String(d.count), 180, ey);
+         doc.text(`${pct}%`, 250, ey);
+         doc.fillColor(parseFloat(avgP) >= 0 ? '#10b981' : '#ef4444').text(`$${avgP}`, 340, ey);
+         doc.fillColor('#1e293b').text(`${wr}%`, 420, ey);
+         doc.fillColor(d.pnl >= 0 ? '#10b981' : '#ef4444').text(`$${d.pnl.toFixed(2)}`, 490, ey);
+       });
+       doc.y = exY + 18 + Object.keys(exitGroups).length * 15 + 10;
+       doc.moveDown(1.2);
+
+       // ── Direction Bias & Regime Performance side-by-side ─────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('DIRECTIONAL BIAS', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(248, doc.y + 4).stroke();
+       doc.text('REGIME PERFORMANCE', 300, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(300, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.5);
+
+       // Direction
+       const dirY = doc.y;
+       ['LONG','SHORT'].forEach((dir, di) => {
+         const dirTrades = reportTrades.filter(t=>t.direction===dir);
+         const dirWins   = dirTrades.filter(t=>t.pnl>0).length;
+         const dirPnl    = dirTrades.reduce((s,t)=>s+t.pnl, 0);
+         const dirWR     = dirTrades.length > 0 ? ((dirWins/dirTrades.length)*100).toFixed(1) : '0';
+         const dy = dirY + di * 32;
+         doc.fontSize(9).font('Helvetica-Bold').fillColor(dir==='LONG'?'#10b981':'#ef4444').text(dir, 50, dy);
+         doc.font('Helvetica').fillColor('#1e293b').text(`${dirTrades.length} trades  WR: ${dirWR}%  Net: $${dirPnl.toFixed(2)}`, 100, dy);
+       });
+
+       // Regime
+       const regGroups: Record<string, {count:number;pnl:number;wins:number}> = {};
+       reportTrades.forEach(t => {
+         const k = String(t.regimeAtEntry || 'UNKNOWN');
+         if (!regGroups[k]) regGroups[k] = { count: 0, pnl: 0, wins: 0 };
+         regGroups[k].count++;
+         regGroups[k].pnl += t.pnl;
+         if (t.pnl > 0) regGroups[k].wins++;
+       });
+       Object.entries(regGroups).forEach(([regime, d], ri) => {
+         const rwy = dirY + ri * 18;
+         const rwr = d.count > 0 ? ((d.wins/d.count)*100).toFixed(1) : '0';
+         doc.fontSize(8).font('Helvetica-Bold').fillColor('#475569').text(regime, 300, rwy);
+         doc.font('Helvetica').fillColor('#1e293b').text(`${d.count}  |  WR ${rwr}%  |  $${d.pnl.toFixed(2)}`, 370, rwy);
+       });
+       doc.moveDown(4);
+
+       // ── Tail Risk: Worst & Best 5 Trades ──────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('TAIL RISK — WORST 5 / BEST 5 INDIVIDUAL TRADES', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+
+       const sorted = [...reportTrades].sort((a,b)=>a.pnl - b.pnl);
+       const worst5 = sorted.slice(0, 5);
+       const best5  = sorted.slice(-5).reverse();
+       const tailY  = doc.y;
+       doc.fontSize(8).font('Helvetica-Bold').fillColor('#94a3b8');
+       doc.text('WORST 5', 50, tailY);  doc.text('BEST 5', 310, tailY);
+       doc.strokeColor('#e2e8f0').lineWidth(0.4).moveTo(50, tailY+10).lineTo(290, tailY+10).stroke();
+       doc.moveTo(310, tailY+10).lineTo(560, tailY+10).stroke();
+       for (let i = 0; i < 5; i++) {
+         const wy = tailY + 16 + i * 14;
+         const w  = worst5[i];
+         const b  = best5[i];
+         if (w) {
+           doc.font('Helvetica').fillColor('#ef4444').text(`$${w.pnl.toFixed(3)}`, 50, wy);
+           doc.fillColor('#94a3b8').text(`${w.symbol} ${w.direction} @ ${w.entryPrice?.toFixed(2)||'-'} (${(w.exitReason||'').replace(/_/g,' ')})`, 100, wy, {width:185});
+         }
+         if (b) {
+           doc.fillColor('#10b981').text(`$${b.pnl.toFixed(3)}`, 310, wy);
+           doc.fillColor('#94a3b8').text(`${b.symbol} ${b.direction} @ ${b.entryPrice?.toFixed(2)||'-'} (${(b.exitReason||'').replace(/_/g,' ')})`, 360, wy, {width:185});
+         }
+       }
+       doc.y = tailY + 16 + 5 * 14 + 10;
+
+       // ── MAE Analysis ──────────────────────────────────────────────────
+       doc.moveDown(1.5);
+       const maeTrades   = reportTrades.filter(t => t.maxAdverseExcursion !== undefined && t.maxAdverseExcursion !== 0);
+       if (maeTrades.length > 0) {
+         const maeWinners = maeTrades.filter(t=>t.pnl>0);
+         const maeLosers  = maeTrades.filter(t=>t.pnl<=0);
+         const avgMaeWin  = maeWinners.length > 0 ? maeWinners.reduce((s,t)=>s+Math.abs(t.maxAdverseExcursion!),0)/maeWinners.length : 0;
+         const avgMaeLoss = maeLosers.length  > 0 ? maeLosers.reduce((s,t)=>s+Math.abs(t.maxAdverseExcursion!),0)/maeLosers.length  : 0;
+         const worstMae   = Math.min(...maeTrades.map(t=>t.maxAdverseExcursion!));
+         doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('MAXIMUM ADVERSE EXCURSION (MAE)', 50, doc.y);
+         doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+         doc.moveDown(1.2);
+         const mY = doc.y;
+         doc.fontSize(9).font('Helvetica-Bold').fillColor('#475569').text('Avg MAE on Winners:', 50, mY);
+         doc.font('Helvetica').fillColor('#1e293b').text(`$${avgMaeWin.toFixed(3)} (${maeWinners.length} trades sampled)`, 200, mY);
+         doc.font('Helvetica-Bold').fillColor('#475569').text('Avg MAE on Losers:', 50, mY+14);
+         doc.font('Helvetica').fillColor('#ef4444').text(`$${avgMaeLoss.toFixed(3)} (${maeLosers.length} trades sampled)`, 200, mY+14);
+         doc.font('Helvetica-Bold').fillColor('#475569').text('Worst Single MAE:', 50, mY+28);
+         doc.font('Helvetica').fillColor('#ef4444').text(`$${worstMae.toFixed(3)}`, 200, mY+28);
+         doc.y = mY + 45;
+       }
+
+       // ══════════════════════════════════════════════════════════════════════
+       // PAGE 4: PER-SYMBOL MATRIX & SUB-ALGORITHM LIVE STATE
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#6366f1');
+       doc.moveDown(1.5);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('PER-SYMBOL PERFORMANCE MATRIX', 50, doc.y);
+       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Trade distribution, profitability and factor decomposition by instrument', 50, doc.y + 16);
+       doc.moveDown(2.5);
+
+       // ── Per-Symbol Table ───────────────────────────────────────────────
+       const symData: Record<string, {count:number;wins:number;pnl:number;grossW:number;grossL:number;stakes:number[]}> = {};
+       reportTrades.forEach(t => {
+         if (!symData[t.symbol]) symData[t.symbol] = {count:0,wins:0,pnl:0,grossW:0,grossL:0,stakes:[]};
+         symData[t.symbol].count++;
+         symData[t.symbol].pnl += t.pnl;
+         symData[t.symbol].stakes.push(t.stake);
+         if (t.pnl > 0) { symData[t.symbol].wins++; symData[t.symbol].grossW += t.pnl; }
+         else { symData[t.symbol].grossL += Math.abs(t.pnl); }
+       });
+       const symTableY = doc.y;
+       doc.fontSize(8).font('Helvetica-Bold').fillColor('#94a3b8');
+       doc.text('SYMBOL', 50, symTableY);
+       doc.text('TRADES', 135, symTableY);
+       doc.text('SHARE%', 185, symTableY);
+       doc.text('WIN RATE', 240, symTableY);
+       doc.text('NET PnL', 305, symTableY);
+       doc.text('PROFIT FACTOR', 370, symTableY);
+       doc.text('AVG STAKE', 460, symTableY);
+       doc.strokeColor('#e2e8f0').lineWidth(0.5).moveTo(50, symTableY+11).lineTo(560, symTableY+11).stroke();
+       doc.font('Helvetica').fillColor('#1e293b');
+       Object.entries(symData).sort((a,b)=>b[1].count-a[1].count).forEach(([sym, d], si) => {
+         const sy = symTableY + 18 + si * 16;
+         const wr  = ((d.wins/d.count)*100).toFixed(1);
+         const pf  = d.grossL > 0 ? (d.grossW/d.grossL).toFixed(2) : d.grossW > 0 ? '∞' : '—';
+         const avgSt = (d.stakes.reduce((a,b)=>a+b,0)/d.stakes.length).toFixed(3);
+         const share = ((d.count/finalTotal)*100).toFixed(1);
+         const subN = subAlgorithms[sym]?.name || sym;
+         doc.fontSize(8).fillColor('#334155').text(subN, 50, sy, {width:80});
+         doc.fillColor('#1e293b').text(String(d.count), 135, sy);
+         doc.text(`${share}%`, 185, sy);
+         doc.fillColor(parseFloat(wr)>=50?'#10b981':'#ef4444').text(`${wr}%`, 240, sy);
+         doc.fillColor(d.pnl>=0?'#10b981':'#ef4444').text(`$${d.pnl.toFixed(2)}`, 305, sy);
+         doc.fillColor('#1e293b').text(pf, 370, sy);
+         doc.text(`$${avgSt}`, 460, sy);
+       });
+       doc.y = symTableY + 18 + Object.keys(symData).length * 16 + 20;
+
+       // ── Sub-Algorithm Live State ───────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('SUB-ALGORITHM LIVE STATE AT REPORT TIME', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.5);
+
+       const subColY = doc.y;
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#94a3b8');
+       doc.text('SUB-ALGO', 50, subColY);
+       doc.text('STATUS', 145, subColY);
+       doc.text('TRADES', 195, subColY);
+       doc.text('WR%', 240, subColY);
+       doc.text('ATR×', 278, subColY);
+       doc.text('bbStd', 312, subColY);
+       doc.text('maxTick', 350, subColY);
+       doc.text('Risk×', 398, subColY);
+       doc.text('DIRECTIVE', 440, subColY);
+       doc.strokeColor('#e2e8f0').lineWidth(0.4).moveTo(50, subColY+11).lineTo(560, subColY+11).stroke();
+       doc.font('Helvetica').fillColor('#1e293b');
+       Object.values(subAlgorithms).forEach((sub, subi) => {
+         const subY = subColY + 18 + subi * 20;
+         const subWR = sub.totalTrades > 0 ? ((sub.winningTrades/sub.totalTrades)*100).toFixed(1) : '—';
+         const directive = (sub.directiveMessage || '—').substring(0, 30);
+         doc.fontSize(7.5);
+         doc.fillColor(sub.enabled ? '#10b981' : '#ef4444').text(sub.name.substring(0,18), 50, subY);
+         doc.fillColor(sub.enabled ? '#10b981' : '#64748b').text(sub.enabled ? 'ON' : 'OFF', 145, subY);
+         doc.fillColor('#1e293b').text(String(sub.totalTrades), 195, subY);
+         doc.fillColor(sub.recentWinRate >= 0.5 ? '#10b981' : '#ef4444').text(subWR, 240, subY);
+         doc.fillColor('#1e293b').text(sub.atrStopMultiplier.toFixed(2), 278, subY);
+         doc.text(sub.bbStd.toFixed(2), 312, subY);
+         doc.text(String(sub.maxTicksInTrade), 350, subY);
+         doc.fillColor(sub.targetRiskStakeMultiplier >= 1 ? '#10b981' : '#f59e0b').text(`${sub.targetRiskStakeMultiplier.toFixed(2)}x`, 398, subY);
+         doc.fillColor('#475569').text(directive, 440, subY, {width:115, ellipsis: true});
+       });
+       doc.y = subColY + 18 + Object.values(subAlgorithms).length * 20 + 20;
+
+       // ── Current Global Parameters ──────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('LIVE GLOBAL PARAMETER STATE', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+       const gpY = doc.y;
+       const gpFields = [
+         ['RSI Oversold',         String(currentParams.rsiOversoldThreshold)],
+         ['RSI Overbought',       String(currentParams.rsiOverboughtThreshold)],
+         ['ATR Stop Mult',        currentParams.atrStopMultiplier.toFixed(4)],
+         ['Bollinger Std',        currentParams.bbStd.toFixed(2)],
+         ['Bollinger Period',     String(currentParams.bbPeriod)],
+         ['Max Ticks/Trade',      String(currentParams.maxTicksInTrade)],
+         ['Min Confluence',       String(currentParams.minConfluenceScore)],
+         ['ADX Regime Gate',      String(currentParams.regimeAdxThreshold)],
+       ];
+       gpFields.forEach(([lbl, val], gi) => {
+         const col = gi % 2 === 0 ? 50 : 300;
+         const row = Math.floor(gi / 2);
+         const gy = gpY + row * 16;
+         doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#475569').text(lbl+':', col, gy);
+         doc.font('Helvetica').fillColor('#1e293b').text(val, col + 120, gy);
+       });
+       doc.y = gpY + Math.ceil(gpFields.length / 2) * 16 + 20;
+
+       // ══════════════════════════════════════════════════════════════════════
+       // PAGE 5: ACTIVE STATE SNAPSHOT & DRAWDOWN VECTOR
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#f59e0b');
+       doc.moveDown(1.5);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('LIVE SESSION STATE SNAPSHOT', 50, doc.y);
+       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Real-time capital state, open positions and drawdown topology at report generation time', 50, doc.y + 16);
+       doc.moveDown(2.5);
+
+       // ── Session State Block ────────────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('SESSION CAPITAL STATE', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+       const capY = doc.y;
+       const lossFromBase = Math.max(0, sessionStartBalance - balance);
+       const ddPct = sessionStartBalance > 0 ? ((lossFromBase / sessionStartBalance) * 100).toFixed(2) : '0.00';
+       const capFields = [
+         ['Deriv Account Balance',   `$${balance.toFixed(2)}`],
+         ['Session Start Balance',   `$${sessionStartBalance.toFixed(2)}`],
+         ['Peak Balance (session)',   `$${peakBalance.toFixed(2)}`],
+         ['Session Drawdown',        `${ddPct}% ($${lossFromBase.toFixed(2)})`],
+         ['Session Blocked',         sessionBlocked ? 'YES — MANUAL RESUME REQUIRED' : 'NO'],
+         ['Circuit Breaker',         circuitBreakerCooldown > 0 ? `ACTIVE (${circuitBreakerCooldown}s remaining)` : 'CLEAR'],
+       ];
+       capFields.forEach(([lbl, val], ci) => {
+         const col = ci % 2 === 0 ? 50 : 300;
+         const row = Math.floor(ci / 2);
+         const cy = capY + row * 16;
+         doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#475569').text(lbl+':', col, cy);
+         doc.font('Helvetica').fillColor(lbl.includes('Blocked') && val.includes('YES') ? '#ef4444' : '#1e293b').text(val, col + 155, cy);
+       });
+       doc.y = capY + Math.ceil(capFields.length / 2) * 16 + 20;
+
+       // ── Drawdown Vector Chart ──────────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text('DRAWDOWN DEPTH CURVE (SESSION)', 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.5);
+       const ddGraphX = 50; const ddGraphY = doc.y; const ddGraphW = 512; const ddGraphH = 120;
+       doc.rect(ddGraphX, ddGraphY, ddGraphW, ddGraphH).fill('#0b0f19');
+       doc.strokeColor('#1e293b').lineWidth(0.4);
+       for (let j = 1; j <= 3; j++) {
+         doc.moveTo(ddGraphX, ddGraphY + (ddGraphH/4)*j).lineTo(ddGraphX+ddGraphW, ddGraphY+(ddGraphH/4)*j).stroke();
+       }
+       const ddPoints: number[] = [];
+       let ddRunning = 0; let ddPeak2 = 0;
+       reportTrades.forEach(t => {
+         ddRunning += t.pnl;
+         if (ddRunning > ddPeak2) ddPeak2 = ddRunning;
+         ddPoints.push(ddPeak2 > 0 ? ((ddPeak2 - ddRunning) / ddPeak2) * 100 : 0);
+       });
+       const ddMax = Math.max(...ddPoints, 0.01);
+       doc.strokeColor('#ef4444').lineWidth(1.5);
+       doc.moveTo(ddGraphX, ddGraphY + (ddPoints[0]/ddMax)*ddGraphH);
+       for (let i = 1; i < ddPoints.length; i++) {
+         const cx = ddGraphX + (i / (ddPoints.length - 1)) * ddGraphW;
+         const cy = ddGraphY + (ddPoints[i] / ddMax) * ddGraphH;
+         doc.lineTo(cx, cy);
+       }
+       doc.stroke();
+       doc.fontSize(7).fillColor('#64748b').font('Helvetica');
+       doc.text(`Max DD: ${ddMax.toFixed(2)}%`, ddGraphX+8, ddGraphY+8);
+       doc.text('0%', ddGraphX+8, ddGraphY+ddGraphH-14);
+       doc.text('Trade 1', ddGraphX+5, ddGraphY+ddGraphH+5);
+       doc.text(`Trade ${ddPoints.length}`, ddGraphX+ddGraphW-80, ddGraphY+ddGraphH+5);
+       doc.y = ddGraphY + ddGraphH + 25;
+
+       // ── Active Positions Snapshot ──────────────────────────────────────
+       doc.fontSize(12).font('Helvetica-Bold').fillColor('#0f172a').text(`OPEN POSITIONS AT REPORT TIME (${activePositions.length})`, 50, doc.y);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+       if (activePositions.length === 0) {
+         doc.fontSize(9).font('Helvetica-Oblique').fillColor('#94a3b8').text('No open positions at report generation time.', 50, doc.y);
+         doc.moveDown(1);
+       } else {
+         const posY = doc.y;
+         doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#94a3b8');
+         doc.text('ID', 50, posY); doc.text('SYMBOL', 120, posY); doc.text('DIR', 190, posY);
+         doc.text('ENTRY', 220, posY); doc.text('STAKE', 280, posY); doc.text('MULT', 330, posY);
+         doc.text('TICKS', 375, posY); doc.text('LIVE PnL', 415, posY); doc.text('SL', 475, posY); doc.text('TP', 518, posY);
+         doc.strokeColor('#e2e8f0').lineWidth(0.4).moveTo(50, posY+11).lineTo(560, posY+11).stroke();
+         doc.font('Helvetica');
+         activePositions.slice(0, 15).forEach((pos, pi) => {
+           const py = posY + 18 + pi * 14;
+           doc.fontSize(7).fillColor('#475569').text(String(pos.id).substring(0,12), 50, py);
+           doc.fillColor('#1e293b').text(pos.symbol, 120, py);
+           doc.fillColor(pos.direction==='LONG'?'#10b981':'#ef4444').text(pos.direction, 190, py);
+           doc.fillColor('#1e293b').text(pos.entryPrice?.toFixed(2)||'-', 220, py);
+           doc.text(`$${pos.stake?.toFixed(2)||'-'}`, 280, py);
+           doc.text(String(pos.multiplier||'-'), 330, py);
+           doc.text(String(pos.ticksElapsed||0), 375, py);
+           doc.fillColor((pos.pnl||0)>=0?'#10b981':'#ef4444').text(`$${(pos.pnl||0).toFixed(3)}`, 415, py);
+           doc.fillColor('#64748b').text(pos.stopLoss?.toFixed(2)||'-', 475, py);
+           doc.text(pos.takeProfit?.toFixed(2)||'-', 518, py);
+         });
+         if (activePositions.length > 15) {
+           doc.fontSize(8).fillColor('#94a3b8').text(`... and ${activePositions.length - 15} more positions not shown.`, 50, posY + 18 + 15*14);
+         }
+       }
+
+
+        // ══════════════════════════════════════════════════════════════════════
+       // PAGE 6: ALGORITHM INTELLIGENCE REPORT
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#7c3aed');
+       doc.moveDown(1.5);
+       const p6Date = new Date().toLocaleDateString('en-KE', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+       const p6Time = new Date().toLocaleTimeString('en-KE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('ALGORITHM INTELLIGENCE REPORT', 50, doc.y);
+       doc.fontSize(8.5).font('Helvetica-Oblique').fillColor('#64748b').text(`Per-algorithm bias analysis, strategy distribution, Governor decisions & parameter audit  |  ${p6Date}  |  ${p6Time}  |  Session: ${botSessionId}`, 50, doc.y + 16, { width: 512 });
+       doc.moveDown(2.5);
+
+       // ── SECTION 1: Per-Algorithm Profiles ─────────────────────────────────
+       doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a').text('SECTION 1 — PER-ALGORITHM PERFORMANCE PROFILES', 50, doc.y);
+       doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+
+       Object.keys(subAlgorithms).forEach(subKey => {
+         if (doc.y > 690) { doc.addPage(); doc.rect(40, 40, 532, 10).fill('#7c3aed'); doc.moveDown(2); }
+         const sub = subAlgorithms[subKey];
+         const sTrades = reportTrades.filter(t => t.symbol === subKey);
+         if (sTrades.length === 0) {
+           doc.fontSize(8).font('Helvetica-Oblique').fillColor('#94a3b8').text(`${sub.personality} (${subKey}): No trades recorded this session.`, 50, doc.y);
+           doc.moveDown(0.7);
+           return;
+         }
+         const sWins = sTrades.filter(t => t.pnl > 0).length;
+         const sPnl = sTrades.reduce((s, t) => s + t.pnl, 0);
+         const sWR = (sWins / sTrades.length * 100);
+         const lTrades = sTrades.filter(t => t.direction === 'LONG');
+         const shTrades = sTrades.filter(t => t.direction === 'SHORT');
+         const longPct2 = (lTrades.length / sTrades.length * 100);
+         const shortPct2 = 100 - longPct2;
+         // Regime breakdown
+         const sReg: Record<string, {count:number;pnl:number;wins:number}> = {};
+         sTrades.forEach(t => { const k = String(t.regimeAtEntry || 'UNKNOWN'); if (!sReg[k]) sReg[k] = {count:0,pnl:0,wins:0}; sReg[k].count++; sReg[k].pnl += t.pnl; if (t.pnl > 0) sReg[k].wins++; });
+         const regSorted = Object.entries(sReg).sort((a, b) => b[1].pnl - a[1].pnl);
+         const bestR = regSorted[0];
+         const worstR = regSorted[regSorted.length - 1];
+         // Exit reason breakdown
+         const sEx: Record<string, {count:number;pnl:number;wins:number}> = {};
+         sTrades.forEach(t => { const k = t.exitReason || 'unknown'; if (!sEx[k]) sEx[k] = {count:0,pnl:0,wins:0}; sEx[k].count++; sEx[k].pnl += t.pnl; if (t.pnl > 0) sEx[k].wins++; });
+         const exSorted = Object.entries(sEx).sort((a, b) => b[1].pnl - a[1].pnl);
+         const topExit = exSorted[0];
+         const worstExitS = [...exSorted].sort((a, b) => a[1].pnl - b[1].pnl)[0];
+         // Bias tag
+         const biasTag = longPct2 > 60 ? 'LONG-BIASED' : longPct2 < 40 ? 'SHORT-BIASED' : 'BALANCED';
+         const biasColor = longPct2 > 60 ? '#10b981' : longPct2 < 40 ? '#ef4444' : '#f59e0b';
+
+         const lineY = doc.y;
+         doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#1e293b').text(`${sub.personality}`, 50, lineY, { width: 200 });
+         doc.fontSize(7).font('Helvetica-Bold').fillColor(biasColor).text(biasTag, 258, lineY);
+         doc.font('Helvetica').fontSize(7.5).fillColor('#64748b').text(`${sTrades.length} trades  |  WR ${sWR.toFixed(1)}%  |  Net $${sPnl.toFixed(2)}  |  Avg $${(sPnl / sTrades.length).toFixed(3)}`, 330, lineY, { width: 230 });
+
+         // Bias bars
+         const bY = lineY + 13;
+         const bMax = 150;
+         doc.fontSize(6.5).font('Helvetica-Bold').fillColor('#10b981').text('L', 50, bY + 1);
+         doc.rect(60, bY, bMax, 7).fillColor('#162032').fill();
+         doc.rect(60, bY, Math.max(2, (longPct2 / 100) * bMax), 7).fillColor('#10b981').fill();
+         doc.fontSize(6.5).font('Helvetica').fillColor('#475569').text(`${longPct2.toFixed(0)}%  (${lTrades.filter(t => t.pnl > 0).length}W / ${lTrades.filter(t => t.pnl <= 0).length}L)`, 216, bY + 1);
+         doc.fontSize(6.5).font('Helvetica-Bold').fillColor('#ef4444').text('S', 50, bY + 10);
+         doc.rect(60, bY + 10, bMax, 7).fillColor('#162032').fill();
+         doc.rect(60, bY + 10, Math.max(2, (shortPct2 / 100) * bMax), 7).fillColor('#ef4444').fill();
+         doc.fontSize(6.5).font('Helvetica').fillColor('#475569').text(`${shortPct2.toFixed(0)}%  (${shTrades.filter(t => t.pnl > 0).length}W / ${shTrades.filter(t => t.pnl <= 0).length}L)`, 216, bY + 10);
+
+         // Strength / Mistake / Opportunity
+         const iY = bY + 23;
+         const bestRWR = bestR && bestR[1].count > 0 ? (bestR[1].wins / bestR[1].count * 100).toFixed(0) : '0';
+         const worstRWR = worstR && worstR[1].count > 0 ? (worstR[1].wins / worstR[1].count * 100).toFixed(0) : '0';
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#6366f1').text('STRENGTH:', 50, iY);
+         doc.font('Helvetica').fillColor('#334155').text(bestR ? `${bestR[0]} regime: WR ${bestRWR}%, Net $${bestR[1].pnl.toFixed(2)} (${bestR[1].count} trades)` : '—', 115, iY, { width: 190 });
+         doc.font('Helvetica-Bold').fillColor('#ef4444').text('MISTAKE:', 318, iY);
+         doc.font('Helvetica').fillColor('#334155').text(worstExitS ? `${worstExitS[0].replace(/_/g, ' ')} exit: Net $${worstExitS[1].pnl.toFixed(2)} (${worstExitS[1].count} trades)` : '—', 373, iY, { width: 185 });
+         doc.y = iY + 12;
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#f59e0b').text('OPPORTUNITY:', 50, doc.y);
+         doc.font('Helvetica').fillColor('#334155').text(topExit ? `Best exit: ${topExit[0].replace(/_/g, ' ')} — $${topExit[1].pnl.toFixed(2)}, WR ${topExit[1].count > 0 ? (topExit[1].wins / topExit[1].count * 100).toFixed(0) : 0}%  |  Weakest regime: ${worstR ? worstR[0] + ` WR ${worstRWR}%` : '—'}` : '—', 125, doc.y, { width: 430 });
+         doc.y = doc.y + 11;
+         doc.strokeColor('#e2e8f0').lineWidth(0.3).moveTo(50, doc.y).lineTo(560, doc.y).stroke();
+         doc.moveDown(0.6);
+       });
+
+       // ── SECTION 2: Strategy Type Distribution ─────────────────────────────
+       if (doc.y > 650) { doc.addPage(); doc.rect(40, 40, 532, 10).fill('#7c3aed'); doc.moveDown(2); }
+       doc.moveDown(0.4);
+       doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a').text('SECTION 2 — STRATEGY TYPE DISTRIBUTION', 50, doc.y);
+       doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+
+       const p6TrendTrades = reportTrades.filter(t => String(t.regimeAtEntry) === 'TRENDING');
+       const p6RangeTrades = reportTrades.filter(t => String(t.regimeAtEntry) === 'RANGING');
+       const p6TransTrades = reportTrades.filter(t => String(t.regimeAtEntry) !== 'TRENDING' && String(t.regimeAtEntry) !== 'RANGING');
+       const stratBuckets2 = [
+         { label: 'SFT-V2 Fractal Pursuit  (Trend-Following)', bkt: p6TrendTrades, col: '#6366f1' },
+         { label: 'Mean-Fader  (Mean-Reversion Ranging)', bkt: p6RangeTrades, col: '#10b981' },
+         { label: 'Transition / Mixed Regime', bkt: p6TransTrades, col: '#f59e0b' },
+       ];
+       const s2Y2 = doc.y;
+       stratBuckets2.forEach(({ label, bkt, col }, bi) => {
+         if (bkt.length === 0) return;
+         const bWins = bkt.filter(t => t.pnl > 0).length;
+         const bPnl = bkt.reduce((s, t) => s + t.pnl, 0);
+         const bPct = (bkt.length / Math.max(1, finalTotal) * 100);
+         const sy2 = s2Y2 + bi * 22;
+         doc.fontSize(8).font('Helvetica-Bold').fillColor(col).text(label, 50, sy2, { width: 195 });
+         doc.rect(250, sy2, 210, 10).fillColor('#0f172a').fill();
+         doc.rect(250, sy2, Math.max(2, (bPct / 100) * 210), 10).fillColor(col).fill();
+         doc.fontSize(7.5).font('Helvetica').fillColor('#475569').text(`${bkt.length} trades (${bPct.toFixed(1)}%)  |  WR ${(bWins / bkt.length * 100).toFixed(1)}%  |  Net $${bPnl.toFixed(2)}`, 468, sy2, { width: 90 });
+       });
+       doc.y = s2Y2 + 3 * 22 + 12;
+
+       // Per-sub strategy mini table
+       doc.moveDown(0.5);
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#475569').text('Per-Algorithm Strategy Breakdown  (T=Trend  R=Range  X=Transition):', 50, doc.y);
+       doc.moveDown(0.5);
+       const psbY = doc.y;
+       let psbCol = 0;
+       Object.keys(subAlgorithms).forEach(key => {
+         const sT = reportTrades.filter(t => t.symbol === key);
+         if (sT.length === 0) return;
+         const sTrend2 = sT.filter(t => String(t.regimeAtEntry) === 'TRENDING').length;
+         const sRange2 = sT.filter(t => String(t.regimeAtEntry) === 'RANGING').length;
+         const sOther2 = sT.length - sTrend2 - sRange2;
+         const colX = psbCol % 3 === 0 ? 50 : psbCol % 3 === 1 ? 220 : 390;
+         const rowY = psbY + Math.floor(psbCol / 3) * 14;
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#1e293b').text(`${key}:`, colX, rowY);
+         doc.font('Helvetica').fillColor('#6366f1').text(`T:${sTrend2}`, colX + 35, rowY);
+         doc.fillColor('#10b981').text(`R:${sRange2}`, colX + 65, rowY);
+         doc.fillColor('#f59e0b').text(`X:${sOther2}`, colX + 92, rowY);
+         psbCol++;
+       });
+       doc.y = psbY + Math.ceil(Math.max(1, psbCol) / 3) * 14 + 12;
+
+       // ── SECTION 3: Governor Activity & Decisions ───────────────────────────
+       if (doc.y > 640) { doc.addPage(); doc.rect(40, 40, 532, 10).fill('#7c3aed'); doc.moveDown(2); }
+       doc.moveDown(0.4);
+       doc.fontSize(11).font('Helvetica-Bold').fillColor('#0f172a').text('SECTION 3 — GOVERNOR ACTIVITY & MAJOR DECISIONS', 50, doc.y);
+       doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1.2);
+
+       const totGov = governorMemory.approvals + governorMemory.vetoes;
+       const vRate = totGov > 0 ? (governorMemory.vetoes / totGov * 100).toFixed(1) : '0.0';
+       const approvalRate = totGov > 0 ? (governorMemory.approvals / totGov * 100).toFixed(1) : '0.0';
+       const gvY2 = doc.y;
+       doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#475569').text('Total Approvals:', 50, gvY2);
+       doc.font('Helvetica').fillColor('#10b981').text(String(governorMemory.approvals), 160, gvY2);
+       doc.font('Helvetica-Bold').fillColor('#475569').text('Total Vetoes:', 210, gvY2);
+       doc.font('Helvetica').fillColor('#ef4444').text(String(governorMemory.vetoes), 300, gvY2);
+       doc.font('Helvetica-Bold').fillColor('#475569').text('Approval Rate:', 340, gvY2);
+       doc.font('Helvetica').fillColor('#1e293b').text(`${approvalRate}%`, 430, gvY2);
+       doc.font('Helvetica-Bold').fillColor('#475569').text('Veto Rate:', 470, gvY2);
+       doc.font('Helvetica').fillColor('#ef4444').text(`${vRate}%`, 530, gvY2);
+
+       // Approval rate visual bar
+       doc.moveDown(0.8);
+       const apBarY = doc.y;
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#475569').text('Governor Approval Rate:', 50, apBarY);
+       doc.rect(195, apBarY, 250, 10).fillColor('#1e1e2e').fill();
+       const apFill = Math.max(2, (parseFloat(approvalRate) / 100) * 250);
+       doc.rect(195, apBarY, apFill, 10).fillColor('#10b981').fill();
+       doc.rect(195 + apFill, apBarY, 250 - apFill, 10).fillColor('#ef4444').fill();
+       doc.fontSize(7).font('Helvetica').fillColor('#475569').text(`${approvalRate}% approved  /  ${vRate}% vetoed`, 452, apBarY + 1, { width: 108 });
+
+       // Focus symbol
+       doc.moveDown(0.9);
+       doc.fontSize(8).font('Helvetica-Bold').fillColor('#475569').text('Focus Symbol (Governor Primary Target):', 50, doc.y);
+       doc.font('Helvetica').fillColor('#6366f1').text(`${governorFocusSymbol}  —  ${subAlgorithms[governorFocusSymbol]?.name || 'N/A'}  (Agentic Score: ${(governorAgenticScore * 100).toFixed(0)}%)`, 260, doc.y, { width: 300 });
+
+       // Last insight
+       doc.moveDown(0.9);
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#475569').text('Last Governor Reasoning:', 50, doc.y);
+       doc.moveDown(0.4);
+       doc.fontSize(7.5).font('Helvetica-Oblique').fillColor('#334155').text(`"${(governorMemory.lastInsight || 'No decisions recorded this session.').substring(0, 300)}"`, 50, doc.y, { width: 512 });
+
+       // Recent adaptive engine log
+       doc.moveDown(1);
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#475569').text('RECENT ADAPTIVE ENGINE DECISIONS  (ML / GOVERNOR_POLICE / CREATIVE_SYNTH):', 50, doc.y);
+       doc.moveDown(0.5);
+       const p6GovLogs = logs.filter(l => l.includes('[GOVERNOR_POLICE]') || l.includes('[ADAPTIVE_ENGINE]') || l.includes('[CREATIVE_SYNTH]')).slice(-8);
+       if (p6GovLogs.length === 0) {
+         doc.fontSize(7).font('Helvetica-Oblique').fillColor('#94a3b8').text('No adaptive engine events recorded in current session.', 50, doc.y);
+         doc.moveDown(0.5);
+       } else {
+         p6GovLogs.forEach((log, i) => {
+           if (doc.y > 760) return;
+           doc.fontSize(6.5).font('Helvetica').fillColor(log.includes('tightened') || log.includes('reduced') ? '#f59e0b' : log.includes('boosting') || log.includes('relaxed') ? '#10b981' : '#475569').text(`${i + 1}. ${log.substring(0, 135)}`, 50, doc.y, { width: 512 });
+           doc.moveDown(0.4);
+         });
+       }
+
+       // Audit recommendations section
+       doc.moveDown(0.6);
+       if (doc.y > 700) { doc.addPage(); doc.rect(40, 40, 532, 10).fill('#7c3aed'); doc.moveDown(2); }
+       doc.fontSize(8.5).font('Helvetica-Bold').fillColor('#0f172a').text('SECTION 4 — SUB-ALGORITHM PARAMETER AUDIT (APPLIED THIS SESSION)', 50, doc.y);
+       doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
+       doc.moveDown(1);
+       const auditRows = [
+         ['R_10  Aegis Mean Fader',      'bbStd 2.20  ATR×2.50  maxTicks 45  breakEven+trailing ADDED', 'Low vol — tight bands, fast settle'],
+         ['R_25  Sentinel Sniper',       'bbStd 2.30  ATR×2.60  maxTicks 50',                          'Low-med vol — moderate tightening'],
+         ['R_75  Apex HFT Scalar',       'No changes — standard reference instrument',                  'Mid vol — calibrated baseline'],
+         ['CRASH500  Recovery Scalar',   'rsiOS 22  rsiOB 75  bbStd 2.75  ATR×2.25  minConf 4  maxTicks 45', 'Spike DOWN — only trade deep dips'],
+         ['BOOM500   Ridge Sniper',      'rsiOS 25  rsiOB 78  bbStd 2.75  ATR×2.25  minConf 4  maxTicks 45', 'Spike UP — only trade deep booms'],
+         ['R_100  Spike Raider',         'rsiOS 28  rsiOB 72  bbStd 2.75  ATR×3.00  maxTicks 75',      'High vol — more room required'],
+       ];
+       const auditY = doc.y;
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#94a3b8');
+       doc.text('ALGORITHM', 50, auditY); doc.text('PARAMETER CHANGES', 195, auditY); doc.text('RATIONALE', 420, auditY);
+       doc.strokeColor('#e2e8f0').lineWidth(0.4).moveTo(50, auditY + 11).lineTo(560, auditY + 11).stroke();
+       auditRows.forEach(([algo, changes, rationale], ri) => {
+         const ay = auditY + 18 + ri * 16;
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#334155').text(algo, 50, ay, { width: 140 });
+         doc.font('Helvetica').fillColor('#1e293b').text(changes, 195, ay, { width: 220 });
+         doc.fillColor('#64748b').text(rationale, 420, ay, { width: 135 });
+       });
+       doc.y = auditY + 18 + auditRows.length * 16 + 15;
+
+       // Page seal
+       doc.moveDown(0.8);
+       doc.strokeColor('#7c3aed').lineWidth(0.5).moveTo(50, doc.y).lineTo(560, doc.y).stroke();
+       doc.moveDown(0.5);
+       doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#0f172a').text('INFINITY MARKETS LAB ALGORITHM INTELLIGENCE UNIT — STRATEGY OPTIMIZATION DIVISION', 50, doc.y, { align: 'center', width: 512 });
+       doc.fontSize(6.5).font('Helvetica').fillColor('#94a3b8').text(`Sealed: ${new Date().toISOString()}  |  Governor Agentic Score: ${(governorAgenticScore * 100).toFixed(0)}%  |  Active Sub-Algorithms: ${Object.values(subAlgorithms).filter(s => s.enabled).length}/6`, 50, doc.y + 11, { align: 'center', width: 512 });
+
+      doc.end();
      });
      
      // Store summary in memory for frontend
@@ -3055,41 +3825,67 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
 // ==========================================
 // CIRCUIT BREAKER SYSTEM
 // ==========================================
+function getCircuitBreakerRemainingSeconds() {
+  if (circuitBreakerResumeAt <= 0) return 0;
+  return Math.max(0, Math.ceil((circuitBreakerResumeAt - Date.now()) / 1000));
+}
+
+function startGovernorCooldown(seconds: number, message: string) {
+  tradingEnabled = false;
+  circuitBreakerResumeAt = Date.now() + seconds * 1000;
+  circuitBreakerCooldown = seconds;
+  tradingAutoResumePending = true;
+  cooldownMessage = message;
+}
+
+function updateCircuitBreakerCooldown() {
+  circuitBreakerCooldown = getCircuitBreakerRemainingSeconds();
+  if (circuitBreakerCooldown > 0 || !tradingAutoResumePending) return;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
+  cooldownMessage = "";
+  if (!sessionBlocked && liveBridgeInstance.getIsAuthorized()) {
+    tradingEnabled = true;
+    logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Governor cooldown cleared. Auto-trading resumed.`);
+  } else {
+    logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Governor cooldown cleared. Trading remains paused until live authorization is available.`);
+  }
+}
+
 function evaluateCircuitBreakers() {
+  updateCircuitBreakerCooldown();
   // Daily & Session limits monitoring
-  const initialCap = 10000.00; // Baseline session seed capital
-  const lossFromBaseline = initialCap - balance;
-  const drawdownPct = lossFromBaseline / initialCap;
+  if (sessionStartBalance <= 0 && balance > 0) {
+    sessionStartBalance = balance;
+  }
+  const equityBaseline = sessionStartBalance || balance || 1;
+  const lossFromBaseline = Math.max(0, equityBaseline - balance);
+  const drawdownPct = lossFromBaseline / equityBaseline;
   
   // Section 8: Terminal Session Block & Strict Safeguards
-  if (drawdownPct >= 0.05 && !sessionBlocked) { // 5% absolute stop
+  if (drawdownPct >= 0.03 && !sessionBlocked) {
     tradingEnabled = false;
     sessionBlocked = true;
-    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5% Drawdown breached.";
-    logs.push(`[BREAKER_ACT] 🛑 TERMINAL DRAWDOWN BREAKER ENGAGED. Current loss: $${lossFromBaseline.toFixed(2)}. Session permanently blocked.`);
-    return;
-  }
-
-  // Section 8: Max consecutive losses (5 trades) -> Terminal Block
-  if (consecutiveLosses >= 5 && !sessionBlocked) {
-    tradingEnabled = false;
-    sessionBlocked = true;
-    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5 Consecutive losses.";
-    logs.push(`[BREAKER_ACT] 🛑 MAX CONSECUTIVE LOSSES (5) BREACHED. Session permanently blocked.`);
+    tradingAutoResumePending = false;
+    circuitBreakerResumeAt = 0;
+    circuitBreakerCooldown = 0;
+    cooldownMessage = "MANUAL INTERVENTION REQUIRED: 3% live equity loss limit reached.";
+    logs.push(`[BREAKER_ACT] 🛑 3% LIVE EQUITY LIMIT BREACHED. Current loss: $${lossFromBaseline.toFixed(2)} from session equity baseline $${equityBaseline.toFixed(2)}. Manual intervention required.`);
     return;
   }
 
   if (sessionBlocked) return; // Prevent temporal breakers overriding terminal state
 
+  if (consecutiveLosses >= 5 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
+    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 5 consecutive losses. Auto-resume in 10 minutes.");
+    logs.push(`[BREAKER_ACT] 🛑 5 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
+    return;
+  }
+
   // Temporal Mitigation limits
-  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0) {
-    circuitBreakerCooldown = 300; // 5-minute cooldown period
-    cooldownMessage = "WARNING: 3 Consecutive losses met. 5-minute cooldown active.";
-    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive Losses Threshold. Circuit breaker locked for 5 mins.`);
-  } else if (drawdownPct >= 0.03 && circuitBreakerCooldown === 0) {
-    circuitBreakerCooldown = 450; // 7.5-minute pause on 3% draw
-    cooldownMessage = "WARNING: 3% Drawdown warning limit breached. 7.5-minute pause.";
-    logs.push(`[BREAKER_ACT] ⚠️ 3% Drawdown Warning. Current loss: $${lossFromBaseline.toFixed(2)}. Pausing trading for 7.5 mins.`);
+  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
+    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 3 consecutive losses. Auto-resume in 10 minutes.");
+    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
   }
 }
 
@@ -3109,8 +3905,8 @@ function runMachineLearningAdaptation() {
       return;
     }
 
-    // Historical Trade Data
-    const trades = completedTrades.filter(t => t.symbol === sub.name);
+    // Historical Trade Data — filter by sub.symbol (the key e.g. "R_100"), NOT sub.name ("Volatility 100 Index")
+    const trades = completedTrades.filter(t => t.symbol === sub.symbol);
     const winRate = sub.recentWinRate;
     const grossWins = trades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
     const grossLosses = Math.abs(trades.filter(t => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0));
@@ -3137,7 +3933,7 @@ function runMachineLearningAdaptation() {
       
       // Increase trailing stop buffer natively in high-variance regimes
       if (tailAdverse) {
-        sub.bbStd = parseFloat((sub.bbStd * 1.1).toFixed(2));
+        sub.bbStd = parseFloat(Math.max(1.8, Math.min(3.5, sub.bbStd * 1.1)).toFixed(2));
       }
       
       // Limit capital downside (cutting half Kelly sizing)
@@ -3157,7 +3953,7 @@ function runMachineLearningAdaptation() {
 
       // Tighten standard deviations slightly to take earlier entries
       if (sub.bbStd > 1.8) {
-        sub.bbStd = parseFloat((sub.bbStd * 0.95).toFixed(2));
+        sub.bbStd = parseFloat(Math.max(1.8, Math.min(3.5, sub.bbStd * 0.95)).toFixed(2));
       }
 
       // Elevate stake sizes to compound positive expectancy (boost Kelly size)
@@ -3192,7 +3988,7 @@ function runMachineLearningAdaptation() {
     if (globalWinRate < 0.45 && globalPF < 1.0) {
       if (currentParams.rsiOversoldThreshold > 25) currentParams.rsiOversoldThreshold -= 1;
       if (currentParams.rsiOverboughtThreshold < 75) currentParams.rsiOverboughtThreshold += 1;
-      currentParams.atrStopMultiplier = parseFloat((currentParams.atrStopMultiplier * 1.1).toFixed(2));
+      currentParams.atrStopMultiplier = parseFloat(Math.min(currentParams.atrStopMultiplier * 1.1, 5.0).toFixed(2));
       logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio WR ${(globalWinRate * 100).toFixed(1)}% & PF < 1. Tightening global parameters universally.`);
     } else {
       logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio metric is healthy (WR ${(globalWinRate * 100).toFixed(1)}%, PF ${globalPF.toFixed(2)}). Global macro parameters active.`);
@@ -3478,7 +4274,7 @@ async function generateAiReport(userPrompt?: string): Promise<string> {
   const client = getGeminiClient();
   if (!client) {
     // Elegant fallback guidance if key is absent
-    return `### **Sovereign System Analyzer (Offline Mode)**
+    return `### **IML System Analyzer (Offline Mode)**
     
 *The Gemini AI API Key was not yet configured in the Secrets panel on AI Studio.*
 Here is an automated system validation report based on direct mathematical tracking:
@@ -3521,7 +4317,7 @@ Here is an automated system validation report based on direct mathematical track
     })),
   };
 
-  const contextPrompt = `You are Sovereign AI, an elite institutional risk engineer and trading system advisor specializing in synthetic indices stochastic models.
+  const contextPrompt = `You are Infinity Markets Lab AI, an elite institutional risk engineer and trading system advisor specializing in synthetic indices stochastic models.
 Review this current automated bot's session data:
 ${JSON.stringify(analyticsData, null, 2)}
 
@@ -3535,12 +4331,12 @@ Format output beautifully with clean markdown headers and lists. Follow research
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-1.5-flash",
       contents: contextPrompt,
     });
     return response.text || "No response received from model.";
   } catch (err: any) {
-    return `### **Sovereign System Analyzer (Error)**
+    return `### **IML System Analyzer (Error)**
     
 Failed to contact Gemini servers: ${err.message || err}. Reverting to local diagnostics. Check your API key.`;
   }
@@ -3559,7 +4355,7 @@ app.get("/api/ml-export", async (req, res) => {
   if (supabaseClient) {
     try {
       const { data, error } = await supabaseClient
-        .from("sovereign_trades")
+        .from("iml_trades")
         .select("*")
         .order("created_at", { ascending: false })
         .limit(10000); // Fetch up to 10k historical trades
@@ -3581,17 +4377,102 @@ app.get("/api/ml-export", async (req, res) => {
       Object.values(row).map(v => typeof v === "object" ? JSON.stringify(v) : v).join(",")
     ).join("\n");
     res.setHeader("Content-Type", "text/csv");
-    res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.csv"');
+    res.setHeader("Content-Disposition", 'attachment; filename="iml_trades_export.csv"');
     return res.status(200).send(`${headers}\n${rows}`);
   }
 
   res.setHeader("Content-Type", "application/json");
-  res.setHeader("Content-Disposition", 'attachment; filename="sovereign_trades_export.json"');
+  res.setHeader("Content-Disposition", 'attachment; filename="iml_trades_export.json"');
   res.json(exportData);
+});
+
+function toCsvValue(value: any) {
+  if (value === null || value === undefined) return "";
+  const raw = typeof value === "object" ? JSON.stringify(value) : String(value);
+  return `"${raw.replace(/"/g, '""')}"`;
+}
+
+function resolveKenyaLogRange(query: any) {
+  const today = getKenyaDay();
+  if (query.start && query.end) {
+    return { startDay: String(query.start), endDay: String(query.end), label: `${query.start}_to_${query.end}` };
+  }
+  const range = String(query.range || "today");
+  const days = range === "30d" ? 30 : range === "7d" ? 7 : range === "3d" ? 3 : 1;
+  const now = new Date();
+  const formatter = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Nairobi", year: "numeric", month: "2-digit", day: "2-digit" });
+  const start = new Date(now.getTime() - (days - 1) * 24 * 60 * 60 * 1000);
+  return { startDay: formatter.format(start), endDay: today, label: range };
+}
+
+app.get("/api/logs/export", async (req, res) => {
+  const format = String(req.query.format || "csv");
+  const { startDay, endDay, label } = resolveKenyaLogRange(req.query);
+  const categoryFilter = req.query.category ? String(req.query.category) : undefined;
+  let exportLogs: any[] = [];
+
+  if (supabaseClient) {
+    try {
+      let query: any = supabaseClient
+        .from("iml_logs")
+        .select("*")
+        .gte("kenya_day", startDay)
+        .lte("kenya_day", endDay)
+        .order("created_at", { ascending: true })
+        .limit(50000);
+      if (categoryFilter) {
+        query = query.in("category", categoryFilter.split(","));
+      }
+      const { data, error } = await query;
+      if (error) {
+        if (isMissingTableError(error)) {
+          logSupabaseSetupInstructions();
+        } else if (isRLSError(error)) {
+          logSupabaseRLSInstructions();
+        }
+      } else {
+        exportLogs = data || [];
+      }
+    } catch (err) {
+      console.error("[LOG_EXPORT] Error fetching logs from Supabase:", err);
+    }
+  }
+
+  if (exportLogs.length === 0) {
+    let sourceLogs = logs;
+    if (categoryFilter) {
+      const cats = categoryFilter.split(",");
+      sourceLogs = logs.filter(raw => cats.some(c => raw.startsWith(`[${c}]`)));
+    }
+    exportLogs = sourceLogs.map((raw, idx) => ({
+      id: idx + 1,
+      session_id: botSessionId,
+      level: inferLogLevel(raw),
+      category: inferLogCategory(raw),
+      message: raw.replace(/^\[[^\]]+\]\s*/, ""),
+      raw,
+      kenya_day: getKenyaDay(),
+      created_at: new Date().toISOString(),
+    }));
+  }
+
+  const filename = `iml_logs_${label}_${startDay}_to_${endDay}.${format === "json" ? "json" : "csv"}`;
+  res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+
+  if (format === "json") {
+    res.setHeader("Content-Type", "application/json");
+    return res.json(exportLogs);
+  }
+
+  res.setHeader("Content-Type", "text/csv");
+  const headers = ["id", "session_id", "level", "category", "kenya_day", "created_at", "message", "raw"];
+  const rows = exportLogs.map(row => headers.map(header => toCsvValue(row[header])).join(","));
+  return res.status(200).send(`${headers.join(",")}\n${rows.join("\n")}`);
 });
 
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
+  updateCircuitBreakerCooldown();
   const currentRegime = detectRegime(selectedSymbol);
   const symbolPrices = tickBuffers[selectedSymbol] || [];
   const currentPrice = symbolPrices[symbolPrices.length - 1] || 100.00;
@@ -3602,6 +4483,12 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const winRate = total > 0 ? parseFloat(((wins / total) * 100).toFixed(1)) : 0;
   
   const totalPnl = parseFloat(completedTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
+  const recentTradeWindow = completedTrades.slice(-300);
+  const recentWindowPnl = parseFloat(recentTradeWindow.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
+  const completedTradesCumulativeOffset = parseFloat((totalPnl - recentWindowPnl).toFixed(2));
+  const openPnl = parseFloat(activePositions.reduce((sum, p) => sum + p.pnl, 0).toFixed(2));
+  const sessionBaseline = sessionStartBalance || balance;
+  const estimatedSessionEquity = parseFloat((sessionBaseline + totalPnl + openPnl).toFixed(2));
   const maxDrawdown = peakBalance === 0 ? 0 : parseFloat((((peakBalance - balance) / peakBalance) * 100).toFixed(2));
 
   res.json({
@@ -3612,6 +4499,10 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     currentPrice,
     balance: parseFloat(balance.toFixed(2)),
     peakBalance: parseFloat(peakBalance.toFixed(2)),
+    sessionStartBalance: parseFloat(sessionBaseline.toFixed(2)),
+    sessionClosedPnl: totalPnl,
+    sessionOpenPnl: openPnl,
+    estimatedSessionEquity,
     isAuthorized: liveBridgeInstance.getIsAuthorized(),
     tradingEnabled,
     tradingMode,
@@ -3637,7 +4528,20 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     },
     indicators: getCurrentIndicators(selectedSymbol),
     activePositions,
-    completedTrades: completedTrades.slice(-300), // return recent (increased to show more historical trades)
+    completedTrades: recentTradeWindow, // recent chart/window payload only
+    completedTradesTotal: completedTrades.length,
+    completedTradesReturned: recentTradeWindow.length,
+    completedTradesCumulativeOffset,
+    symbolDistribution: (() => {
+      const counts: Record<string, number> = {};
+      completedTrades.forEach(t => { counts[t.symbol] = (counts[t.symbol] || 0) + 1; });
+      return Object.keys(counts).sort((a,b) => counts[b]-counts[a]).map(sym => ({
+        symbol: sym,
+        name: subAlgorithms[sym]?.name || sym,
+        count: counts[sym],
+        pct: parseFloat(((counts[sym] / completedTrades.length) * 100).toFixed(1)),
+      }));
+    })(),
     parameters: currentParams,
     regime: currentRegime,
     circuitBreaker: {
@@ -3647,6 +4551,22 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     },
     logs: logs.slice(-1000), // return last 1000 logs (increased to support tall terminal & scrollback searches)
   });
+});
+
+// Manual resume after 3% equity intervention (clears block WITHOUT wiping data)
+app.post("/api/resume-session", (req, res) => {
+  if (!sessionBlocked) {
+    return res.json({ success: true, message: "Session is not currently blocked." });
+  }
+  sessionBlocked = false;
+  tradingEnabled = false; // user must explicitly press START after reviewing
+  cooldownMessage = "";
+  circuitBreakerCooldown = 0;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
+  logs.push(`[RISK_CONTROL] ✅ Manual session block cleared by operator after risk review. Trading is PAUSED — press START to resume.`);
+  scheduleStateSaveToSupabase();
+  res.json({ success: true, message: "Session block cleared. Trading remains paused until manually started." });
 });
 
 // Update Configuration
@@ -3690,15 +4610,14 @@ app.post("/api/config", (req, res) => {
 
   if (enabled !== undefined) {
     if (enabled && sessionBlocked) {
-      return res.status(403).json({ error: "Session permanently blocked due to terminal limit breach. Please manually reset session." });
+      return res.status(403).json({ error: "Manual intervention required: 3% live equity loss limit reached. Please review risk and reset the session." });
+    }
+    if (enabled && !liveBridgeInstance.getIsAuthorized()) {
+      return res.status(403).json({ error: "Live Deriv authorization required to enable trading. Set DERIV_API_TOKEN." });
     }
     tradingEnabled = enabled;
     if (enabled) {
-      if (liveBridgeInstance.getIsAuthorized()) {
-        logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Active Live Terminal Trading)`);
-      } else {
-        logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Real-Time Sandbox Paper Mode)`);
-      }
+      logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Active Live Terminal Trading)`);
     } else {
       logs.push(`[SYSTEM] Auto-trade DISABLED 🔴 (Engine Paused / Idle)`);
     }
@@ -3727,10 +4646,9 @@ app.post("/api/config", (req, res) => {
     if (hybridConfig.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = Boolean(hybridConfig.hybridEarlyCutoffEnabled);
     if (hybridConfig.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = Number(hybridConfig.hybridEarlyCutoffPct);
     if (hybridConfig.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = Number(hybridConfig.hybridGreeningTriggerPct);
-    logs.push(`[SOVEREIGN_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
+    logs.push(`[IML_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
 
-  saveStateToDisk();
   res.json({ success: true, message: "Configuration updated" });
 });
 
@@ -3746,8 +4664,11 @@ app.get("/api/ticks", (req, res) => {
   });
 });
 
-// Manual Force Trade Placement (supports Sandbox & Live Authorized Modes)
+// Manual Force Trade Placement (Live Authorized Mode only)
 app.post("/api/trade", (req, res) => {
+  if (!liveBridgeInstance.getIsAuthorized()) {
+    return res.status(403).json({ error: "Live Deriv authorization required. Set DERIV_API_TOKEN to place trades." });
+  }
   const { direction } = req.body;
   if (!direction || (direction !== "LONG" && direction !== "SHORT")) {
     return res.status(400).json({ error: "Invalid direction: LONG or SHORT required" });
@@ -3846,23 +4767,20 @@ app.post("/api/reset", async (req, res) => {
   consecutiveLosses = 0;
   consecutiveWins = 0;
   circuitBreakerCooldown = 0;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
   cooldownMessage = "";
   tradingEnabled = false;
   sessionBlocked = false;
   currentParams = { ...defaultParams };
   
-  if (!liveBridgeInstance.getIsAuthorized()) {
-    balance = 10000.00;
-    peakBalance = 10000.00;
-  } else {
-    // If authorized, trigger live balance fetch to get the absolute live balance from Deriv
-    try {
-      liveBridgeInstance.refreshBalance();
-      // Initialize peakBalance to current balance as fallback
-      peakBalance = balance;
-    } catch (e) {
-      console.error("[RESET] Failed requesting live Deriv balance update:", e);
-    }
+  // Always fetch live balance from Deriv on reset — no local default fallback
+  try {
+    liveBridgeInstance.refreshBalance();
+    sessionStartBalance = balance;
+    peakBalance = balance;
+  } catch (e) {
+    console.error("[RESET] Failed requesting live Deriv balance update:", e);
   }
 
   // Fully reset all sub-algorithms' trade counters and stats
@@ -3878,28 +4796,38 @@ app.post("/api/reset", async (req, res) => {
     sub.directiveMessage = "INITIALIZING STANDBY PILOT";
   });
   
-  logs = [`[${new Date().toISOString()}] Sovereign Engine active metrics and overrides have been reset safely.`];
+  logs = [`[${new Date().toISOString()}] Infinity Markets Lab Engine active metrics and overrides have been reset safely.`];
   
   if (supabaseClient) {
-    try {
-      // Clear all trade logging records from Supabase to start cleanly
-      const { error: delError } = await supabaseClient
-        .from("sovereign_trades")
-        .delete()
-        .neq("id", "trigger-nothing-to-delete-all");
-      if (delError) {
-        logs.push(`[SUPABASE_RESET_WARNING] Could not clear 'sovereign_trades' cache: ${delError.message}`);
-      } else {
-        logs.push(`[SUPABASE_RESET] Cloud 'sovereign_trades' logs wiped cleanly.`);
+    // Wipe every table — full clean slate as requested
+    const tablesToWipe: string[] = ["iml_trades", "iml_logs", "iml_strategy_history"];
+    for (const table of tablesToWipe) {
+      try {
+        const filterCol = table === "iml_trades" ? "id" : "id";
+        const { error } = await supabaseClient
+          .from(table)
+          .delete()
+          .gt(filterCol, 0); // deletes all rows (bigserial id > 0 covers all, text ids use neq below)
+        // For text-id tables use neq trick
+        if (error && table === "iml_trades") {
+          await supabaseClient.from(table).delete().neq("id", "__NONE__");
+        }
+        if (error && table !== "iml_trades") {
+          logs.push(`[SUPABASE_RESET_WARNING] Could not wipe '${table}': ${error.message}`);
+        } else {
+          logs.push(`[SUPABASE_RESET] '${table}' wiped from cloud database ✓`);
+        }
+      } catch (err: any) {
+        logs.push(`[SUPABASE_RESET_ERROR] Exception wiping '${table}': ${err.message}`);
       }
-    } catch (err: any) {
-      console.error("[SUPABASE_RESET_ERROR] Exception wiping trades:", err);
     }
+    // iml_trades uses text id — wipe it separately with correct filter
+    try {
+      await supabaseClient.from("iml_trades").delete().neq("id", "__NONE__");
+    } catch (_) {}
   }
 
   liveBridgeInstance.requestHistoryForSymbols();
-
-  saveStateToDisk();
 
   if (supabaseClient) {
     await saveStateToSupabase();
@@ -3952,7 +4880,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[SOVEREIGN CORE] Full-stack engine listening on http://0.0.0.0:${PORT}`);
+    console.log(`[IML CORE] Full-stack engine listening on http://0.0.0.0:${PORT}`);
   });
 }
 
