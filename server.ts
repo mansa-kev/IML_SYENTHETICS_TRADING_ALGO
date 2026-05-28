@@ -9,7 +9,7 @@ import dotenv from "dotenv";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Candle, ActivePosition, TradeRecord, LearningParams, SubAlgorithm } from "./src/types/sovereign.js";
+import { MarketRegime, Candle, ActivePosition, TradeRecord, LearningParams, SubAlgorithm } from "./src/types/iml.js";
 
 dotenv.config();
 
@@ -24,9 +24,9 @@ const PORT = 3000;
 let balance = 10000.00;
 let peakBalance = 10000.00;
 let tradingEnabled = false;
-let selectedSymbol = "R_10"; // Volatility 10 (1s)
+let selectedSymbol = "R_75"; // Volatility 75 high-frequency focus
 let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
-// Sovereign Hybrid Risk Engine (SHRE) state variables
+// Infinity Markets Lab Hybrid Risk Engine (IML-HRE) state variables
 let hybridRiskType = "FIXED" as "FIXED" | "PERCENT";
 let hybridRiskFixedAmount = 25.00;
 let hybridRiskPercent = 0.5; // 0.5% of account balance (e.g. $50 on $10k)
@@ -42,21 +42,25 @@ const startEpoch = Math.floor(Date.now() / 1000);
 
 let activePositions: ActivePosition[] = [];
 let completedTrades: TradeRecord[] = [];
-let logs: string[] = [`[${new Date().toISOString()}] Sovereign Engine initializing under session key ${botSessionId}`];
+let logs: string[] = [`[${new Date().toISOString()}] Infinity Markets Lab Engine initializing under session key ${botSessionId}`];
 
 // Learning Engine Parameter defaults
 let currentParams: LearningParams = {
   rsiOversoldThreshold: 30,   // default: 30, range [25, 42]
   rsiOverboughtThreshold: 70,  // default: 70, range [58, 75]
   bbPeriod: 20,                // default: 20
-  bbStd: 2.25,                  // default: 2.25
-  maxTicksInTrade: 120,         // default: 120 ticks
+  bbStd: 2.50,                  // Rec: 2.50 — reduces false entries near bands
+  maxTicksInTrade: 60,          // Rec: 60 — hard temporal stop, prevents infinite holding
   minConfluenceScore: 3,       // require 3 of 5 indicators for entry
-  atrStopMultiplier: 3.15,      // default: 3.15
-  regimeAdxThreshold: 25,      // default: 25
+  atrStopMultiplier: 2.75,      // Rec: 2.75 — functional ATR stop (was corrupted to 9.22e30)
+  regimeAdxThreshold: 20,      // Rec: 20 — gate mean-reversion earlier in trend regimes
 };
 
 const defaultParams: LearningParams = { ...currentParams };
+const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
+
+// Pending Deriv order queue — maps local position ID to Deriv contract_id on buy confirmation
+const pendingOrderQueue: Array<{ localId: string; symbol: string; direction: string }> = [];
 
 // Circuit Breakers states
 let circuitBreakerCooldown = 0; // seconds remaining
@@ -64,6 +68,9 @@ let cooldownMessage = "";
 let consecutiveLosses = 0;
 let consecutiveWins = 0;
 let sessionBlocked = false;
+let sessionStartBalance = 0;
+let circuitBreakerResumeAt = 0;
+let tradingAutoResumePending = false;
 
 // Historical pricing buffers (rolling arrays of size 2000)
 const maxBufferLength = 2000;
@@ -100,7 +107,7 @@ interface StrategyProposal {
 }
 
 let governorFocusSymbol = "R_10";
-let governorStatus = "SOVEREIGN AGENTIC CORE: ONLINE";
+let governorStatus = "IML AGENTIC CORE: ONLINE";
 let governorAgenticScore = 1.0; // 100% Agentic goal
 
 const governorMemory: {
@@ -125,17 +132,19 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOversoldThreshold: 30,
     rsiOverboughtThreshold: 70,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.20,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.50,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
     targetLossPct: 0.15,
     timeExitEnabled: true,
-    maxTicksInTrade: 120,
+    breakEvenEnabled: true,
+    trailingStopEnabled: true,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -153,14 +162,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Volatility 25 (1s)",
     personality: "Sentinel Divergence Sniper",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 31,
+    rsiOverboughtThreshold: 69,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.30,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.60,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -168,7 +177,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 50,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -184,16 +193,16 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
   R_75: {
     symbol: "R_75",
     name: "Volatility 75 (1s)",
-    personality: "Apex Volatility Breakout",
+    personality: "Apex Volatility HFT Scalar",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 32,
+    rsiOverboughtThreshold: 68,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.50,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 2.75,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -201,7 +210,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 60,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -219,14 +228,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Crash 500 Index",
     personality: "Crash Extreme Recovery Scalar",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 22,
+    rsiOverboughtThreshold: 75,
     bbPeriod: 20,
-    bbStd: 2.25,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    bbStd: 2.75,
+    minConfluenceScore: 4,
+    atrStopMultiplier: 2.25,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -234,7 +243,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -252,14 +261,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Boom 500 Index",
     personality: "Boom Consolidator Ridge Sniper",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 25,
+    rsiOverboughtThreshold: 78,
     bbPeriod: 20,
-    bbStd: 2.25,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    bbStd: 2.75,
+    minConfluenceScore: 4,
+    atrStopMultiplier: 2.25,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -267,7 +276,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 45,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -285,14 +294,14 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     name: "Volatility 100 Index",
     personality: "Spike Breakout Raider",
     enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
+    rsiOversoldThreshold: 28,
+    rsiOverboughtThreshold: 72,
     bbPeriod: 20,
-    bbStd: 2.25,
+    bbStd: 2.75,
     minConfluenceScore: 3,
-    atrStopMultiplier: 3.15,
+    atrStopMultiplier: 3.00,
     learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 1.0,
+    targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
     directiveMessage: "INITIALIZING STANDBY PILOT",
     recentWinRate: 0.5,
@@ -300,7 +309,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 120,
+    maxTicksInTrade: 75,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -352,9 +361,8 @@ class DerivLiveBridge {
         if (DERIV_API_TOKEN) {
           this.authorizeUser();
         } else {
-          logs.push(`[DERIV_LIVE] ⚠️ DERIV_API_TOKEN not found in environment variables. Automated trading is restricted to MONITORING mode.`);
+          logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Live trading is disabled. Price data stream active (read-only).`);
           this.requestHistoryForSymbols();
-          // Parallel subscriptions for all active instruments in monitoring mode
           Object.keys(INSTRUMENTS).forEach((symbol) => {
             this.subscribeToTicks(symbol);
           });
@@ -396,7 +404,7 @@ class DerivLiveBridge {
         authorize: DERIV_API_TOKEN
       }));
     } else {
-      logs.push(`[DERIV_LIVE] ⚠️ DERIV_API_TOKEN not found in environment variables. Automated trading is restricted to MONITORING mode. Please set DERIV_API_TOKEN to enable active live-only trading.`);
+      logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Trading is fully disabled until a valid token is provided.`);
     }
   }
 
@@ -515,19 +523,29 @@ class DerivLiveBridge {
                   direction = "SHORT";
                 }
 
+                const ghostEntry = parseFloat(contract.entry_tick || "0") || parseFloat(contract.current_spot || "0");
+                const ghostSpot  = parseFloat(contract.current_spot || "0");
+                const ghostStake = parseFloat(contract.buy_price || "0");
+                // Compute ATR-based SL/TP if Deriv reports none (limit_order absent = old contract)
+                // Always compute price-level SL/TP from ATR — never use Deriv dollar amounts as prices
+                // (Deriv limit_order.stop_loss.order_amount is a dollar loss threshold, not a price level)
+                const ghostAtrBuf = ghostSpot * 0.003; // 0.3% of spot — ATR fallback
+                const ghostSL = direction === "LONG" ? ghostEntry - ghostAtrBuf : ghostEntry + ghostAtrBuf;
+                const ghostTP = direction === "LONG" ? ghostEntry + ghostAtrBuf * 2 : ghostEntry - ghostAtrBuf * 2;
                 activePositions.push({
                   id: contractIdStr,
                   symbol: internalSymbol,
                   contractType: type as any,
                   direction: direction,
-                  stake: parseFloat(contract.buy_price || "0"),
-                  entryPrice: parseFloat(contract.entry_tick || "0"),
-                  currentPrice: parseFloat(contract.current_spot || "0"),
-                  stopLoss: parseFloat(contract.limit_order?.stop_loss?.order_amount || "0"),
-                  takeProfit: parseFloat(contract.limit_order?.take_profit?.order_amount || "0"),
+                  stake: ghostStake,
+                  entryPrice: ghostEntry,
+                  currentPrice: ghostSpot,
+                  stopLoss: ghostSL,
+                  takeProfit: ghostTP,
                   pnl: parseFloat(contract.profit || "0"),
                   ticksElapsed: 0,
-                  entryEpoch: contract.date_start || Math.floor(Date.now() / 1000)
+                  entryEpoch: contract.date_start || Math.floor(Date.now() / 1000),
+                  multiplier: parseFloat(contract.multiplier || "40"),
                 });
              }
           }
@@ -601,10 +619,20 @@ class DerivLiveBridge {
         }
       }
 
-      // 3. Purchase Response
+      // 3. Purchase Response — link Deriv contract_id back to local position
       if (msg.msg_type === "buy") {
         const buyInfo = msg.buy;
-        logs.push(`[DERIV_LIVE_TRADE] ✅ Order successfully accepted. Contract ID: ${buyInfo.contract_id}. Payout criteria set.`);
+        const derivContractId = String(buyInfo.contract_id);
+        logs.push(`[DERIV_LIVE_TRADE] ✅ Order accepted. Deriv Contract ID: ${derivContractId}. Linking to local registry...`);
+        // Match the most recently queued pending order and update its position ID
+        const pending = pendingOrderQueue.shift();
+        if (pending) {
+          const pos = activePositions.find(p => p.id === pending.localId);
+          if (pos) {
+            pos.id = derivContractId;
+            logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Ghost-position elimination active.`);
+          }
+        }
       }
     } catch (e) {
       // Log critical exceptions in the socket loop safely
@@ -656,30 +684,40 @@ class DerivLiveBridge {
   }
 
   // Sends the real order contract proposal directly to your authorized Deriv account.
-  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number) {
+  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number) {
     if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
 
     const derivSymbol = this.getDerivSymbolCode(symbol);
     const effMode = getEffectiveTradeType();
+    const supportedMultipliers = DERIV_SUPPORTED_MULTIPLIERS;
+    const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200;
+    const finalMultiplier = multiplier && supportedMultipliers.includes(multiplier) ? multiplier : fallbackMultiplier;
+    if (effMode === "HYBRID_LINEAR" && multiplier === undefined) {
+      logs.push(`[DERIV_LIVE_TRADE] ℹ️ HYBRID_LINEAR signal routed through supported Deriv multiplier contract x${finalMultiplier}.`);
+    }
     
-    // Submission protocol for Multipliers parameters
-    const proposal = {
-      buy: 1,
-      price: stake,
-      parameters: {
-        amount: stake,
-        basis: "stake",
-        contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
-        currency: "USD",
-        symbol: derivSymbol,
-        multiplier: multiplier || (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200),
-      }
+    // Submission protocol for Multipliers parameters — includes server-side SL/TP limit orders
+    const parameters: any = {
+      amount: stake,
+      basis: "stake",
+      contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
+      currency: "USD",
+      symbol: derivSymbol,
+      multiplier: finalMultiplier,
     };
+    // Attach server-side stop_loss and take_profit so Deriv manages exits even through disconnections
+    if (stopLossAmount && stopLossAmount > 0) {
+      parameters.limit_order = {
+        stop_loss: parseFloat(Math.min(stopLossAmount, stake).toFixed(2)),
+        ...(takeProfitAmount && takeProfitAmount > 0 ? { take_profit: parseFloat(takeProfitAmount.toFixed(2)) } : {})
+      };
+    }
+    const proposal = { buy: 1, price: stake, parameters };
 
     this.ws.send(JSON.stringify(proposal));
-    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${multiplier || "default"}): ${direction} on ${derivSymbol} (Stake: $${stake})`);
+    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
     return true;
   }
 }
@@ -1202,7 +1240,7 @@ async function runGovernorAudit() {
     }
   }
   
-  governorStatus = "SOVEREIGN AGENTIC CORE: ONLINE";
+  governorStatus = "IML AGENTIC CORE: ONLINE";
 }
 
 // Tick-based recurring audit trigger
@@ -1261,9 +1299,9 @@ function scrutinizeProposal(proposal: StrategyProposal): { approved: boolean; po
   
   // 1. Structural Regime Conflict Check
   const sub = subAlgorithms[symbol];
-  if (sub.hurstVal !== undefined && sub.hurstVal < 0.52 && conviction < 0.4) {
+  if (sub.hurstVal !== undefined && sub.hurstVal < 0.52 && conviction < 0.4 && score < 3) {
     governorMemory.vetoes++;
-    return { approved: false, polishedStake: 0, reasoning: "VETO: Market is in anti-persistent noise state. High probability of chop." };
+    return { approved: false, polishedStake: 0, reasoning: "VETO: Weak low-confluence signal inside anti-persistent noise." };
   }
 
   // 2. Correlation & Exposure Gating
@@ -1294,14 +1332,7 @@ function scrutinizeProposal(proposal: StrategyProposal): { approved: boolean; po
 }
 
 function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: number) {
-  // Update cooling down markers globally
-  if (circuitBreakerCooldown > 0) {
-    circuitBreakerCooldown--;
-    if (circuitBreakerCooldown === 0) {
-      cooldownMessage = "";
-      logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Circuit breaker cooldown cleared. Resuming normal logic.`);
-    }
-  }
+  updateCircuitBreakerCooldown();
 
   // 1. Process and track any existing positions for this specific symbol
   updateOpenPositions(symbol, currentPrice, epoch);
@@ -1377,26 +1408,36 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   if (epoch % 50 === 0) {
     if (Math.abs(syntheticDelta) > 0.4) {
       const creativeReason = syntheticDelta > 0 ? "Potential Structural Breakout" : "Structural Deceleration Warning";
-      logs.push(`[CREATIVE_SYNTH] 🧠 ${sub.name} synthesized a new Strategic Pivot: '${creativeReason}' (Δ: ${syntheticDelta.toFixed(2)}). Submitting for Governor scrutiny...`);
+      if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🧠 ${sub.name} synthesized a new Strategic Pivot: '${creativeReason}' (Δ: ${syntheticDelta.toFixed(2)}). Submitting for Governor scrutiny...`);
       
-      // Auto-tuning: Sub-algorithms now update their own focus based on synthetic insights
+      // Auto-tuning runs whether paused or not — recalibrate during downtime
       if (syntheticDelta < -0.3) {
-         sub.minConfluenceScore = Math.min(5, sub.minConfluenceScore + 1);
-         logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
+         sub.minConfluenceScore = Math.min(4, sub.minConfluenceScore + 1);
+         if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
       } else if (syntheticDelta > 0.3 && sub.minConfluenceScore > 2) {
          sub.minConfluenceScore--;
-         logs.push(`[CREATIVE_SYNTH] ⚡ ${sub.name} relaxed execution barriers due to high structural momentum.`);
+         if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] ⚡ ${sub.name} relaxed execution barriers due to high structural momentum.`);
       }
     }
   }
 
   // 5. Early exit checks before active trade trigger
+  updateCircuitBreakerCooldown();
   if (circuitBreakerCooldown > 0) return;
   if (!sub.enabled) return;
   if (epoch < sub.cooldownUntil) return;
 
   // Match: if a position is open on this symbol, do not open another
   if (activePositions.some(p => p.symbol === symbol)) {
+    return;
+  }
+
+  // ── PAUSED MODE: indicators stay warm, positions managed above — skip signal analysis & logging ──
+  if (!tradingEnabled) {
+    // Single terse heartbeat every 5 minutes on the primary symbol only — proves engine is alive
+    if (epoch % 300 === 0 && symbol === selectedSymbol) {
+      logs.push(`[IML_MONITOR] 🔍 PAUSED — Monitoring ${symbol} | RSI: ${rsiVal.toFixed(1)} | ADX: ${adx.toFixed(1)} | Regime: ${currentRegime} | H_μ: ${hMicro.toFixed(3)} | Conviction: ${(conviction * 100).toFixed(0)}% | Positions: ${activePositions.length}`);
+    }
     return;
   }
 
@@ -1435,10 +1476,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
   } else {
     // FALLBACK: Standard Mean-Fader signals for stationary/random-walk regimes
-    // Calibration: Do not trade Mean Reversion if ADX > 22
-    if (adx > 22) {
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_REGIME] 🚫 Mean Reversion signal ignored. ADX (${adx.toFixed(1)}) > 22 threshold.`);
-      return;
+    const highAdxMeanReversionPenalty = adx > 45 ? 1 : 0;
+    if (highAdxMeanReversionPenalty && Math.random() < 0.05) {
+      logs.push(`[SFT_V2_REGIME] ⚠️ High ADX (${adx.toFixed(1)}) detected. Mean Reversion requires stronger confluence instead of being hard-blocked.`);
     }
     const isOversold = currentPrice <= lower;
     const isRsiOversoldRange = rsiVal <= sub.rsiOversoldThreshold;
@@ -1467,9 +1507,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     // Audit Fix #3: Implement Dynamic Confluence Scaling
     // Automatically scale down the required confluence criteria to (N-1) during high-volatility regimes (ADX > 30)
     let dynamicMinConfluence = sub.minConfluenceScore;
-    if (adx > 30) {
-      dynamicMinConfluence = Math.max(2, sub.minConfluenceScore - 1);
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_DYNAMIC] ⚖️ High momentum detected (ADX: ${adx.toFixed(1)}). Scaling confluence from ${sub.minConfluenceScore} down to ${dynamicMinConfluence}.`);
+    if (adx > 45) {
+      dynamicMinConfluence = Math.min(5, sub.minConfluenceScore + highAdxMeanReversionPenalty);
+      if (Math.random() < 0.05) logs.push(`[SFT_V2_DYNAMIC] ⚖️ High momentum detected (ADX: ${adx.toFixed(1)}). Scaling mean-reversion confluence from ${sub.minConfluenceScore} up to ${dynamicMinConfluence}.`);
     }
 
     sub.confluenceScore = Math.max(longScore, shortScore);
@@ -1540,7 +1580,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.05)).toFixed(2));
     
     // Ensure Multiplier mode respects Fixed USD risk if configured
-    if (tradingMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
+    if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
       stake = Math.min(stake, hybridRiskFixedAmount);
     }
 
@@ -1581,8 +1621,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     logs.push(`[TRACE] Setting stopLoss and takeProfit distances...`);
     const atrBuffer = atr * sub.atrStopMultiplier;
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
-    let takeProfitDistance = stopLossDistance * 2.0; // Optimized standard exit ratio (Sovereign recommended higher R)
-    let chosenMultiplier = 50;
+    let takeProfitDistance = stopLossDistance * 2.0; // Optimized standard exit ratio (IML recommended higher R)
+    let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
     let targetRisk = 25.00;
 
     if (tickEffMode === "HYBRID_LINEAR") {
@@ -1591,12 +1631,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       takeProfitDistance = stopLossDistance * hybridRewardRatio;
       stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
       logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
-    } else if (tradingMode === "MULTIPLIER") {
+    } else if (tickEffMode === "MULTIPLIER") {
       const targetLossPct = sub.targetLossPct || 0.15; // default 15% max risk on stake
       const slPct = stopLossDistance / currentPrice;
       const desiredMultiplier = targetLossPct / slPct;
 
-      const multiplierOptions = [50, 100, 200, 400];
+      const multiplierOptions = DERIV_SUPPORTED_MULTIPLIERS;
       chosenMultiplier = multiplierOptions[0];
       let minDiff = Math.abs(desiredMultiplier - chosenMultiplier);
       for (let i = 1; i < multiplierOptions.length; i++) {
@@ -1608,7 +1648,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
 
       // If at chosenMultiplier our expected stop loss is too wide, downshift to avoid large losses
-      while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > 50) {
+      while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > multiplierOptions[0]) {
         const idx = multiplierOptions.indexOf(chosenMultiplier);
         if (idx > 0) {
           chosenMultiplier = multiplierOptions[idx - 1];
@@ -1653,7 +1693,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       pnl: 0.0,
       ticksElapsed: 0,
       entryEpoch: epoch,
-      multiplier: (tradingMode === "MULTIPLIER" && tickEffMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+      multiplier: tickEffMode === "MULTIPLIER" ? chosenMultiplier : undefined,
       isHybridLinear: tickEffMode === "HYBRID_LINEAR" ? true : undefined,
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
@@ -1661,14 +1701,25 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
-    // Place actual contract proposal request if live credentials are active
-    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
-    logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
-    if (!liveOrderPlaced) {
-      logs.push(`[DERIV_LIVE_TRADE] ❌ Live order was not accepted by the Deriv bridge; no local position was created.`);
+    if (!liveBridgeInstance.getIsAuthorized()) {
+      logs.push(`[ORDER_BLOCKED] Live authorization required. Trade rejected — set DERIV_API_TOKEN to enable live trading.`);
       return;
     }
-
+    const slAmount = parseFloat(Math.min(
+      (stopLossDistance / currentPrice) * stake * (position.multiplier || 40),
+      stake
+    ).toFixed(3));
+    const tpAmount = parseFloat(
+      ((takeProfitDistance / currentPrice) * stake * (position.multiplier || 40)).toFixed(3)
+    );
+    pendingOrderQueue.push({ localId: positionId, symbol, direction });
+    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount);
+    logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
+    if (!liveOrderPlaced) {
+      pendingOrderQueue.pop();
+      logs.push(`[ORDER_FAILED] Live order dispatch failed for Sub-algorithm ${sub.name}. Position not tracked.`);
+      return;
+    }
     logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
     activePositions.push(position);
     logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5]`);
@@ -1785,7 +1836,7 @@ function executeProposal(
   const atrBuffer = atr * atrStopMult;
   let stopLossDistance = Math.max(entryPrice * 0.003, atrBuffer);
   let takeProfitDistance = stopLossDistance * 1.25; // optimized 1.25x exit ratio for high hit rate
-  let chosenMultiplier = 50;
+  let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
   let targetRisk = 25.00;
 
   const effMode = getEffectiveTradeType();
@@ -1796,11 +1847,11 @@ function executeProposal(
     takeProfitDistance = stopLossDistance * hybridRewardRatio;
     stake = parseFloat(Math.max(0.35, Math.min(targetRisk * 2.0, balance * 0.1)).toFixed(2));
     logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
-  } else if (tradingMode === "MULTIPLIER") {
+  } else if (effMode === "MULTIPLIER") {
     const slPct = stopLossDistance / entryPrice;
     const desiredMultiplier = targetLossPct / slPct;
 
-    const multiplierOptions = [50, 100, 200, 400];
+    const multiplierOptions = DERIV_SUPPORTED_MULTIPLIERS;
     chosenMultiplier = multiplierOptions[0];
     let minDiff = Math.abs(desiredMultiplier - chosenMultiplier);
     for (let i = 1; i < multiplierOptions.length; i++) {
@@ -1812,7 +1863,7 @@ function executeProposal(
     }
 
     // If at chosenMultiplier our expected stop loss is too wide, downshift to avoid large losses
-    while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > 50) {
+    while (slPct * chosenMultiplier > 0.40 && chosenMultiplier > multiplierOptions[0]) {
       const idx = multiplierOptions.indexOf(chosenMultiplier);
       if (idx > 0) {
         chosenMultiplier = multiplierOptions[idx - 1];
@@ -1839,7 +1890,7 @@ function executeProposal(
     contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
   }
 
-  const id = `TX_${Math.floor(Math.random() * 89999 + 10000)}`;
+  const id = `TX_${Date.now().toString(36).toUpperCase()}_${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 
   const position: ActivePosition = {
     id,
@@ -1854,20 +1905,31 @@ function executeProposal(
     pnl: 0.0,
     ticksElapsed: 0,
     entryEpoch: epoch,
-    multiplier: (tradingMode === "MULTIPLIER" && effMode !== "HYBRID_LINEAR") ? chosenMultiplier : undefined,
+    multiplier: effMode === "MULTIPLIER" ? chosenMultiplier : undefined,
     isHybridLinear: effMode === "HYBRID_LINEAR" ? true : undefined,
     targetRiskAmount: effMode === "HYBRID_LINEAR" ? targetRisk : undefined,
     hybridPositionSize: effMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
   };
 
-  // Place actual contract proposal request if live credentials are active
-  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier);
-  if (!liveOrderPlaced) {
-    logs.push(`[DERIV_LIVE_TRADE] ❌ Manual live order was not accepted by the Deriv bridge; no local position was created.`);
+  if (!liveBridgeInstance.getIsAuthorized()) {
+    logs.push(`[ORDER_BLOCKED] Live authorization required. Manual trade rejected — set DERIV_API_TOKEN.`);
     return false;
   }
-
-  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal.`);
+  const manualSlAmount = parseFloat(Math.min(
+    (stopLossDistance / entryPrice) * stake * (position.multiplier || 40),
+    stake
+  ).toFixed(3));
+  const manualTpAmount = parseFloat(
+    ((takeProfitDistance / entryPrice) * stake * (position.multiplier || 40)).toFixed(3)
+  );
+  pendingOrderQueue.push({ localId: id, symbol, direction });
+  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount);
+  if (!liveOrderPlaced) {
+    pendingOrderQueue.pop();
+    logs.push(`[ORDER_FAILED] Live order dispatch failed. Manual position not tracked.`);
+    return false;
+  }
+  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}`);
   activePositions.push(position);
 
   logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
@@ -1902,6 +1964,12 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
     }
 
     pos.pnl = parseFloat(posPnl.toFixed(2));
+    // Track Maximum Adverse Excursion (worst unrealised loss this position has seen)
+    if (posPnl < 0) {
+      if (pos.maxAdverseExcursion === undefined || posPnl < pos.maxAdverseExcursion) {
+        pos.maxAdverseExcursion = parseFloat(posPnl.toFixed(2));
+      }
+    }
     
     const subAlg = subAlgorithms[pos.symbol];
 
@@ -2200,10 +2268,13 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     atrAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).atr,
     tickStreamSnapshot: (tickBuffers[pos.symbol] || []).slice(-150),
     conditionsMet: pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"],
+    maxAdverseExcursion: pos.maxAdverseExcursion ?? 0,
   };
 
   completedTrades.push(record);
-  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} (Pushed balance to $${balance})`);
+  // Balance is authoritative from Deriv WS stream — do not write locally here.
+  // peakBalance tracking is maintained from the stream handler.
+  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Awaiting Deriv balance stream confirmation`);
 
   // Check trade limit to pause for manual review
   if (completedTrades.length >= 100 && tradingEnabled) {
@@ -2215,7 +2286,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   evaluateCircuitBreakers();
 
   // Trigger Adaptive parameter optimization incrementally
-  if (completedTrades.length % 3 === 0) {
+  if (completedTrades.length % 50 === 0) {
     runMachineLearningAdaptation();
   }
 }
@@ -2223,7 +2294,35 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
 // ==========================================
 // CIRCUIT BREAKER SYSTEM
 // ==========================================
+function getCircuitBreakerRemainingSeconds() {
+  if (circuitBreakerResumeAt <= 0) return 0;
+  return Math.max(0, Math.ceil((circuitBreakerResumeAt - Date.now()) / 1000));
+}
+
+function startGovernorCooldown(seconds: number, message: string) {
+  tradingEnabled = false;
+  circuitBreakerResumeAt = Date.now() + seconds * 1000;
+  circuitBreakerCooldown = seconds;
+  tradingAutoResumePending = true;
+  cooldownMessage = message;
+}
+
+function updateCircuitBreakerCooldown() {
+  circuitBreakerCooldown = getCircuitBreakerRemainingSeconds();
+  if (circuitBreakerCooldown > 0 || !tradingAutoResumePending) return;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
+  cooldownMessage = "";
+  if (!sessionBlocked && liveBridgeInstance.getIsAuthorized()) {
+    tradingEnabled = true;
+    logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Governor cooldown cleared. Auto-trading resumed.`);
+  } else {
+    logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Governor cooldown cleared. Trading remains paused until live authorization is available.`);
+  }
+}
+
 function evaluateCircuitBreakers() {
+  updateCircuitBreakerCooldown();
   // Daily & Session limits monitoring
   const initialCap = peakBalance || balance;
   if (initialCap <= 0) return;
@@ -2231,34 +2330,29 @@ function evaluateCircuitBreakers() {
   const drawdownPct = lossFromBaseline / initialCap;
   
   // Section 8: Terminal Session Block & Strict Safeguards
-  if (drawdownPct >= 0.05 && !sessionBlocked) { // 5% absolute stop
+  if (drawdownPct >= 0.03 && !sessionBlocked) {
     tradingEnabled = false;
     sessionBlocked = true;
-    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5% Drawdown breached.";
-    logs.push(`[BREAKER_ACT] 🛑 TERMINAL DRAWDOWN BREAKER ENGAGED. Current loss: $${lossFromBaseline.toFixed(2)}. Session permanently blocked.`);
-    return;
-  }
-
-  // Section 8: Max consecutive losses (5 trades) -> Terminal Block
-  if (consecutiveLosses >= 5 && !sessionBlocked) {
-    tradingEnabled = false;
-    sessionBlocked = true;
-    cooldownMessage = "CRITICAL LIMIT: Session permanently blocked. 5 Consecutive losses.";
-    logs.push(`[BREAKER_ACT] 🛑 MAX CONSECUTIVE LOSSES (5) BREACHED. Session permanently blocked.`);
+    tradingAutoResumePending = false;
+    circuitBreakerResumeAt = 0;
+    circuitBreakerCooldown = 0;
+    cooldownMessage = "MANUAL INTERVENTION REQUIRED: 3% live equity loss limit reached.";
+    logs.push(`[BREAKER_ACT] 🛑 3% LIVE EQUITY LIMIT BREACHED. Current loss: $${lossFromBaseline.toFixed(2)} from session equity baseline $${initialCap.toFixed(2)}. Manual intervention required.`);
     return;
   }
 
   if (sessionBlocked) return; // Prevent temporal breakers overriding terminal state
 
+  if (consecutiveLosses >= 5 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
+    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 5 consecutive losses. Auto-resume in 10 minutes.");
+    logs.push(`[BREAKER_ACT] 🛑 5 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
+    return;
+  }
+
   // Temporal Mitigation limits
-  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0) {
-    circuitBreakerCooldown = 300; // 5-minute cooldown period
-    cooldownMessage = "WARNING: 3 Consecutive losses met. 5-minute cooldown active.";
-    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive Losses Threshold. Circuit breaker locked for 5 mins.`);
-  } else if (drawdownPct >= 0.03 && circuitBreakerCooldown === 0) {
-    circuitBreakerCooldown = 450; // 7.5-minute pause on 3% draw
-    cooldownMessage = "WARNING: 3% Drawdown warning limit breached. 7.5-minute pause.";
-    logs.push(`[BREAKER_ACT] ⚠️ 3% Drawdown Warning. Current loss: $${lossFromBaseline.toFixed(2)}. Pausing trading for 7.5 mins.`);
+  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
+    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 3 consecutive losses. Auto-resume in 10 minutes.");
+    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
   }
 }
 
@@ -2278,8 +2372,8 @@ function runMachineLearningAdaptation() {
       return;
     }
 
-    // Historical Trade Data
-    const trades = completedTrades.filter(t => t.symbol === sub.name);
+    // Historical Trade Data — filter by sub.symbol (the key e.g. "R_100"), NOT sub.name ("Volatility 100 Index")
+    const trades = completedTrades.filter(t => t.symbol === sub.symbol);
     const winRate = sub.recentWinRate;
     const grossWins = trades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
     const grossLosses = Math.abs(trades.filter(t => t.pnl < 0).reduce((sum, t) => sum + t.pnl, 0));
@@ -2306,7 +2400,7 @@ function runMachineLearningAdaptation() {
       
       // Increase trailing stop buffer natively in high-variance regimes
       if (tailAdverse) {
-        sub.bbStd = parseFloat((sub.bbStd * 1.1).toFixed(2));
+        sub.bbStd = parseFloat(Math.max(1.8, Math.min(3.5, sub.bbStd * 1.1)).toFixed(2));
       }
       
       // Limit capital downside (cutting half Kelly sizing)
@@ -2326,7 +2420,7 @@ function runMachineLearningAdaptation() {
 
       // Tighten standard deviations slightly to take earlier entries
       if (sub.bbStd > 1.8) {
-        sub.bbStd = parseFloat((sub.bbStd * 0.95).toFixed(2));
+        sub.bbStd = parseFloat(Math.max(1.8, Math.min(3.5, sub.bbStd * 0.95)).toFixed(2));
       }
 
       // Elevate stake sizes to compound positive expectancy (boost Kelly size)
@@ -2361,7 +2455,7 @@ function runMachineLearningAdaptation() {
     if (globalWinRate < 0.45 && globalPF < 1.0) {
       if (currentParams.rsiOversoldThreshold > 25) currentParams.rsiOversoldThreshold -= 1;
       if (currentParams.rsiOverboughtThreshold < 75) currentParams.rsiOverboughtThreshold += 1;
-      currentParams.atrStopMultiplier = parseFloat((currentParams.atrStopMultiplier * 1.1).toFixed(2));
+      currentParams.atrStopMultiplier = parseFloat(Math.min(currentParams.atrStopMultiplier * 1.1, 5.0).toFixed(2));
       logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio WR ${(globalWinRate * 100).toFixed(1)}% & PF < 1. Tightening global parameters universally.`);
     } else {
       logs.push(`[GOVERNOR_POLICE] 🌐 Global portfolio metric is healthy (WR ${(globalWinRate * 100).toFixed(1)}%, PF ${globalPF.toFixed(2)}). Global macro parameters active.`);
@@ -2400,7 +2494,7 @@ async function generateAiReport(userPrompt?: string): Promise<string> {
   const client = getGeminiClient();
   if (!client) {
     // Elegant fallback guidance if key is absent
-    return `### **Sovereign System Analyzer (Offline Mode)**
+    return `### **IML System Analyzer (Offline Mode)**
     
 *The Gemini AI API Key was not yet configured in the Secrets panel on AI Studio.*
 Here is an automated system validation report based on direct mathematical tracking:
@@ -2443,7 +2537,7 @@ Here is an automated system validation report based on direct mathematical track
     })),
   };
 
-  const contextPrompt = `You are Sovereign AI, an elite institutional risk engineer and trading system advisor specializing in synthetic indices stochastic models.
+  const contextPrompt = `You are Infinity Markets Lab AI, an elite institutional risk engineer and trading system advisor specializing in synthetic indices stochastic models.
 Review this current automated bot's session data:
 ${JSON.stringify(analyticsData, null, 2)}
 
@@ -2457,12 +2551,12 @@ Format output beautifully with clean markdown headers and lists. Follow research
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-3.5-flash",
+      model: "gemini-1.5-flash",
       contents: contextPrompt,
     });
     return response.text || "No response received from model.";
   } catch (err: any) {
-    return `### **Sovereign System Analyzer (Error)**
+    return `### **IML System Analyzer (Error)**
     
 Failed to contact Gemini servers: ${err.message || err}. Reverting to local diagnostics. Check your API key.`;
   }
@@ -2474,6 +2568,7 @@ Failed to contact Gemini servers: ${err.message || err}. Reverting to local diag
 
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
+  updateCircuitBreakerCooldown();
   const currentRegime = detectRegime(selectedSymbol);
   const symbolPrices = tickBuffers[selectedSymbol] || [];
   const currentPrice = symbolPrices[symbolPrices.length - 1] ?? null;
@@ -2484,6 +2579,12 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const winRate = total > 0 ? parseFloat(((wins / total) * 100).toFixed(1)) : 0;
   
   const totalPnl = parseFloat(completedTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
+  const recentTradeWindow = completedTrades.slice(-300);
+  const recentWindowPnl = parseFloat(recentTradeWindow.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
+  const completedTradesCumulativeOffset = parseFloat((totalPnl - recentWindowPnl).toFixed(2));
+  const openPnl = parseFloat(activePositions.reduce((sum, p) => sum + p.pnl, 0).toFixed(2));
+  const sessionBaseline = sessionStartBalance || balance;
+  const estimatedSessionEquity = parseFloat((sessionBaseline + totalPnl + openPnl).toFixed(2));
   const maxDrawdown = peakBalance === 0 ? 0 : parseFloat((((peakBalance - balance) / peakBalance) * 100).toFixed(2));
 
   res.json({
@@ -2495,6 +2596,10 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     liveDataReady: currentPrice !== null,
     balance: parseFloat(balance.toFixed(2)),
     peakBalance: parseFloat(peakBalance.toFixed(2)),
+    sessionStartBalance: parseFloat(sessionBaseline.toFixed(2)),
+    sessionClosedPnl: totalPnl,
+    sessionOpenPnl: openPnl,
+    estimatedSessionEquity,
     isAuthorized: liveBridgeInstance.getIsAuthorized(),
     tradingEnabled,
     tradingMode,
@@ -2530,6 +2635,21 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     },
     logs: logs.slice(-1000),
   });
+});
+
+// Manual resume after 3% equity intervention (clears block WITHOUT wiping data)
+app.post("/api/resume-session", (req, res) => {
+  if (!sessionBlocked) {
+    return res.json({ success: true, message: "Session is not currently blocked." });
+  }
+  sessionBlocked = false;
+  tradingEnabled = false; // user must explicitly press START after reviewing
+  cooldownMessage = "";
+  circuitBreakerCooldown = 0;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
+  logs.push(`[RISK_CONTROL] ✅ Manual session block cleared by operator after risk review. Trading is PAUSED — press START to resume.`);
+  res.json({ success: true, message: "Session block cleared. Trading remains paused until manually started." });
 });
 
 // Update Configuration
@@ -2573,7 +2693,10 @@ app.post("/api/config", (req, res) => {
 
   if (enabled !== undefined) {
     if (enabled && sessionBlocked) {
-      return res.status(403).json({ error: "Session permanently blocked due to terminal limit breach. Please manually reset session." });
+      return res.status(403).json({ error: "Manual intervention required: 3% live equity loss limit reached. Please review risk and reset the session." });
+    }
+    if (enabled && !liveBridgeInstance.getIsAuthorized()) {
+      return res.status(403).json({ error: "Live Deriv authorization required to enable trading. Set DERIV_API_TOKEN." });
     }
     tradingEnabled = enabled;
     if (enabled) {
@@ -2611,7 +2734,7 @@ app.post("/api/config", (req, res) => {
     if (hybridConfig.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = Boolean(hybridConfig.hybridEarlyCutoffEnabled);
     if (hybridConfig.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = Number(hybridConfig.hybridEarlyCutoffPct);
     if (hybridConfig.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = Number(hybridConfig.hybridGreeningTriggerPct);
-    logs.push(`[SOVEREIGN_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
+    logs.push(`[IML_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
 
   res.json({ success: true, message: "Configuration updated" });
@@ -2631,6 +2754,9 @@ app.get("/api/ticks", (req, res) => {
 
 // Manual Force Trade Placement (live authorized mode only)
 app.post("/api/trade", (req, res) => {
+  if (!liveBridgeInstance.getIsAuthorized()) {
+    return res.status(403).json({ error: "Live Deriv authorization required. Set DERIV_API_TOKEN to place trades." });
+  }
   const { direction } = req.body;
   if (!direction || (direction !== "LONG" && direction !== "SHORT")) {
     return res.status(400).json({ error: "Invalid direction: LONG or SHORT required" });
@@ -2714,6 +2840,8 @@ app.post("/api/reset", async (req, res) => {
   consecutiveLosses = 0;
   consecutiveWins = 0;
   circuitBreakerCooldown = 0;
+  circuitBreakerResumeAt = 0;
+  tradingAutoResumePending = false;
   cooldownMessage = "";
   tradingEnabled = false;
   sessionBlocked = false;
@@ -2741,7 +2869,7 @@ app.post("/api/reset", async (req, res) => {
     sub.directiveMessage = "INITIALIZING STANDBY PILOT";
   });
   
-  logs = [`[${new Date().toISOString()}] Sovereign Engine active metrics and overrides have been reset safely.`];
+  logs = [`[${new Date().toISOString()}] Infinity Markets Lab Engine active metrics and overrides have been reset safely.`];
   
   liveBridgeInstance.requestHistoryForSymbols();
 
@@ -2767,7 +2895,7 @@ async function startServer() {
   }
 
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`[SOVEREIGN CORE] Full-stack engine listening on http://0.0.0.0:${PORT}`);
+    console.log(`[IML CORE] Full-stack engine listening on http://0.0.0.0:${PORT}`);
   });
 }
 
