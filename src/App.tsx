@@ -1653,23 +1653,51 @@ export default function App() {
               const wins = completedTrades.filter(t => t.pnl > 0);
               const losses = completedTrades.filter(t => t.pnl <= 0);
               
-              const calcAvgDur = (arr: TradeRecord[]) => arr.length > 0 ? arr.reduce((sum, t) => sum + (t.exitEpoch - t.entryEpoch), 0) / arr.length : 0;
+              const normalizeEpochSeconds = (epoch: number) => {
+                if (!Number.isFinite(epoch) || epoch <= 0) return null;
+                return epoch >= 1e11 ? epoch / 1000 : epoch;
+              };
+              const getTradeDurationSeconds = (trade: TradeRecord) => {
+                const entry = normalizeEpochSeconds(trade.entryEpoch);
+                const exit = normalizeEpochSeconds(trade.exitEpoch);
+                if (entry === null || exit === null) return null;
+                const duration = exit - entry;
+                if (!Number.isFinite(duration) || duration <= 0 || duration > 86400) return null;
+                return duration;
+              };
+              const durationSnapshots = completedTrades
+                .map((trade) => {
+                  const duration = getTradeDurationSeconds(trade);
+                  return duration === null ? null : { trade, duration };
+                })
+                .filter((snapshot): snapshot is { trade: TradeRecord; duration: number } => snapshot !== null);
+              const calcAvgDur = (arr: TradeRecord[]) => {
+                const validDurations = arr
+                  .map(getTradeDurationSeconds)
+                  .filter((duration): duration is number => duration !== null);
+                return validDurations.length > 0
+                  ? validDurations.reduce((sum, duration) => sum + duration, 0) / validDurations.length
+                  : 0;
+              };
               const formatDur = (s: number) => {
-                if(s === 0) return "--";
-                if(s < 60) return `${Math.round(s)}s`;
-                return `${Math.floor(s/60)}m ${Math.round(s%60)}s`;
+                if (s === 0) return "--";
+                if (s < 60) return `${Math.round(s)}s`;
+                if (s < 3600) return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+                const hours = Math.floor(s / 3600);
+                const minutes = Math.floor((s % 3600) / 60);
+                return `${hours}h ${minutes}m`;
               };
 
               const avgWinDur = calcAvgDur(wins);
               const avgLossDur = calcAvgDur(losses);
-              const durations = completedTrades.map(t => t.exitEpoch - t.entryEpoch);
+              const durations = durationSnapshots.map(({ duration }) => duration);
               const longestTrade = durations.length > 0 ? Math.max(...durations) : 0;
-              const validFastDurations = durations.filter(d => d > 0);
-              const fastestExecution = validFastDurations.length > 0 ? Math.min(...validFastDurations) : 0;
+              const fastestExecution = durations.length > 0 ? Math.min(...durations) : 0;
 
-              const quickCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) < 180).length;
-              const midCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) >= 180 && (t.exitEpoch - t.entryEpoch) <= 480).length;
-              const longCount = completedTrades.filter(t => (t.exitEpoch - t.entryEpoch) > 480).length;
+              const quickCount = durationSnapshots.filter(({ duration }) => duration < 180).length;
+              const midCount = durationSnapshots.filter(({ duration }) => duration >= 180 && duration <= 480).length;
+              const longCount = durationSnapshots.filter(({ duration }) => duration > 480).length;
+              const durationSampleCount = durationSnapshots.length;
 
               return (
                 <div className="space-y-4">
@@ -1703,9 +1731,9 @@ export default function App() {
                       <span>Long &gt;8m ({longCount})</span>
                     </div>
                     <div className="w-full h-2 rounded-full flex overflow-hidden border border-slate-800 bg-slate-950">
-                       {quickCount > 0 && <div className="bg-emerald-500/80 transition-all" style={{ width: `${(quickCount / completedTrades.length) * 100}%` }} />}
-                       {midCount > 0 && <div className="bg-indigo-500/80 transition-all" style={{ width: `${(midCount / completedTrades.length) * 100}%` }} />}
-                       {longCount > 0 && <div className="bg-fuchsia-500/80 transition-all" style={{ width: `${(longCount / completedTrades.length) * 100}%` }} />}
+                       {quickCount > 0 && durationSampleCount > 0 && <div className="bg-emerald-500/80 transition-all" style={{ width: `${(quickCount / durationSampleCount) * 100}%` }} />}
+                       {midCount > 0 && durationSampleCount > 0 && <div className="bg-indigo-500/80 transition-all" style={{ width: `${(midCount / durationSampleCount) * 100}%` }} />}
+                       {longCount > 0 && durationSampleCount > 0 && <div className="bg-fuchsia-500/80 transition-all" style={{ width: `${(longCount / durationSampleCount) * 100}%` }} />}
                     </div>
                   </div>
                 </div>

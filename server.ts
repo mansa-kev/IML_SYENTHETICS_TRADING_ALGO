@@ -64,8 +64,17 @@ let currentParams: LearningParams = {
 const defaultParams: LearningParams = { ...currentParams };
 const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
 
-// Pending Deriv order queue — maps local position ID to Deriv contract_id on buy confirmation
-const pendingOrderQueue: Array<{ localId: string; symbol: string; direction: string }> = [];
+// Pending Deriv order registry — holds local positions until Deriv returns a real contract_id
+type PendingDerivOrder = {
+  requestId: number;
+  localId: string;
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  position: ActivePosition;
+  requestedAt: number;
+};
+const pendingOrderQueue: PendingDerivOrder[] = [];
+let nextDerivRequestId = 1;
 
 function inferDirectionFromContractType(type: string): "LONG" | "SHORT" {
   return type.includes("PUT") || type.includes("FALL") || type.includes("MULTDOWN") || type.includes("UNDER") ? "SHORT" : "LONG";
@@ -840,7 +849,14 @@ async function loadStateFromSupabase() {
       if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
       if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
-      if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
+      if (loaded.activePositions !== undefined) {
+        const recoveredPositions = Array.isArray(loaded.activePositions) ? loaded.activePositions : [];
+        const linkedActivePositions = recoveredPositions.filter((pos: any) => /^\d+$/.test(String(pos?.id || "")));
+        if (linkedActivePositions.length !== recoveredPositions.length) {
+          logs.push(`[STATE_SANITIZER] Removed ${recoveredPositions.length - linkedActivePositions.length} stale local placeholder positions from recovered session state. Waiting for Deriv contract registry sync to rebuild any real live positions.`);
+        }
+        activePositions = linkedActivePositions;
+      }
       if (loaded.completedTrades !== undefined) {
         const recoveredTrades = Array.isArray(loaded.completedTrades) ? loaded.completedTrades : [];
         const authoritativeTrades = recoveredTrades.filter((trade: any) => trade?.derivCloseConfirmed === true);
@@ -1056,6 +1072,16 @@ class DerivLiveBridge {
       const msg = JSON.parse(data);
 
       if (msg.error) {
+        const errorReqId = Number(msg.req_id ?? msg.echo_req?.req_id);
+        const errorLocalId = String(msg.echo_req?.passthrough?.localId || "");
+        const pendingIndex = pendingOrderQueue.findIndex((order) =>
+          (Number.isFinite(errorReqId) && order.requestId === errorReqId) ||
+          (errorLocalId !== "" && order.localId === errorLocalId)
+        );
+        if (pendingIndex !== -1) {
+          const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
+          logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry.`);
+        }
         logs.push(`[DERIV_LIVE_ERROR] 🔴 Deriv returned warning: ${msg.error.message} (${msg.msg_type})`);
         return;
       }
@@ -1255,16 +1281,23 @@ class DerivLiveBridge {
       if (msg.msg_type === "buy") {
         const buyInfo = msg.buy;
         const derivContractId = String(buyInfo.contract_id);
+        const responseReqId = Number(msg.req_id ?? msg.echo_req?.req_id);
+        const passthroughLocalId = String(msg.echo_req?.passthrough?.localId || "");
         logs.push(`[DERIV_LIVE_TRADE] ✅ Order accepted. Deriv Contract ID: ${derivContractId}. Linking to local registry...`);
-        // Match the most recently queued pending order and update its position ID
-        const pending = pendingOrderQueue.shift();
-        if (pending) {
-          const pos = activePositions.find(p => p.id === pending.localId);
-          if (pos) {
-            pos.id = derivContractId;
-            logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Ghost-position elimination active.`);
-            this.ws?.send(JSON.stringify({ proposal_open_contract: 1, contract_id: Number(derivContractId), subscribe: 1 }));
+        const pendingIndex = pendingOrderQueue.findIndex((order) =>
+          (Number.isFinite(responseReqId) && order.requestId === responseReqId) ||
+          (passthroughLocalId !== "" && order.localId === passthroughLocalId)
+        );
+        if (pendingIndex !== -1) {
+          const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
+          pending.position.id = derivContractId;
+          if (!activePositions.some((p) => p.id === derivContractId)) {
+            activePositions.push(pending.position);
           }
+          logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Live position promoted from pending registry.`);
+          this.ws?.send(JSON.stringify({ proposal_open_contract: 1, contract_id: Number(derivContractId), subscribe: 1 }));
+        } else {
+          logs.push(`[DERIV_LIVE_TRADE] ⚠️ Buy confirmation for Deriv contract #${derivContractId} arrived with no pending local registry match. Awaiting proposal_open_contract sync.`);
         }
       }
 
@@ -1323,7 +1356,7 @@ class DerivLiveBridge {
   }
 
   // Sends the real order contract proposal directly to your Live / Demo account!
-  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number) {
+  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number, requestId?: number, localId?: string) {
     if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
@@ -1353,7 +1386,13 @@ class DerivLiveBridge {
         ...(takeProfitAmount && takeProfitAmount > 0 ? { take_profit: parseFloat(takeProfitAmount.toFixed(2)) } : {})
       };
     }
-    const proposal = { buy: 1, price: stake, parameters };
+    const proposal: any = { buy: 1, price: stake, parameters };
+    if (requestId !== undefined) {
+      proposal.req_id = requestId;
+    }
+    if (localId) {
+      proposal.passthrough = { localId, symbol, direction };
+    }
 
     this.ws.send(JSON.stringify(proposal));
     logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
@@ -2366,17 +2405,17 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       ((takeProfitDistance / currentPrice) * stake * (position.multiplier || 40)).toFixed(3)
     );
     // Register in pending queue BEFORE dispatch so the buy confirmation can link the contract_id
-    pendingOrderQueue.push({ localId: positionId, symbol, direction });
-    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount);
+    const requestId = nextDerivRequestId++;
+    pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction, position, requestedAt: Date.now() });
+    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount, requestId, positionId);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
-      pendingOrderQueue.pop(); // rollback the queue entry if dispatch failed
+      const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
+      if (pendingIndex !== -1) pendingOrderQueue.splice(pendingIndex, 1);
       logs.push(`[ORDER_FAILED] Live order dispatch failed for Sub-algorithm ${sub.name}. Position not tracked.`);
       return;
     }
-    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal.`);
-
-    activePositions.push(position);
+    logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal. Pending local position ${positionId} awaiting buy confirmation.`);
     logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Elite: ${auditRes.reasoning.includes("ELITE")}]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
@@ -2581,23 +2620,32 @@ function executeProposal(
     ((takeProfitDistance / entryPrice) * stake * (position.multiplier || 40)).toFixed(3)
   );
   // Register in pending queue BEFORE dispatch so buy confirmation can link the contract_id
-  pendingOrderQueue.push({ localId: id, symbol, direction });
-  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount);
+  const requestId = nextDerivRequestId++;
+  pendingOrderQueue.push({ requestId, localId: id, symbol, direction, position, requestedAt: Date.now() });
+  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount, requestId, id);
   if (!liveOrderPlaced) {
-    pendingOrderQueue.pop(); // rollback queue entry if dispatch failed
+    const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
+    if (pendingIndex !== -1) pendingOrderQueue.splice(pendingIndex, 1);
     logs.push(`[ORDER_FAILED] Live order dispatch failed. Manual position not tracked.`);
     return;
   }
-  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}`);
-
-  activePositions.push(position);
+  logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}. Pending local position ${id} awaiting buy confirmation.`);
 
   logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
+  const staleUnlinkedIndices: number[] = [];
   activePositions.forEach((pos, idx) => {
     if (pos.symbol !== symbol) return;
+    if (!/^\d+$/.test(String(pos.id))) {
+      pos.ticksElapsed++;
+      if (pos.ticksElapsed >= 10) {
+        staleUnlinkedIndices.push(idx);
+        logs.push(`[STATE_SANITIZER] Removed stale unlinked local position ${pos.id} on ${pos.symbol} after ${pos.ticksElapsed} ticks without Deriv contract linkage.`);
+      }
+      return;
+    }
     pos.currentPrice = currentPrice;
     pos.ticksElapsed++;
 
@@ -2842,6 +2890,9 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
       }
     }
   });
+  if (staleUnlinkedIndices.length > 0) {
+    activePositions = activePositions.filter((_, idx) => !staleUnlinkedIndices.includes(idx));
+  }
 }
 
 function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff", epoch: number, authoritativePnl?: number, derivCloseConfirmed = false) {
