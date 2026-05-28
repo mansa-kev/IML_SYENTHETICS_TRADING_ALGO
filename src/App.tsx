@@ -1625,11 +1625,12 @@ export default function App() {
                               method: "POST",
                               headers: { "Content-Type": "application/json" },
                               body: JSON.stringify({ id: pos.id })
-                            }).then(() => fetchState());
+                            }).finally(() => fetchState());
                           }}
-                          className="px-2.5 py-1 text-sm font-mono font-semibold text-red-400 hover:text-white bg-red-500/10 hover:bg-red-500 border border-red-500/20 hover:border-red-500 rounded transition cursor-pointer"
+                          disabled={Boolean(pos.closeRequestedAt)}
+                          className={`px-2.5 py-1 text-sm font-mono font-semibold rounded transition ${pos.closeRequestedAt ? "text-slate-400 bg-slate-800 border border-slate-700 cursor-not-allowed" : "text-red-400 hover:text-white bg-red-500/10 hover:bg-red-500 border border-red-500/20 hover:border-red-500 cursor-pointer"}`}
                         >
-                          Spot Settle
+                          {pos.closeRequestedAt ? "Closing on Deriv..." : "Close on Deriv"}
                         </button>
                       </div>
                     </div>

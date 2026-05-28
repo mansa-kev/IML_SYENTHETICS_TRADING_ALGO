@@ -42,6 +42,12 @@ export interface ActivePosition {
   pnl: number;
   ticksElapsed: number;
   entryEpoch: number;
+  entryRegime?: MarketRegime;
+  entryRsi?: number;
+  entryBbPct?: number;
+  entryAdx?: number;
+  entryAtr?: number;
+  entryConditions?: string[];
   multiplier?: number;
   highestPriceSinceEntry?: number;
   lowestPriceSinceEntry?: number;
@@ -51,6 +57,8 @@ export interface ActivePosition {
   hybridPositionSize?: number;
   isFractalTrend?: boolean;
   maxAdverseExcursion?: number;
+  closeRequestedAt?: number;
+  closeRequestedReason?: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
 }
 
 export interface TradeRecord {
@@ -76,6 +84,7 @@ export interface TradeRecord {
   hybridPositionSize?: number;
   tickStreamSnapshot?: number[];
   maxAdverseExcursion?: number;
+  derivCloseConfirmed?: boolean;
 }
 
 export interface SessionStats {

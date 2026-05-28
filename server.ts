@@ -14,6 +14,7 @@ import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, 
 import { createClient } from "@supabase/supabase-js";
 import PDFDocument from "pdfkit";
 
+dotenv.config({ path: ".env.local" });
 dotenv.config();
 
 const app = express();
@@ -65,6 +66,43 @@ const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
 
 // Pending Deriv order queue — maps local position ID to Deriv contract_id on buy confirmation
 const pendingOrderQueue: Array<{ localId: string; symbol: string; direction: string }> = [];
+
+function inferDirectionFromContractType(type: string): "LONG" | "SHORT" {
+  return type.includes("PUT") || type.includes("FALL") || type.includes("MULTDOWN") || type.includes("UNDER") ? "SHORT" : "LONG";
+}
+
+function isDerivContractClosed(contract: any): boolean {
+  const status = String(contract?.status || "").toLowerCase();
+  return Boolean(contract?.is_sold) || Boolean(contract?.is_expired) || ["sold", "won", "lost", "closed", "expired", "cancelled"].includes(status);
+}
+
+function resolveExitReasonFromContract(pos: ActivePosition, exitPrice: number): TradeRecord["exitReason"] {
+  if (pos.closeRequestedReason) {
+    return pos.closeRequestedReason;
+  }
+  const tolerance = Math.max(Math.abs(pos.entryPrice || 0) * 0.0015, pos.entryAtr ? pos.entryAtr * 0.35 : 0.15);
+  if (pos.direction === "LONG") {
+    if (exitPrice <= pos.stopLoss + tolerance) return "stop_loss";
+    if (exitPrice >= pos.takeProfit - tolerance) return "take_profit";
+  } else {
+    if (exitPrice >= pos.stopLoss - tolerance) return "stop_loss";
+    if (exitPrice <= pos.takeProfit + tolerance) return "take_profit";
+  }
+  return "manual";
+}
+
+function finalizeDerivContractSettlement(pos: ActivePosition, contract: any) {
+  if (completedTrades.some(t => t.id === pos.id)) {
+    activePositions = activePositions.filter(p => p.id !== pos.id);
+    return;
+  }
+  const exitPrice = parseFloat(contract.exit_tick || contract.sell_spot || contract.current_spot || contract.entry_tick || `${pos.currentPrice || pos.entryPrice || 0}`) || pos.currentPrice || pos.entryPrice;
+  const epoch = parseInt(String(contract.date_expiry || contract.date_settlement || contract.sell_time || Math.floor(Date.now() / 1000)), 10) || Math.floor(Date.now() / 1000);
+  const authoritativePnl = parseFloat(contract.profit ?? "NaN");
+  const reason = resolveExitReasonFromContract(pos, exitPrice);
+  activePositions = activePositions.filter(p => p.id !== pos.id);
+  settleContract(pos, exitPrice, reason, epoch, Number.isFinite(authoritativePnl) ? authoritativePnl : undefined, true);
+}
 
 // Circuit Breakers states
 let circuitBreakerCooldown = 0; // seconds remaining
@@ -803,7 +841,14 @@ async function loadStateFromSupabase() {
       if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.activePositions !== undefined) activePositions = loaded.activePositions;
-      if (loaded.completedTrades !== undefined) completedTrades = loaded.completedTrades;
+      if (loaded.completedTrades !== undefined) {
+        const recoveredTrades = Array.isArray(loaded.completedTrades) ? loaded.completedTrades : [];
+        const authoritativeTrades = recoveredTrades.filter((trade: any) => trade?.derivCloseConfirmed === true);
+        if (authoritativeTrades.length !== recoveredTrades.length) {
+          logs.push(`[STATE_SANITIZER] Removed ${recoveredTrades.length - authoritativeTrades.length} legacy non-authoritative trades from recovered session state. Generate fresh analytics from Deriv-confirmed closes only.`);
+        }
+        completedTrades = authoritativeTrades;
+      }
       if (loaded.currentParams !== undefined) {
         currentParams = loaded.currentParams;
         // Sanity clamp — prevent corrupted ML values from persisting across reboots
@@ -1049,46 +1094,90 @@ class DerivLiveBridge {
       // 1.05 Monitor Open Positions Registry
       if (msg.msg_type === "proposal_open_contract") {
         const contract = msg.proposal_open_contract;
-        if (contract && contract.status === "open") {
+        if (contract && contract.contract_id) {
           const contractIdStr = contract.contract_id.toString();
           const existing = activePositions.find(p => p.id === contractIdStr);
-          if (!existing) {
-             const internalSymbol = this.getInternalSymbolCode(contract.underlying || "");
-             if (internalSymbol) {
-                logs.push(`[DERIV_LIVE] 👻 Ghost Position Detected! Mapping orphan contract #${contractIdStr} (${contract.display_name}) to live registry.`);
-                
-                // Derive direction from contract type
-                let direction: "LONG" | "SHORT" = "LONG";
-                const type = contract.contract_type || "";
-                if (type.includes("PUT") || type.includes("FALL") || type.includes("MULTDOWN") || type.includes("UNDER")) {
-                  direction = "SHORT";
-                }
 
-                const ghostEntry = parseFloat(contract.entry_tick || "0") || parseFloat(contract.current_spot || "0");
-                const ghostSpot  = parseFloat(contract.current_spot || "0");
-                const ghostStake = parseFloat(contract.buy_price || "0");
-                // Compute ATR-based SL/TP if Deriv reports none (limit_order absent = old contract)
-                // Always compute price-level SL/TP from ATR — never use Deriv dollar amounts as prices
-                // (Deriv limit_order.stop_loss.order_amount is a dollar loss threshold, not a price level)
-                const ghostAtrBuf = ghostSpot * 0.003; // 0.3% of spot — ATR fallback
-                const ghostSL = direction === "LONG" ? ghostEntry - ghostAtrBuf : ghostEntry + ghostAtrBuf;
-                const ghostTP = direction === "LONG" ? ghostEntry + ghostAtrBuf * 2 : ghostEntry - ghostAtrBuf * 2;
-                activePositions.push({
+          if (isDerivContractClosed(contract)) {
+            if (existing) {
+              finalizeDerivContractSettlement(existing, contract);
+            } else if (!completedTrades.some(t => t.id === contractIdStr)) {
+              const internalSymbol = this.getInternalSymbolCode(contract.underlying || "");
+              if (internalSymbol) {
+                const type = contract.contract_type || "";
+                const direction = inferDirectionFromContractType(type);
+                const entryPrice = parseFloat(contract.entry_tick || contract.entry_spot || contract.current_spot || "0");
+                const exitPrice = parseFloat(contract.exit_tick || contract.sell_spot || contract.current_spot || `${entryPrice}`) || entryPrice;
+                const ghostAtrAdx = computeATRAndADX(candleBuffers[internalSymbol] || [], 14);
+                const ghostBollinger = computeBollinger(tickBuffers[internalSymbol] || [], subAlgorithms[internalSymbol]?.bbPeriod || currentParams.bbPeriod);
+                finalizeDerivContractSettlement({
                   id: contractIdStr,
                   symbol: internalSymbol,
                   contractType: type as any,
-                  direction: direction,
-                  stake: ghostStake,
-                  entryPrice: ghostEntry,
-                  currentPrice: ghostSpot,
-                  stopLoss: ghostSL,
-                  takeProfit: ghostTP,
+                  direction,
+                  stake: parseFloat(contract.buy_price || "0"),
+                  entryPrice,
+                  currentPrice: exitPrice,
+                  stopLoss: entryPrice,
+                  takeProfit: entryPrice,
                   pnl: parseFloat(contract.profit || "0"),
                   ticksElapsed: 0,
                   entryEpoch: contract.date_start || Math.floor(Date.now() / 1000),
                   multiplier: parseFloat(contract.multiplier || "40"),
-                });
-             }
+                  entryRegime: detectRegime(internalSymbol),
+                  entryRsi: computeRSI(tickBuffers[internalSymbol] || [], 14),
+                  entryBbPct: parseFloat((((entryPrice - ghostBollinger.lower) / ((ghostBollinger.upper - ghostBollinger.lower) || 1))).toFixed(3)),
+                  entryAdx: parseFloat(ghostAtrAdx.adx.toFixed(2)),
+                  entryAtr: parseFloat(ghostAtrAdx.atr.toFixed(4)),
+                  entryConditions: ["DERIV_RECOVERY_SYNC"],
+                }, contract);
+              }
+            }
+            return;
+          }
+
+          if (existing) {
+            const derivSpot = parseFloat(contract.current_spot || contract.bid_price || `${existing.currentPrice}`);
+            const derivPnl = parseFloat(contract.profit ?? `${existing.pnl}`);
+            if (Number.isFinite(derivSpot)) existing.currentPrice = derivSpot;
+            if (Number.isFinite(derivPnl)) existing.pnl = derivPnl;
+            return;
+          }
+
+          const internalSymbol = this.getInternalSymbolCode(contract.underlying || "");
+          if (internalSymbol) {
+            logs.push(`[DERIV_LIVE] 👻 Ghost Position Detected! Mapping orphan contract #${contractIdStr} (${contract.display_name}) to live registry.`);
+            const type = contract.contract_type || "";
+            const direction = inferDirectionFromContractType(type);
+            const ghostEntry = parseFloat(contract.entry_tick || "0") || parseFloat(contract.current_spot || "0");
+            const ghostSpot  = parseFloat(contract.current_spot || "0");
+            const ghostStake = parseFloat(contract.buy_price || "0");
+            const ghostAtrBuf = ghostSpot * 0.003;
+            const ghostSL = direction === "LONG" ? ghostEntry - ghostAtrBuf : ghostEntry + ghostAtrBuf;
+            const ghostTP = direction === "LONG" ? ghostEntry + ghostAtrBuf * 2 : ghostEntry - ghostAtrBuf * 2;
+            const ghostAtrAdx = computeATRAndADX(candleBuffers[internalSymbol] || [], 14);
+            const ghostBollinger = computeBollinger(tickBuffers[internalSymbol] || [], subAlgorithms[internalSymbol]?.bbPeriod || currentParams.bbPeriod);
+            activePositions.push({
+              id: contractIdStr,
+              symbol: internalSymbol,
+              contractType: type as any,
+              direction: direction,
+              stake: ghostStake,
+              entryPrice: ghostEntry,
+              currentPrice: ghostSpot,
+              stopLoss: ghostSL,
+              takeProfit: ghostTP,
+              pnl: parseFloat(contract.profit || "0"),
+              ticksElapsed: 0,
+              entryEpoch: contract.date_start || Math.floor(Date.now() / 1000),
+              multiplier: parseFloat(contract.multiplier || "40"),
+              entryRegime: detectRegime(internalSymbol),
+              entryRsi: computeRSI(tickBuffers[internalSymbol] || [], 14),
+              entryBbPct: parseFloat((((ghostEntry - ghostBollinger.lower) / ((ghostBollinger.upper - ghostBollinger.lower) || 1))).toFixed(3)),
+              entryAdx: parseFloat(ghostAtrAdx.adx.toFixed(2)),
+              entryAtr: parseFloat(ghostAtrAdx.atr.toFixed(4)),
+              entryConditions: ["DERIV_GHOST_SYNC"],
+            });
           }
         }
       }
@@ -1174,8 +1263,15 @@ class DerivLiveBridge {
           if (pos) {
             pos.id = derivContractId;
             logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Ghost-position elimination active.`);
+            this.ws?.send(JSON.stringify({ proposal_open_contract: 1, contract_id: Number(derivContractId), subscribe: 1 }));
           }
         }
+      }
+
+      if (msg.msg_type === "sell" && msg.sell) {
+        const soldFor = parseFloat(msg.sell.sold_for || "0");
+        const contractId = String(msg.echo_req?.sell || msg.sell.contract_id || "UNKNOWN");
+        logs.push(`[DERIV_LIVE_TRADE] 🧾 Close request acknowledged by Deriv for contract #${contractId}${Number.isFinite(soldFor) ? ` (Sold For: $${soldFor.toFixed(2)})` : ""}. Awaiting final settlement confirmation.`);
       }
     } catch (e) {
       // Log critical exceptions in the socket loop safely
@@ -1261,6 +1357,19 @@ class DerivLiveBridge {
 
     this.ws.send(JSON.stringify(proposal));
     logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
+    return true;
+  }
+
+  public requestContractClose(contractId: string, reason: TradeRecord["exitReason"]) {
+    if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    const numericId = Number(contractId);
+    if (!Number.isFinite(numericId)) {
+      return false;
+    }
+    this.ws.send(JSON.stringify({ sell: numericId, price: 0 }));
+    logs.push(`[DERIV_LIVE_TRADE] 🛑 Requesting authoritative Deriv close for contract #${contractId} on ${reason.toUpperCase()}.`);
     return true;
   }
 }
@@ -2113,7 +2222,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
     }
 
-    stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.05)).toFixed(2));
+    stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.015)).toFixed(2));
     
     // Ensure Multiplier mode respects Fixed USD risk if configured
     if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
@@ -2195,7 +2304,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
       // Recalculate stopLossDistance and takeProfitDistance with an adaptive 1.25x risk-reward ratio
       // to avoid giving back open profits and highly increase hit rate
-      takeProfitDistance = stopLossDistance * 1.25;
+      takeProfitDistance = stopLossDistance * 1.6;
 
       // Scale stake down dynamically if expected loss is too high
       const expectedLossPct = (stopLossDistance / currentPrice) * chosenMultiplier;
@@ -2229,6 +2338,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       pnl: 0.0,
       ticksElapsed: 0,
       entryEpoch: epoch,
+      entryRegime: currentRegime,
+      entryRsi: parseFloat(rsiVal.toFixed(2)),
+      entryBbPct: parseFloat((((currentPrice - lower) / ((upper - lower) || 1))).toFixed(3)),
+      entryAdx: parseFloat(adx.toFixed(2)),
+      entryAtr: parseFloat(atr.toFixed(4)),
+      entryConditions: [...conditionsList],
       multiplier: tickEffMode === "MULTIPLIER" ? chosenMultiplier : undefined,
       isHybridLinear: tickEffMode === "HYBRID_LINEAR" ? true : undefined,
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
@@ -2310,17 +2425,17 @@ function calculateKellyStake(symbol?: string): number {
   const halfKelly = fullKelly / 2.0;
 
   // STRICT CAPS based on risk preset
-  const MAX_STAKE_PCT = riskPreset === "AGGRESSIVE" ? 0.04 : riskPreset === "CONSERVATIVE" ? 0.01 : 0.02;
+  const MAX_STAKE_PCT = riskPreset === "AGGRESSIVE" ? 0.0125 : riskPreset === "CONSERVATIVE" ? 0.0025 : 0.006;
   const calculatedMax = balance * MAX_STAKE_PCT;
   
-  let kellyPct = Math.max(0.005, Math.min(halfKelly, MAX_STAKE_PCT));
+  let kellyPct = Math.max(0.0015, Math.min(halfKelly, MAX_STAKE_PCT));
   if (isNaN(kellyPct) || kellyPct <= 0) {
-    kellyPct = 0.005; // safe fallback (0.5% of equity)
+    kellyPct = 0.0015;
   }
 
   let stake = balance * kellyPct;
   if (stake < 0.35) {
-    stake = balance * 0.005; // safe fallback
+    stake = balance * 0.0015;
   }
 
   // Section 7.3 Halving Trigger Protocol
@@ -2356,7 +2471,7 @@ function executeProposal(
   if (sub) {
     stake = stake * sub.targetRiskStakeMultiplier;
   }
-  stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.05)).toFixed(2));
+  stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.015)).toFixed(2));
 
   if (stake > balance) {
     logs.push(`[EXECUTION_ALERT] ${new Date().toLocaleTimeString()} Stake recommendation ($${stake}) exceeds available balance. Reverting.`);
@@ -2370,7 +2485,7 @@ function executeProposal(
 
   const atrBuffer = atr * atrStopMult;
   let stopLossDistance = Math.max(entryPrice * 0.003, atrBuffer);
-  let takeProfitDistance = stopLossDistance * 1.25; // optimized 1.25x exit ratio for high hit rate
+  let takeProfitDistance = stopLossDistance * 1.6;
   let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
   let targetRisk = 25.00;
 
@@ -2440,6 +2555,12 @@ function executeProposal(
     pnl: 0.0,
     ticksElapsed: 0,
     entryEpoch: epoch,
+    entryRegime: regime,
+    entryRsi: parseFloat(rsi.toFixed(2)),
+    entryBbPct: parseFloat((((entryPrice - bbLower) / ((bbUpper - bbLower) || 1))).toFixed(3)),
+    entryAdx: parseFloat(computeATRAndADX(candleBuffers[symbol] || [], 14).adx.toFixed(2)),
+    entryAtr: parseFloat(atr.toFixed(4)),
+    entryConditions: [...conditions],
     multiplier: effMode === "MULTIPLIER" ? chosenMultiplier : undefined,
     isHybridLinear: effMode === "HYBRID_LINEAR" ? true : undefined,
     targetRiskAmount: effMode === "HYBRID_LINEAR" ? targetRisk : undefined,
@@ -2475,8 +2596,6 @@ function executeProposal(
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
-  const settledTrades: { idx: number, pos: ActivePosition, price: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "early_cutoff", epoch: number }[] = [];
-
   activePositions.forEach((pos, idx) => {
     if (pos.symbol !== symbol) return;
     pos.currentPrice = currentPrice;
@@ -2706,23 +2825,31 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
     }
 
     if (exitTriggered) {
-      settledTrades.push({ idx, pos, price: currentPrice, reason, epoch });
+      if (pos.closeRequestedAt) {
+        return;
+      }
+      if (!/^\d+$/.test(String(pos.id))) {
+        logs.push(`[DERIV_CLOSE_PENDING] Exit condition ${reason.toUpperCase()} triggered for ${pos.symbol}, but contract is still awaiting Deriv contract ID linkage.`);
+        return;
+      }
+      pos.closeRequestedAt = Date.now();
+      pos.closeRequestedReason = reason;
+      const closeSent = liveBridgeInstance.requestContractClose(pos.id, reason);
+      if (!closeSent) {
+        pos.closeRequestedAt = undefined;
+        pos.closeRequestedReason = undefined;
+        logs.push(`[DERIV_CLOSE_FAILED] Unable to request authoritative close for contract #${pos.id} on ${reason.toUpperCase()}.`);
+      }
     }
-  });
-
-  // Re-build active list minus settled trades
-  activePositions = activePositions.filter((_, idx) => !settledTrades.some(s => s.idx === idx));
-
-  // Settle contracts and persist to disk clean
-  settledTrades.forEach(s => {
-    settleContract(s.pos, s.price, s.reason, s.epoch);
   });
 }
 
-function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "early_cutoff", epoch: number) {
+function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff", epoch: number, authoritativePnl?: number, derivCloseConfirmed = false) {
   // Recalculate definitive exit P&L
   let finalPnl = pos.pnl;
-  if (pos.isHybridLinear) {
+  if (authoritativePnl !== undefined && Number.isFinite(authoritativePnl)) {
+    finalPnl = authoritativePnl;
+  } else if (pos.isHybridLinear) {
     if (reason === "stop_loss") {
       finalPnl = -pos.targetRiskAmount!;
     } else if (reason === "take_profit") {
@@ -2786,6 +2913,11 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     subAlg.recentWinRate = subAlg.totalTrades > 0 ? (subAlg.winningTrades / subAlg.totalTrades) : 0.5;
   }
 
+  if (completedTrades.some(t => t.id === pos.id)) {
+    logs.push(`[CONTRACT_SETTLED] Duplicate close confirmation ignored for contract #${pos.id}.`);
+    return;
+  }
+
   // Create record
   const record: TradeRecord = {
     id: pos.id,
@@ -2797,22 +2929,23 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     exitPrice,
     pnl: finalPnl,
     exitReason: reason,
-    regimeAtEntry: detectRegime(pos.symbol),
+    regimeAtEntry: pos.entryRegime || detectRegime(pos.symbol),
     entryEpoch: pos.entryEpoch,
     exitEpoch: epoch,
-    rsiAtEntry: computeRSI(tickBuffers[pos.symbol] || [], 14),
-    bbPctAtEntry: computeBollinger(tickBuffers[pos.symbol] || [], currentParams.bbPeriod).percentB,
-    adxAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).adx,
-    atrAtEntry: computeATRAndADX(candleBuffers[pos.symbol] || [], 14).atr,
+    rsiAtEntry: pos.entryRsi ?? computeRSI(tickBuffers[pos.symbol] || [], 14),
+    bbPctAtEntry: pos.entryBbPct ?? computeBollinger(tickBuffers[pos.symbol] || [], currentParams.bbPeriod).percentB,
+    adxAtEntry: pos.entryAdx ?? computeATRAndADX(candleBuffers[pos.symbol] || [], 14).adx,
+    atrAtEntry: pos.entryAtr ?? computeATRAndADX(candleBuffers[pos.symbol] || [], 14).atr,
     tickStreamSnapshot: (tickBuffers[pos.symbol] || []).slice(-150),
-    conditionsMet: pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"],
+    conditionsMet: pos.entryConditions && pos.entryConditions.length > 0 ? pos.entryConditions : (pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"]),
     maxAdverseExcursion: pos.maxAdverseExcursion ?? 0,
+    derivCloseConfirmed,
   };
 
   completedTrades.push(record);
   // Balance is authoritative from Deriv WS stream — do not write locally here.
   // peakBalance tracking is maintained from the stream handler.
-  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Awaiting Deriv balance stream confirmation`);
+  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Source: ${derivCloseConfirmed ? "Deriv authoritative close confirmation" : "local engine settlement"}`);
 
   // Check trade limit to trigger report without interrupting live trading
   if (completedTrades.length > 0 && completedTrades.length % 100 === 0) {
@@ -3349,6 +3482,14 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        // ── MAE Analysis ──────────────────────────────────────────────────
        doc.moveDown(1.5);
        const maeTrades   = reportTrades.filter(t => t.maxAdverseExcursion !== undefined && t.maxAdverseExcursion !== 0);
+       if (maeTrades.length > 0 && doc.y > 680) {
+         doc.addPage();
+         doc.rect(40, 40, 532, 10).fill('#0f172a');
+         doc.moveDown(1.5);
+         doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('QUANTITATIVE RISK ANALYTICS (CONT.)', 50, doc.y);
+         doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Continuation of tail-risk and adverse-excursion diagnostics', 50, doc.y + 16);
+         doc.moveDown(2.5);
+       }
        if (maeTrades.length > 0) {
          const maeWinners = maeTrades.filter(t=>t.pnl>0);
          const maeLosers  = maeTrades.filter(t=>t.pnl<=0);
@@ -4719,13 +4860,23 @@ app.post("/api/close-position", (req, res) => {
   }
 
   const pos = activePositions[index];
-  const symbolPrices = tickBuffers[pos.symbol] || [];
-  const currentPrice = symbolPrices[symbolPrices.length - 1] || pos.currentPrice;
+  if (pos.closeRequestedAt) {
+    return res.status(409).json({ error: "Close request already pending with Deriv" });
+  }
+  if (!/^\d+$/.test(String(pos.id))) {
+    return res.status(409).json({ error: "Contract is still awaiting Deriv linkage. Try again in a moment." });
+  }
 
-  activePositions.splice(index, 1);
-  settleContract(pos, currentPrice, "manual", Math.floor(Date.now() / 1000));
+  pos.closeRequestedAt = Date.now();
+  pos.closeRequestedReason = "manual";
+  const closeSent = liveBridgeInstance.requestContractClose(pos.id, "manual");
+  if (!closeSent) {
+    pos.closeRequestedAt = undefined;
+    pos.closeRequestedReason = undefined;
+    return res.status(503).json({ error: "Failed to send live close request to Deriv." });
+  }
 
-  res.json({ success: true, message: "Position settled manually." });
+  res.json({ success: true, message: "Live close request sent to Deriv. Awaiting authoritative contract confirmation." });
 });
 
 // AI analysis session
