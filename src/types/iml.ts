@@ -59,6 +59,7 @@ export interface ActivePosition {
   maxAdverseExcursion?: number;
   closeRequestedAt?: number;
   closeRequestedReason?: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
+  maxTicksOverride?: number;
 }
 
 export interface TradeRecord {
@@ -85,6 +86,9 @@ export interface TradeRecord {
   tickStreamSnapshot?: number[];
   maxAdverseExcursion?: number;
   derivCloseConfirmed?: boolean;
+  derivedSharpeContribution?: number;
+  entrySignalProbability?: number;
+  entryExpectedEdge?: number;
 }
 
 export interface SessionStats {
@@ -152,6 +156,243 @@ export interface InstrumentConfig {
   basePrice: number;
 }
 
+// ==========================================
+// PHASE 1: PROBABILISTIC TRADING CORE TYPES
+// ==========================================
+
+export interface RegimeDistribution {
+  trendProbability: number;
+  meanReversionProbability: number;
+  transitionProbability: number;
+  volatilityExpansionProbability: number;
+  entropyScore: number;
+}
+
+export interface RegimeState extends RegimeDistribution {
+  volatilityCompressionProbability: number;
+  confidence: number;
+}
+
+export interface SignalProbability {
+  expectedEdge: number;
+  confidence: number;
+  uncertainty: number;
+  regimeCompatibility: number;
+  volatilityScore: number;
+  executionQuality: number;
+  tailRisk: number;
+}
+
+export interface ExtendedSignalProbability extends SignalProbability {
+  expectedHoldingTime: number;
+  expectedRR: number;
+  executionSensitivity: number;
+}
+
+export enum ConfidenceTier {
+  HIGH = "HIGH",
+  MEDIUM = "MEDIUM",
+  LOW = "LOW",
+  REJECT = "REJECT",
+}
+
+export interface OpportunityProfile {
+  tier: ConfidenceTier;
+  expectedEdge: number;
+  confidence: number;
+  uncertainty: number;
+  volatilityScore: number;
+  regimeAlignment: number;
+}
+
+export interface RejectionAnalysis {
+  symbol: string;
+  expectedEdge: number;
+  confidence: number;
+  regimeAlignment: number;
+  volatilityScore: number;
+  uncertainty: number;
+  correlationPenalty: number;
+  transitionPenalty: number;
+  executionPenalty: number;
+  expectedSharpeImpact: number;
+  rejectionReasons: string[];
+}
+
+export enum EquityCurveState {
+  EXPANSION     = "EXPANSION",
+  NORMAL        = "NORMAL",
+  SOFT_DRAWDOWN = "SOFT_DRAWDOWN",
+  HARD_DRAWDOWN = "HARD_DRAWDOWN",
+  RECOVERY      = "RECOVERY",
+}
+
+export interface UncertaintyState {
+  epistemicUncertainty: number;
+  marketUncertainty: number;
+  modelConfidence: number;
+  regimeStability: number;
+}
+
+export interface PortfolioHeatState {
+  totalHeat: number;
+  correlatedClusterHeat: Record<string, number>;
+  maxConcentration: number;
+  heatCapExceeded: boolean;
+  adjustedLeverageScale: number;
+}
+
+export interface OpportunityDensityMetrics {
+  totalHighQualityOpportunities: number;
+  capturedHighQualityTrades: number;
+  opportunityDensity: number;
+  falsePositiveApprovals: number;
+  falseNegativeRejections: number;
+  avgExpectedSharpeContribution: number;
+  varianceAdjustedExpectancy: number;
+}
+
+export interface SpikeHarvestState {
+  spikeDetected: boolean;
+  spikeEpoch: number;
+  spikeExhaustionProbability: number;
+  recoveryProbability: number;
+  persistenceDecay: number;
+  volatilityCollapseProbability: number;
+  postSpikeTicksElapsed: number;
+}
+
+export interface EquityCurveThrottleConfig {
+  state: EquityCurveState;
+  leverageScale: number;
+  confidenceThreshold: number;
+  portfolioHeatCap: number;
+  maxPositionDurationScale: number;
+  tradeAggressiveness: number;
+}
+
+export interface GovernorDecision {
+  approved: boolean;
+  confidenceTier: ConfidenceTier;
+  finalConfidence: number;
+  allocatedRisk: number;
+  adjustedLeverage: number;
+  expectedEdge: number;
+  uncertaintyAdjustedEdge: number;
+  executionAdjustedEdge: number;
+  expectedSharpeImpact: number;
+  correlationPenalty: number;
+  volatilityPenalty: number;
+  executionPenalty: number;
+  uncertaintyPenalty: number;
+  transitionPenalty: number;
+  heatPenalty: number;
+  equityCurveState: EquityCurveState;
+  rejectionReasons?: string[];
+}
+
+export interface PortfolioRiskState {
+  totalExposure: number;
+  directionalBias: number;
+  correlationMatrix: Record<string, Record<string, number>>;
+  volatilityCluster: number;
+  entropyLevel: number;
+  drawdownSeverity: number;
+  regimeStability: number;
+}
+
+export interface ExecutionHealth {
+  fillLatency: number;
+  slippageEstimate: number;
+  rejectionRate: number;
+  desyncDetected: boolean;
+  degradedSince: number;
+}
+
+export interface LiveMetrics {
+  expectancy: number;
+  realizedSharpe: number;
+  sortinoRatio: number;
+  maxDrawdown: number;
+  consecutiveLosses: number;
+  fillDegradation: number;
+  regimeAccuracy: number;
+  exposureCorrelation: number;
+  avgTradeDuration: number;
+  volatilityForecastError: number;
+  executionLatency: number;
+  realizedVsExpectedPnl: number;
+  recoveryFactor: number;
+}
+
+// ==========================================
+// PHASE 2: PROBABILISTIC INTELLIGENCE TYPES
+// ==========================================
+
+export interface TradeQuality {
+  expectedEdge: number;
+  successProbability: number;
+  expectedVolatility: number;
+  regimeAlignment: number;
+  tailRisk: number;
+  confidence: number;
+  expectedHoldingTime: number;
+  expectedRR: number;
+}
+
+export interface VolatilityForecast {
+  nextPeriodVolatility: number;
+  volatilityTrend: number;
+  volatilityShockProbability: number;
+  confidence: number;
+}
+
+export interface DistributionStats {
+  skewness: number;
+  kurtosis: number;
+  varianceClustering: number;
+  avgConsecutiveLosses: number;
+  avgDrawdownDuration: number;
+  recoveryFactor: number;
+  regimeSharpe: Record<string, number>;
+  regimeExpectancy: Record<string, number>;
+  tailRiskExposure: number;
+}
+
+export interface FeatureSnapshot {
+  epoch: number;
+  symbol: string;
+  price: number;
+  rsi: number;
+  bbPct: number;
+  adx: number;
+  atr: number;
+  hurst: number;
+  conviction: number;
+  regimeState: RegimeState;
+  volatilityForecast: VolatilityForecast;
+}
+
+export interface InstrumentStats {
+  symbol: string;
+  totalTrades: number;
+  winningTrades: number;
+  winRate: number;
+  totalPnl: number;
+  expectancy: number;
+  sharpeRatio: number;
+  sortinoRatio: number;
+  maxDrawdown: number;
+  avgHoldingTime: number;
+  bestTrade: number;
+  worstTrade: number;
+  profitFactor: number;
+  recoveryFactor: number;
+  regimePerformance: Record<string, { trades: number; wins: number; pnl: number; expectancy: number }>;
+  distribution: DistributionStats;
+  featureHistory: FeatureSnapshot[];
+}
+
 export interface SubAlgorithm {
   symbol: string;
   name: string;
@@ -191,4 +432,13 @@ export interface SubAlgorithm {
   convictionScore?: number;
   kamaValue?: number;
   tailExponent?: number;
+  // Phase 1 probabilistic fields
+  regimeState?: RegimeState;
+  lastSignalProbability?: ExtendedSignalProbability;
+  specialization?: "V75" | "V50" | "BOOM" | "CRASH";
+  // Phase 2 state fields
+  spikeHarvestState?: SpikeHarvestState;
+  equityCurveState?: EquityCurveState;
+  recentPnlWindow?: number[];
+  rollingExpectedEdge?: number;
 }

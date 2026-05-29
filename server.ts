@@ -10,7 +10,7 @@ import fs from "fs";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm } from "./src/types/iml.js";
+import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm, RegimeState, SignalProbability, ExtendedSignalProbability, ConfidenceTier, GovernorDecision, PortfolioRiskState, ExecutionHealth, LiveMetrics, TradeQuality, VolatilityForecast, DistributionStats, FeatureSnapshot, InstrumentStats, EquityCurveState, UncertaintyState, PortfolioHeatState, OpportunityDensityMetrics, SpikeHarvestState, EquityCurveThrottleConfig } from "./src/types/iml.js";
 import { createClient } from "@supabase/supabase-js";
 import PDFDocument from "pdfkit";
 
@@ -126,19 +126,15 @@ let tradingAutoResumePending = false;
 // Historical pricing buffers (rolling arrays of size 2000)
 const maxBufferLength = 2000;
 const tickBuffers: Record<string, number[]> = {
-  R_10: [],
   R_25: [],
   R_75: [],
-  R_100: [],
   CRASH500: [],
   BOOM500: [],
 };
 
 const candleBuffers: Record<string, Candle[]> = {
-  R_10: [],
   R_25: [],
   R_75: [],
-  R_100: [],
   CRASH500: [],
   BOOM500: [],
 };
@@ -154,10 +150,20 @@ interface StrategyProposal {
   effMode: "MULTIPLIER" | "HYBRID_LINEAR";
   conviction: number;
   reason: string;
-  indicators: any;
+  indicators: {
+    rsi?: number;
+    adx?: number;
+    atr?: number;
+    bbPct?: number;
+    vwapVal?: number;
+    price?: number;
+    isDivergent?: boolean;
+    isReversalCandle?: boolean;
+    signalProbability?: ExtendedSignalProbability;
+  };
 }
 
-let governorFocusSymbol = "R_10";
+let governorFocusSymbol = "R_25";
 let governorStatus = "IML AGENTIC CORE: ONLINE";
 let governorAgenticScore = 1.0; // 100% Agentic goal
 
@@ -173,41 +179,177 @@ const governorMemory: {
   lastInsight: "System initialized with baseline heuristic scrutiny."
 };
 
+// ==========================================
+// PROBABILISTIC PORTFOLIO INTELLIGENCE STATE
+// ==========================================
+const CORRELATION_CLUSTERS: Record<string, string[]> = {
+  VOL_CLUSTER: ["R_25", "R_75", "R_100"],
+  EVENT_CLUSTER: ["BOOM500", "CRASH500"],
+};
+
+let executionHealth: ExecutionHealth = {
+  fillLatency: 0.45,
+  slippageEstimate: 0.0,
+  rejectionRate: 0.02,
+  desyncDetected: false,
+  degradedSince: 0,
+};
+
+let uncertaintyState: UncertaintyState = {
+  epistemicUncertainty: 0.35,
+  marketUncertainty: 0.40,
+  modelConfidence: 0.60,
+  regimeStability: 0.55,
+};
+
+let portfolioHeatState: PortfolioHeatState = {
+  totalHeat: 0,
+  correlatedClusterHeat: {},
+  maxConcentration: 0,
+  heatCapExceeded: false,
+  adjustedLeverageScale: 1,
+};
+
+let opportunityDensityMetrics: OpportunityDensityMetrics = {
+  totalHighQualityOpportunities: 0,
+  capturedHighQualityTrades: 0,
+  opportunityDensity: 0,
+  falsePositiveApprovals: 0,
+  falseNegativeRejections: 0,
+  avgExpectedSharpeContribution: 0,
+  varianceAdjustedExpectancy: 0,
+};
+
+let equityCurveState: EquityCurveState = EquityCurveState.NORMAL;
+let equityCurveThrottle: EquityCurveThrottleConfig = {
+  state: equityCurveState,
+  leverageScale: 1,
+  confidenceThreshold: 0.45,
+  portfolioHeatCap: 0.65,
+  maxPositionDurationScale: 1,
+  tradeAggressiveness: 1,
+};
+
+function clamp01(val: number): number {
+  return Math.max(0, Math.min(1, val));
+}
+
+function deriveExecutionQualityScore(): number {
+  const latencyPenalty = clamp01(executionHealth.fillLatency / 1.2); // normalize vs 1.2s worst-case
+  const slippagePenalty = clamp01(Math.abs(executionHealth.slippageEstimate) / 1.5);
+  const rejectionPenalty = clamp01(executionHealth.rejectionRate * 6);
+  const desyncPenalty = executionHealth.desyncDetected ? 0.25 : 0;
+  const quality = 1 - clamp01(0.45 * latencyPenalty + 0.35 * slippagePenalty + 0.15 * rejectionPenalty + desyncPenalty);
+  return parseFloat(Math.max(0.15, quality).toFixed(4));
+}
+
+function computePortfolioHeatSnapshot(candidate?: { symbol: string; stake: number; direction: "LONG" | "SHORT" }): PortfolioHeatState {
+  const balanceDenom = balance > 0 ? balance : 1;
+  const exposureBySymbol: Record<string, number> = {};
+  for (const pos of activePositions) {
+    exposureBySymbol[pos.symbol] = (exposureBySymbol[pos.symbol] || 0) + Math.abs(pos.stake) / balanceDenom;
+  }
+  if (candidate) {
+    exposureBySymbol[candidate.symbol] = (exposureBySymbol[candidate.symbol] || 0) + Math.abs(candidate.stake) / balanceDenom;
+  }
+
+  let totalHeat = 0;
+  Object.values(exposureBySymbol).forEach(v => { totalHeat += v; });
+  const correlatedClusterHeat: Record<string, number> = {};
+  let maxConcentration = 0;
+  for (const [cluster, members] of Object.entries(CORRELATION_CLUSTERS)) {
+    const value = members.reduce((sum, sym) => sum + (exposureBySymbol[sym] || 0), 0);
+    correlatedClusterHeat[cluster] = parseFloat(value.toFixed(4));
+    if (value > maxConcentration) maxConcentration = value;
+  }
+  const adjustedScale = Math.max(
+    0.2,
+    1 - Math.max(0, totalHeat - 0.35) * 0.8 - Math.max(0, maxConcentration - 0.45) * 0.6
+  );
+  const heatCap = equityCurveThrottle.portfolioHeatCap;
+  return {
+    totalHeat: parseFloat(totalHeat.toFixed(4)),
+    correlatedClusterHeat,
+    maxConcentration: parseFloat(maxConcentration.toFixed(4)),
+    heatCapExceeded: totalHeat > heatCap,
+    adjustedLeverageScale: parseFloat(adjustedScale.toFixed(4)),
+  };
+}
+
+function directionalDistance(current: number, lower: number, upper: number, mode: "MR" | "TREND"): number {
+  if (mode === "MR") {
+    const mid = (upper + lower) / 2;
+    return current <= mid ? clamp01((mid - current) / Math.max(1e-6, mid - lower)) : clamp01((current - mid) / Math.max(1e-6, upper - mid));
+  }
+  return clamp01((current - lower) / Math.max(1e-6, upper - lower));
+}
+
+function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveThrottleConfig {
+  const dd = riskState.drawdownSeverity;
+  const entropy = riskState.entropyLevel;
+  const volatility = riskState.volatilityCluster;
+  let state: EquityCurveState = EquityCurveState.NORMAL;
+  if (dd >= 0.12 || entropy >= 0.55) {
+    state = EquityCurveState.HARD_DRAWDOWN;
+  } else if (dd >= 0.07 || entropy >= 0.48) {
+    state = EquityCurveState.SOFT_DRAWDOWN;
+  } else if (dd <= 0.01 && volatility <= 0.35 && entropy <= 0.35) {
+    state = EquityCurveState.EXPANSION;
+  } else if (dd > 0.0 && dd <= 0.04 && entropy <= 0.45) {
+    state = EquityCurveState.RECOVERY;
+  }
+
+  switch (state) {
+    case EquityCurveState.EXPANSION:
+      return {
+        state,
+        leverageScale: 1.15,
+        confidenceThreshold: 0.42,
+        portfolioHeatCap: 0.7,
+        maxPositionDurationScale: 1.1,
+        tradeAggressiveness: 1.1,
+      };
+    case EquityCurveState.RECOVERY:
+      return {
+        state,
+        leverageScale: 0.95,
+        confidenceThreshold: 0.46,
+        portfolioHeatCap: 0.6,
+        maxPositionDurationScale: 0.95,
+        tradeAggressiveness: 0.95,
+      };
+    case EquityCurveState.SOFT_DRAWDOWN:
+      return {
+        state,
+        leverageScale: 0.75,
+        confidenceThreshold: 0.5,
+        portfolioHeatCap: 0.5,
+        maxPositionDurationScale: 0.8,
+        tradeAggressiveness: 0.75,
+      };
+    case EquityCurveState.HARD_DRAWDOWN:
+      return {
+        state,
+        leverageScale: 0.45,
+        confidenceThreshold: 0.58,
+        portfolioHeatCap: 0.35,
+        maxPositionDurationScale: 0.65,
+        tradeAggressiveness: 0.55,
+      };
+    default:
+      return {
+        state: EquityCurveState.NORMAL,
+        leverageScale: 1,
+        confidenceThreshold: 0.45,
+        portfolioHeatCap: 0.65,
+        maxPositionDurationScale: 1,
+        tradeAggressiveness: 1,
+      };
+  }
+}
+
 // Sub-algorithm engines mapping each instrument to local personalities
 const subAlgorithms: Record<string, SubAlgorithm> = {
-  R_10: {
-    symbol: "R_10",
-    name: "Volatility 10 (1s)",
-    personality: "Aegis Mean Fader",
-    enabled: true,
-    rsiOversoldThreshold: 30,
-    rsiOverboughtThreshold: 70,
-    bbPeriod: 20,
-    bbStd: 2.20,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 2.50,
-    learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 0.75,
-    cooldownUntil: 0,
-    directiveMessage: "INITIALIZING STANDBY PILOT",
-    recentWinRate: 0.5,
-    targetLossPct: 0.15,
-    timeExitEnabled: true,
-    breakEvenEnabled: true,
-    trailingStopEnabled: true,
-    maxTicksInTrade: 45,
-    totalTrades: 0,
-    winningTrades: 0,
-    totalPnl: 0,
-    consecutiveLosses: 0,
-    consecutiveWins: 0,
-    rsiVal: 50,
-    bbPct: 0.5,
-    adxVal: 15,
-    atrVal: 0,
-    confluenceScore: 0,
-    mRegime: MarketRegime.TRANSITION,
-  },
   R_25: {
     symbol: "R_25",
     name: "Volatility 25 (1s)",
@@ -328,39 +470,6 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     breakEvenEnabled: true,
     trailingStopEnabled: true,
     maxTicksInTrade: 45,
-    totalTrades: 0,
-    winningTrades: 0,
-    totalPnl: 0,
-    consecutiveLosses: 0,
-    consecutiveWins: 0,
-    rsiVal: 50,
-    bbPct: 0.5,
-    adxVal: 15,
-    atrVal: 0,
-    confluenceScore: 0,
-    mRegime: MarketRegime.TRANSITION,
-  },
-  R_100: {
-    symbol: "R_100",
-    name: "Volatility 100 Index",
-    personality: "Spike Breakout Raider",
-    enabled: true,
-    rsiOversoldThreshold: 28,
-    rsiOverboughtThreshold: 72,
-    bbPeriod: 20,
-    bbStd: 2.75,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 3.00,
-    learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 0.75,
-    cooldownUntil: 0,
-    directiveMessage: "INITIALIZING STANDBY PILOT",
-    recentWinRate: 0.5,
-    targetLossPct: 0.20,
-    timeExitEnabled: true,
-    breakEvenEnabled: true,
-    trailingStopEnabled: true,
-    maxTicksInTrade: 75,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -851,17 +960,23 @@ async function loadStateFromSupabase() {
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.activePositions !== undefined) {
         const recoveredPositions = Array.isArray(loaded.activePositions) ? loaded.activePositions : [];
-        const linkedActivePositions = recoveredPositions.filter((pos: any) => /^\d+$/.test(String(pos?.id || "")));
+        const allowedInstruments = new Set(Object.keys(INSTRUMENTS));
+        const linkedActivePositions = recoveredPositions.filter((pos: any) =>
+          /^\d+$/.test(String(pos?.id || "")) && allowedInstruments.has(pos?.symbol)
+        );
         if (linkedActivePositions.length !== recoveredPositions.length) {
-          logs.push(`[STATE_SANITIZER] Removed ${recoveredPositions.length - linkedActivePositions.length} stale local placeholder positions from recovered session state. Waiting for Deriv contract registry sync to rebuild any real live positions.`);
+          logs.push(`[STATE_SANITIZER] Removed ${recoveredPositions.length - linkedActivePositions.length} stale/disallowed positions from recovered session state.`);
         }
         activePositions = linkedActivePositions;
       }
       if (loaded.completedTrades !== undefined) {
         const recoveredTrades = Array.isArray(loaded.completedTrades) ? loaded.completedTrades : [];
-        const authoritativeTrades = recoveredTrades.filter((trade: any) => trade?.derivCloseConfirmed === true);
+        const allowedInstruments = new Set(Object.keys(INSTRUMENTS));
+        const authoritativeTrades = recoveredTrades.filter((trade: any) =>
+          trade?.derivCloseConfirmed === true && allowedInstruments.has(trade?.symbol)
+        );
         if (authoritativeTrades.length !== recoveredTrades.length) {
-          logs.push(`[STATE_SANITIZER] Removed ${recoveredTrades.length - authoritativeTrades.length} legacy non-authoritative trades from recovered session state. Generate fresh analytics from Deriv-confirmed closes only.`);
+          logs.push(`[STATE_SANITIZER] Removed ${recoveredTrades.length - authoritativeTrades.length} legacy/disallowed trades from recovered session state.`);
         }
         completedTrades = authoritativeTrades;
       }
@@ -929,12 +1044,17 @@ runSystemBootstrap();
 
 // Instrument configuration mappings
 const INSTRUMENTS = {
-  R_10: { name: "Volatility 10 (1s)", volatility: 0.12, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 100.0 },
   R_25: { name: "Volatility 25 (1s)", volatility: 0.28, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 250.0 },
   R_75: { name: "Volatility 75 (1s)", volatility: 0.85, tickType: "std", idealStrategy: "breakout", basePrice: 750.0 },
-  R_100: { name: "Volatility 100 Index", volatility: 1.05, tickType: "std", idealStrategy: "breakout", basePrice: 1000.0 },
   CRASH500: { name: "Crash 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
   BOOM500: { name: "Boom 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
+};
+
+const INSTRUMENT_PRIORS: Record<string, { confidence: number; expectedEdge: number; sharpe: number }> = {
+  R_25: { confidence: 0.52, expectedEdge: 0.46, sharpe: 0.55 },
+  R_75: { confidence: 0.51, expectedEdge: 0.47, sharpe: 0.58 },
+  CRASH500: { confidence: 0.50, expectedEdge: 0.44, sharpe: 0.50 },
+  BOOM500: { confidence: 0.50, expectedEdge: 0.44, sharpe: 0.50 },
 };
 
 // ==========================================
@@ -1789,44 +1909,78 @@ function computeRS(prices: number[], windowSize = 1024): { H: number, rSquared: 
 }
 
 // ==========================================
-// REGIME DETECTION ENGINE
+// PHASE 1: PROBABILISTIC REGIME ENGINE
 // ==========================================
-function detectRegime(symbol: string): MarketRegime {
+function computeRegimeState(symbol: string): RegimeState {
   const prices = tickBuffers[symbol] || [];
   const candles = candleBuffers[symbol] || [];
-  if (prices.length < 50) return MarketRegime.TRANSITION;
-
+  if (prices.length < 50) {
+    return { trendProbability: 0.15, meanReversionProbability: 0.15, transitionProbability: 0.55, volatilityExpansionProbability: 0.10, entropyScore: 0.60, volatilityCompressionProbability: 0.05, confidence: 0.30 };
+  }
   const lastPrice = prices[prices.length - 1];
   const ma50 = computeSMA(prices, 50);
-  const rsi = computeRSI(prices, 14);
   const { atr, adx } = computeATRAndADX(candles, 14);
   const { upper, lower, mid } = computeBollinger(prices, currentParams.bbPeriod, currentParams.bbStd);
-
-  // Bollinger Band Width for compression analysis
   const bbWidth = (upper - lower) / (mid || 1);
-
-  // Determine relative width bounds
-  // We can track percentile-like ranks. In dynamic, Volatility indices has stable expected base bands:
   const baseVol = INSTRUMENTS[symbol as keyof typeof INSTRUMENTS]?.volatility || 0.5;
-  const squeezeThreshold = baseVol * 0.003; // compression triggers
-  const highVolThreshold = baseVol * 0.012; // expansion triggers
-
-  if (adx > currentParams.regimeAdxThreshold) {
-    // Trending status
-    if (lastPrice > ma50) {
-      return MarketRegime.TRENDING_UP;
-    } else {
-      return MarketRegime.TRENDING_DOWN;
-    }
-  } else if (bbWidth < squeezeThreshold) {
-    return MarketRegime.LOW_VOL; // Squeeze (breakout danger zone)
-  } else if (bbWidth > highVolThreshold) {
-    return MarketRegime.HIGH_VOL; // Dynamic panic expansion
-  } else if (adx < 18 && Math.abs((lastPrice - ma50) / ma50) < 0.008) {
-    return MarketRegime.RANGING; // Prime mean-reversion target
-  } else {
-    return MarketRegime.TRANSITION; // Transition/Neutral segment
+  const recentCandles = candles.slice(-20);
+  let atrAccel = 0;
+  if (recentCandles.length >= 10) {
+    const { atr: atrRecent } = computeATRAndADX(recentCandles.slice(-10), 10);
+    const { atr: atrPrior } = computeATRAndADX(recentCandles.slice(0, 10), 10);
+    atrAccel = atrPrior > 0 ? (atrRecent - atrPrior) / atrPrior : 0;
   }
+  const maSlope = prices.length >= 51 ? (ma50 - computeSMA(prices.slice(0, -1), 50)) / (ma50 || 1) : 0;
+  let directionalPersistence = 0;
+  if (prices.length >= 20) {
+    const recentMoves = prices.slice(-20);
+    let sameDir = 0;
+    for (let i = 1; i < recentMoves.length; i++) {
+      if ((recentMoves[i] - recentMoves[i - 1]) * maSlope > 0) sameDir++;
+    }
+    directionalPersistence = sameDir / (recentMoves.length - 1);
+  }
+  const adxNorm = Math.min(1, adx / 60);
+  const trendRaw = 0.55 * adxNorm + 0.25 * directionalPersistence + 0.20 * (Math.abs(maSlope) * 200);
+  const trendProbability = 1 / (1 + Math.exp(-8 * (trendRaw - 0.45)));
+  const squeezeThreshold = baseVol * 0.003;
+  const highVolThreshold = baseVol * 0.012;
+  const bbCompression = Math.max(0, 1 - (bbWidth / highVolThreshold));
+  const adxWeakness = Math.max(0, 1 - adx / 25);
+  const mrRaw = 0.40 * bbCompression + 0.35 * adxWeakness + 0.25 * (1 - Math.abs(maSlope) * 200);
+  const meanReversionProbability = 1 / (1 + Math.exp(-7 * (mrRaw - 0.40)));
+  const volExpRaw = 0.50 * Math.min(1, bbWidth / highVolThreshold) + 0.30 * Math.max(0, atrAccel) + 0.20 * adxNorm;
+  const volatilityExpansionProbability = 1 / (1 + Math.exp(-6 * (volExpRaw - 0.40)));
+  const volCompRaw = 0.50 * Math.max(0, 1 - bbWidth / squeezeThreshold) + 0.30 * Math.max(0, -atrAccel) + 0.20 * (1 - adxNorm);
+  const volatilityCompressionProbability = 1 / (1 + Math.exp(-6 * (volCompRaw - 0.35)));
+  const signalConflict = Math.abs(trendRaw - mrRaw) < 0.15 ? 0.6 : 0.2;
+  const entropyEstimate = 1 - Math.max(trendProbability, meanReversionProbability, volatilityExpansionProbability, volatilityCompressionProbability);
+  const transitionProbability = 0.5 * signalConflict + 0.5 * entropyEstimate;
+  const maxProb = Math.max(trendProbability, meanReversionProbability, volatilityExpansionProbability, volatilityCompressionProbability);
+  const confidence = 0.6 * maxProb + 0.4 * (1 - transitionProbability);
+  return {
+    trendProbability: parseFloat(trendProbability.toFixed(4)),
+    meanReversionProbability: parseFloat(meanReversionProbability.toFixed(4)),
+    transitionProbability: parseFloat(transitionProbability.toFixed(4)),
+    volatilityExpansionProbability: parseFloat(volatilityExpansionProbability.toFixed(4)),
+    entropyScore: parseFloat(Math.max(0, Math.min(1, entropyEstimate)).toFixed(4)),
+    volatilityCompressionProbability: parseFloat(volatilityCompressionProbability.toFixed(4)),
+    confidence: parseFloat(confidence.toFixed(4)),
+  };
+}
+
+function detectRegime(symbol: string): MarketRegime {
+  const rs = computeRegimeState(symbol);
+  if (rs.trendProbability > 0.45) {
+    const prices = tickBuffers[symbol] || [];
+    const lastPrice = prices[prices.length - 1] || 0;
+    const ma50 = computeSMA(prices, 50);
+    return lastPrice > ma50 ? MarketRegime.TRENDING_UP : MarketRegime.TRENDING_DOWN;
+  }
+  if (rs.meanReversionProbability > 0.40) return MarketRegime.RANGING;
+  if (rs.volatilityExpansionProbability > 0.40) return MarketRegime.HIGH_VOL;
+  if (rs.volatilityCompressionProbability > 0.40) return MarketRegime.LOW_VOL;
+  return MarketRegime.TRANSITION;
 }
 
 // ==========================================
@@ -1981,44 +2135,396 @@ function evaluateGovernorFocus() {
   }
 }
 
-/**
- * AGENTIC GOVERNOR: Scrutinize and possibly veto or polish proposals from sub-algorithms.
- */
-function scrutinizeProposal(proposal: StrategyProposal): { approved: boolean; polishedStake: number; reasoning: string } {
-  const { symbol, direction, score, stake, conviction, reason } = proposal;
-  
-  // 1. Structural Regime Conflict Check
+function computePortfolioRiskState(): PortfolioRiskState {
+  const activeSubs = Object.values(subAlgorithms).filter(s => s.enabled);
+  if (activeSubs.length === 0) {
+    const empty: PortfolioRiskState = { totalExposure: 0, directionalBias: 0, correlationMatrix: {}, volatilityCluster: 0, entropyLevel: 0, drawdownSeverity: 0, regimeStability: 0 };
+    equityCurveState = EquityCurveState.NORMAL;
+    equityCurveThrottle = deriveEquityCurveThrottle(empty);
+    portfolioHeatState = computePortfolioHeatSnapshot();
+    return empty;
+  }
+  const longCount = activePositions.filter(p => p.direction === "LONG").length;
+  const shortCount = activePositions.filter(p => p.direction === "SHORT").length;
+  const total = longCount + shortCount || 1;
+  const directionalBias = (longCount - shortCount) / total;
+  const totalExposure = activePositions.reduce((sum, p) => sum + p.stake, 0) / (balance || 1);
+  const volScores = activeSubs.map(s => { const rs = s.regimeState; return rs ? rs.volatilityExpansionProbability : 0; });
+  const volatilityCluster = volScores.reduce((sum, v) => sum + v, 0) / (volScores.length || 1);
+  const entropyScores = activeSubs.map(s => { const rs = s.regimeState; return rs ? rs.transitionProbability : 0.5; });
+  const entropyLevel = entropyScores.reduce((sum, e) => sum + e, 0) / (entropyScores.length || 1);
+  const peak = peakBalance || balance || 1;
+  const drawdownSeverity = Math.max(0, (peak - balance) / peak);
+  const stabilityScores = activeSubs.map(s => { const rs = s.regimeState; return rs ? rs.confidence : 0.3; });
+  const regimeStability = stabilityScores.reduce((sum, c) => sum + c, 0) / (stabilityScores.length || 1);
+  const symbols = activeSubs.map(s => s.symbol);
+  const correlationMatrix: Record<string, Record<string, number>> = {};
+  for (const s1 of symbols) {
+    correlationMatrix[s1] = {};
+    const rs1 = subAlgorithms[s1]?.regimeState;
+    for (const s2 of symbols) {
+      if (s1 === s2) { correlationMatrix[s1][s2] = 1.0; }
+      else {
+        const rs2 = subAlgorithms[s2]?.regimeState;
+        if (rs1 && rs2) {
+          const sim = 1 - 0.5 * (Math.abs(rs1.trendProbability - rs2.trendProbability) + Math.abs(rs1.meanReversionProbability - rs2.meanReversionProbability) + Math.abs(rs1.transitionProbability - rs2.transitionProbability));
+          correlationMatrix[s1][s2] = parseFloat(Math.max(0, Math.min(1, sim)).toFixed(3));
+        } else { correlationMatrix[s1][s2] = 0.5; }
+      }
+    }
+  }
+  const riskState: PortfolioRiskState = {
+    totalExposure: parseFloat(totalExposure.toFixed(4)),
+    directionalBias: parseFloat(directionalBias.toFixed(3)),
+    correlationMatrix,
+    volatilityCluster: parseFloat(volatilityCluster.toFixed(4)),
+    entropyLevel: parseFloat(entropyLevel.toFixed(4)),
+    drawdownSeverity: parseFloat(drawdownSeverity.toFixed(4)),
+    regimeStability: parseFloat(regimeStability.toFixed(4)),
+  };
+
+  equityCurveThrottle = deriveEquityCurveThrottle(riskState);
+  equityCurveState = equityCurveThrottle.state;
+  const baseHeat = computePortfolioHeatSnapshot();
+  portfolioHeatState = {
+    ...baseHeat,
+    adjustedLeverageScale: parseFloat((baseHeat.adjustedLeverageScale * equityCurveThrottle.leverageScale).toFixed(4)),
+  };
+
+  return riskState;
+}
+
+function computeSignalProbability(symbol: string, direction: "LONG" | "SHORT", rsiVal: number, bbPct: number, vwapVal: number, currentPrice: number, adx: number, atr: number, isDivergent: boolean, isReversalCandle: boolean, regimeState: RegimeState, hurstVal: number, conviction: number): ExtendedSignalProbability {
+  const baseVol = INSTRUMENTS[symbol as keyof typeof INSTRUMENTS]?.volatility || 0.5;
+  const isTrendRegime = regimeState.trendProbability > 0.40;
+  const isMRRegime = regimeState.meanReversionProbability > 0.40;
+  const isTransition = regimeState.transitionProbability > 0.35;
+  let regimeCompatibility: number;
+  if (isMRRegime && !isTrendRegime) regimeCompatibility = 0.75 + 0.25 * regimeState.meanReversionProbability;
+  else if (isTrendRegime && !isMRRegime) regimeCompatibility = 0.55 + 0.25 * regimeState.trendProbability;
+  else if (isTransition) regimeCompatibility = 0.35;
+  else regimeCompatibility = 0.50;
+  const rsiExtreme = direction === "LONG" ? (rsiVal < 35 ? (35 - rsiVal) / 35 : 0) : (rsiVal > 65 ? (rsiVal - 65) / 35 : 0);
+  const bbExtreme = direction === "LONG" ? Math.max(0, 1 - bbPct) : Math.max(0, bbPct);
+  const vwapConfirm = direction === "LONG" ? (currentPrice < vwapVal ? 0.15 : -0.05) : (currentPrice > vwapVal ? 0.15 : -0.05);
+  const divergenceBonus = isDivergent ? 0.25 : 0;
+  const reversalBonus = isReversalCandle ? 0.15 : 0;
+  const rawEdge = 0.25 * rsiExtreme + 0.25 * bbExtreme + 0.10 * vwapConfirm + divergenceBonus + reversalBonus;
+  const expectedEdge = rawEdge * regimeCompatibility;
+  const regimeClarity = regimeState.confidence;
+  const hurstStability = hurstVal > 0.45 && hurstVal < 0.70 ? 0.8 : 0.5;
+  const signalStrength = Math.min(1, (rsiExtreme + bbExtreme + (isDivergent ? 0.5 : 0) + (isReversalCandle ? 0.3 : 0)) / 2);
+  const confidence = 0.35 * regimeClarity + 0.25 * hurstStability + 0.25 * conviction + 0.15 * signalStrength;
+  const volRatio = atr / (currentPrice * baseVol * 0.01);
+  const volFavorable = volRatio > 0.5 && volRatio < 2.0 ? 1 - Math.abs(volRatio - 1) : 0.3;
+  const volatilityScore = 0.5 * volFavorable + 0.3 * (1 - Math.abs(atr / (currentPrice * 0.005) - 1)) + 0.2 * (1 - regimeState.transitionProbability);
+  const tailRisk = isTransition ? 0.25 : (1 - regimeState.confidence) * 0.3 + (hurstVal < 0.45 ? 0.15 : 0);
+  const uncertainty = clamp01((1 - confidence) * (1 + regimeState.transitionProbability * 0.6) + tailRisk * 0.25);
+  const expectedHoldingTime = isTrendRegime ? 45 : isMRRegime ? 20 : 30;
+  const expectedRR = isTrendRegime ? 2.5 : isMRRegime ? 2.0 : 1.8;
+  const executionSensitivity = isMRRegime ? 0.6 : 0.35;
+  const executionQuality = deriveExecutionQualityScore();
+  return {
+    expectedEdge: parseFloat(Math.max(0, Math.min(1, expectedEdge)).toFixed(4)),
+    confidence: parseFloat(Math.max(0.1, Math.min(1, confidence)).toFixed(4)),
+    uncertainty: parseFloat(uncertainty.toFixed(4)),
+    regimeCompatibility: parseFloat(Math.max(0.1, Math.min(1, regimeCompatibility)).toFixed(4)),
+    volatilityScore: parseFloat(Math.max(0.1, Math.min(1, volatilityScore)).toFixed(4)),
+    tailRisk: parseFloat(Math.max(0, Math.min(1, tailRisk)).toFixed(4)),
+    expectedHoldingTime, expectedRR,
+    executionSensitivity: parseFloat(executionSensitivity.toFixed(4)),
+    executionQuality,
+  };
+}
+
+function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
+  const { symbol, direction, score, stake, conviction } = proposal;
   const sub = subAlgorithms[symbol];
-  if (sub.hurstVal !== undefined && sub.hurstVal < 0.52 && conviction < 0.4 && score < 3) {
-    governorMemory.vetoes++;
-    return { approved: false, polishedStake: 0, reasoning: "VETO: Weak low-confluence signal inside anti-persistent noise." };
+  const portfolioRisk = computePortfolioRiskState();
+  const regimeState = sub.regimeState || computeRegimeState(symbol);
+  const indicators = proposal.indicators || {};
+  const priceSeries = tickBuffers[symbol] || [];
+  const fallbackPrice = priceSeries[priceSeries.length - 1] || INSTRUMENTS[symbol as keyof typeof INSTRUMENTS]?.basePrice || 100;
+  const currentPrice = indicators.price ?? fallbackPrice;
+  const rsiVal = indicators.rsi ?? sub.rsiVal ?? 50;
+  const bbPct = indicators.bbPct ?? sub.bbPct ?? 0.5;
+  const vwapVal = indicators.vwapVal ?? (computeVWAP(priceSeries, 30) || currentPrice);
+  const adxVal = indicators.adx ?? sub.adxVal ?? 20;
+  const atrVal = indicators.atr ?? sub.atrVal ?? 1;
+  const isDivergent = indicators.isDivergent ?? false;
+  const isReversalCandle = indicators.isReversalCandle ?? false;
+
+  const signalProfile = indicators.signalProbability || computeSignalProbability(
+    symbol, direction, rsiVal, bbPct, vwapVal, currentPrice,
+    adxVal, atrVal, isDivergent, isReversalCandle, regimeState, sub.hurstVal || 0.5, conviction
+  );
+  sub.lastSignalProbability = signalProfile;
+
+  const prior = INSTRUMENT_PRIORS[symbol] || { confidence: 0.5, expectedEdge: 0.45, sharpe: 0.5 };
+  const recentWeight = Math.min(1, (sub.totalTrades || 0) / 40);
+  const baselineWeight = 1 - recentWeight;
+  const blendedConfidence = parseFloat((signalProfile.confidence * recentWeight + prior.confidence * baselineWeight).toFixed(4));
+  const blendedEdge = parseFloat((signalProfile.expectedEdge * recentWeight + prior.expectedEdge * baselineWeight).toFixed(4));
+
+  const instantUncertainty: UncertaintyState = {
+    epistemicUncertainty: clamp01(1 - signalProfile.confidence),
+    marketUncertainty: clamp01(regimeState.transitionProbability * 0.6 + portfolioRisk.volatilityCluster * 0.4),
+    modelConfidence: clamp01(0.5 * signalProfile.confidence + 0.5 * (1 - signalProfile.uncertainty)),
+    regimeStability: clamp01(1 - regimeState.transitionProbability * 0.6 - portfolioRisk.entropyLevel * 0.4),
+  };
+  uncertaintyState = {
+    epistemicUncertainty: parseFloat((uncertaintyState.epistemicUncertainty * 0.7 + instantUncertainty.epistemicUncertainty * 0.3).toFixed(4)),
+    marketUncertainty: parseFloat((uncertaintyState.marketUncertainty * 0.7 + instantUncertainty.marketUncertainty * 0.3).toFixed(4)),
+    modelConfidence: parseFloat((uncertaintyState.modelConfidence * 0.6 + instantUncertainty.modelConfidence * 0.4).toFixed(4)),
+    regimeStability: parseFloat((uncertaintyState.regimeStability * 0.6 + instantUncertainty.regimeStability * 0.4).toFixed(4)),
+  };
+
+  const uncertaintyAdjustedEdge = parseFloat((blendedEdge * blendedConfidence * uncertaintyState.regimeStability).toFixed(4));
+  const executionAdjustedEdge = parseFloat((uncertaintyAdjustedEdge * signalProfile.executionQuality).toFixed(4));
+
+  const isTrendRegime = regimeState.trendProbability > 0.40;
+  const isMRRegime = regimeState.meanReversionProbability > 0.40;
+  const isTransition = regimeState.transitionProbability > 0.35;
+  let transitionPenalty = 0;
+  if (isTransition) transitionPenalty = 0.30 + (regimeState.transitionProbability - 0.35) * 0.45;
+  else if (isTrendRegime && executionAdjustedEdge < 0.35) transitionPenalty = 0.18;
+  else if (isMRRegime && sub.hurstVal && sub.hurstVal > 0.60) transitionPenalty = 0.16;
+  transitionPenalty = Math.min(0.45, Math.max(0, transitionPenalty));
+
+  let correlationPenalty = 0;
+  const sameDirection = activePositions.filter(p => p.direction === direction).length;
+  if (sameDirection >= 2) correlationPenalty = 0.12 * sameDirection;
+  for (const pos of activePositions) {
+    const posSub = subAlgorithms[pos.symbol];
+    if (posSub?.regimeState && regimeState) {
+      const regimeOverlap = 1 - 0.5 * (Math.abs(regimeState.trendProbability - (posSub.regimeState.trendProbability || 0)) + Math.abs(regimeState.transitionProbability - (posSub.regimeState.transitionProbability || 0)));
+      if (regimeOverlap > 0.7 && pos.direction === direction) correlationPenalty += 0.08;
+    }
+  }
+  correlationPenalty = Math.min(0.45, correlationPenalty);
+
+  let volatilityPenalty = 0;
+  if (portfolioRisk.volatilityCluster > 0.50) volatilityPenalty = 0.15 + (portfolioRisk.volatilityCluster - 0.50) * 0.45;
+  if (regimeState.volatilityExpansionProbability > 0.55) volatilityPenalty += 0.12;
+  volatilityPenalty = Math.min(0.40, volatilityPenalty);
+
+  let uncertaintyPenalty = 0;
+  if (portfolioRisk.entropyLevel > 0.40) uncertaintyPenalty = 0.10 + (portfolioRisk.entropyLevel - 0.40) * 0.9;
+  if (uncertaintyState.marketUncertainty > 0.55) uncertaintyPenalty += 0.15;
+  if (signalProfile.uncertainty > 0.55) uncertaintyPenalty += (signalProfile.uncertainty - 0.55) * 0.55;
+  uncertaintyPenalty = Math.min(0.55, uncertaintyPenalty);
+
+  let executionPenalty = 0;
+  if (portfolioRisk.drawdownSeverity > 0.02) executionPenalty = 0.10 + portfolioRisk.drawdownSeverity * 1.8;
+  if (signalProfile.executionQuality < 0.55) executionPenalty += (0.55 - signalProfile.executionQuality) * 0.6;
+  executionPenalty = Math.min(0.40, executionPenalty);
+
+  const candidateHeat = computePortfolioHeatSnapshot({ symbol, stake, direction });
+  const heatPenalty = Math.max(0, candidateHeat.totalHeat - equityCurveThrottle.portfolioHeatCap);
+
+  const baseConfidence = Math.min(1, blendedConfidence * (0.7 + 0.3 * executionAdjustedEdge));
+  const totalPenalty = Math.min(0.85, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9);
+  const finalConfidence = parseFloat(Math.max(0.05, baseConfidence * (1 - totalPenalty)).toFixed(4));
+
+  let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
+  if (finalConfidence >= Math.max(0.6, equityCurveThrottle.confidenceThreshold + 0.15) && executionAdjustedEdge >= 0.45) confidenceTier = ConfidenceTier.HIGH;
+  else if (finalConfidence >= Math.max(0.48, equityCurveThrottle.confidenceThreshold + 0.05)) confidenceTier = ConfidenceTier.MEDIUM;
+  else if (finalConfidence >= equityCurveThrottle.confidenceThreshold) confidenceTier = ConfidenceTier.LOW;
+  if (signalProfile.uncertainty > 0.85 || transitionPenalty > 0.45 || heatPenalty > 0.35) confidenceTier = ConfidenceTier.REJECT;
+
+  const rejectionReasons: string[] = [];
+  if (confidenceTier === ConfidenceTier.REJECT) {
+    if (finalConfidence < equityCurveThrottle.confidenceThreshold) rejectionReasons.push("low_confidence");
+    if (signalProfile.uncertainty > 0.75) rejectionReasons.push("extreme_uncertainty");
+    if (transitionPenalty > 0.4) rejectionReasons.push("regime_transition");
+    if (correlationPenalty > 0.35) rejectionReasons.push("correlation_cluster");
+    if (volatilityPenalty > 0.35) rejectionReasons.push("volatility_cluster");
+    if (executionPenalty > 0.3) rejectionReasons.push("execution_drawdown");
+    if (heatPenalty > 0.25) rejectionReasons.push("portfolio_heat");
   }
 
-  // 2. Correlation & Exposure Gating
-  const directionExposure = activePositions.filter(p => p.direction === direction).length;
-  if (directionExposure >= 2 && score < 5) {
-    governorMemory.vetoes++;
-    return { approved: false, polishedStake: 0, reasoning: `VETO: Strategic exposure limit reached for ${direction} bias. Awaiting higher confluence.` };
+  const tierScale = confidenceTier === ConfidenceTier.HIGH ? 1
+    : confidenceTier === ConfidenceTier.MEDIUM ? 0.72
+    : confidenceTier === ConfidenceTier.LOW ? 0.45
+    : 0;
+
+  let adjustedRisk = stake * equityCurveThrottle.tradeAggressiveness * finalConfidence * tierScale;
+  adjustedRisk *= candidateHeat.adjustedLeverageScale;
+  adjustedRisk *= equityCurveThrottle.leverageScale;
+  if (heatPenalty > 0) {
+    adjustedRisk *= Math.max(0.25, 1 - heatPenalty * 1.6);
   }
+  if (symbol === governorFocusSymbol && finalConfidence > 0.60 && portfolioRisk.entropyLevel < 0.35) adjustedRisk *= 1.20;
+  if (portfolioRisk.drawdownSeverity > 0.015) adjustedRisk *= 0.68;
+  adjustedRisk = parseFloat(Math.max(0, Math.min(stake, adjustedRisk)).toFixed(2));
 
-  // 3. Selective Leverage Polishing (Agentic Autonomy)
-  let finalStake = stake;
-  let logic = "Approved as proposed.";
+  const expectedSharpeImpact = parseFloat(Math.max(-1, Math.min(1,
+    (executionAdjustedEdge - 0.45) * 1.6 - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65
+  )).toFixed(4));
 
-  // Governor Logic: If conviction is ultra-high (>0.85) AND it's the focus symbol, BOOST the trade.
-  if (symbol === governorFocusSymbol && conviction > 0.85 && score >= 4) {
-    finalStake *= 1.35;
-    logic = "POLISHED: Ultra-high conviction detected on focus instrument. Applied 1.35x strategic boost.";
+  const approved = confidenceTier !== ConfidenceTier.REJECT && adjustedRisk > 0;
+  const riskFloorBase = confidenceTier === ConfidenceTier.HIGH ? 0.35 : confidenceTier === ConfidenceTier.MEDIUM ? 0.20 : confidenceTier === ConfidenceTier.LOW ? 0.08 : 0;
+  const riskFloor = parseFloat((riskFloorBase * equityCurveThrottle.tradeAggressiveness).toFixed(2));
+  const finalRisk = approved ? Math.max(riskFloor, adjustedRisk) : 0;
+
+  if (signalProfile.expectedEdge >= 0.45 && blendedConfidence >= equityCurveThrottle.confidenceThreshold) {
+    opportunityDensityMetrics.totalHighQualityOpportunities += 1;
+    if (approved) opportunityDensityMetrics.capturedHighQualityTrades += 1;
+    else opportunityDensityMetrics.falseNegativeRejections += 1;
+  } else if (approved && signalProfile.expectedEdge < 0.35) {
+    opportunityDensityMetrics.falsePositiveApprovals += 1;
   }
+  const oppTotal = Math.max(1, opportunityDensityMetrics.totalHighQualityOpportunities);
+  opportunityDensityMetrics.opportunityDensity = parseFloat((opportunityDensityMetrics.capturedHighQualityTrades / oppTotal).toFixed(4));
+  opportunityDensityMetrics.avgExpectedSharpeContribution = parseFloat(((opportunityDensityMetrics.avgExpectedSharpeContribution * (oppTotal - 1) + expectedSharpeImpact) / oppTotal).toFixed(4));
+  opportunityDensityMetrics.varianceAdjustedExpectancy = parseFloat((executionAdjustedEdge - uncertaintyPenalty * 0.5).toFixed(4));
 
-  // Double Vetting for "Elite" trades
-  if (score === 5 && conviction > 0.75) {
-    logic = "ELITE_CO_SIGNED: Structural fractal alignment meets supreme Governor criteria.";
+  if (approved) governorMemory.approvals++;
+  else governorMemory.vetoes++;
+
+  governorMemory.lastInsight = `Tier: ${confidenceTier} | Conf: ${(finalConfidence * 100).toFixed(0)}% | Risk: $${finalRisk.toFixed(2)} | Heat: ${(candidateHeat.totalHeat * 100).toFixed(0)}% | Equity State: ${equityCurveState}`;
+
+  return {
+    approved,
+    confidenceTier,
+    finalConfidence,
+    allocatedRisk: finalRisk,
+    adjustedLeverage: parseFloat((equityCurveThrottle.leverageScale * candidateHeat.adjustedLeverageScale).toFixed(4)),
+    expectedEdge: blendedEdge,
+    uncertaintyAdjustedEdge,
+    executionAdjustedEdge,
+    expectedSharpeImpact,
+    correlationPenalty: parseFloat(correlationPenalty.toFixed(3)),
+    volatilityPenalty: parseFloat(volatilityPenalty.toFixed(3)),
+    executionPenalty: parseFloat(executionPenalty.toFixed(3)),
+    uncertaintyPenalty: parseFloat(uncertaintyPenalty.toFixed(3)),
+    transitionPenalty: parseFloat(transitionPenalty.toFixed(3)),
+    heatPenalty: parseFloat(heatPenalty.toFixed(3)),
+    equityCurveState,
+    rejectionReasons: rejectionReasons.length ? rejectionReasons : undefined,
+  };
+}
+
+// ==========================================
+// PHASE 2: VOLATILITY FORECASTING ENGINE
+// ==========================================
+const volForecastState: Record<string, { ewma: number; lastShock: number }> = {};
+
+function forecastVolatility(symbol: string): VolatilityForecast {
+  const prices = tickBuffers[symbol] || [];
+  if (prices.length < 20) return { nextPeriodVolatility: 0.01, volatilityTrend: 0, volatilityShockProbability: 0.05, confidence: 0.3 };
+  const returns: number[] = [];
+  for (let i = 1; i < prices.length; i++) returns.push(Math.log(prices[i] / prices[i - 1]));
+  const variance = returns.reduce((s, r) => s + r * r, 0) / returns.length;
+  const realizedVol = Math.sqrt(Math.max(1e-10, variance));
+  if (!volForecastState[symbol]) volForecastState[symbol] = { ewma: realizedVol, lastShock: 0 };
+  const st = volForecastState[symbol];
+  st.ewma = 0.94 * st.ewma + 0.06 * realizedVol;
+  const recentVol = Math.sqrt(returns.slice(-10).reduce((s, r) => s + r * r, 0) / Math.min(10, returns.length));
+  const shockRatio = recentVol / (st.ewma || 1e-10);
+  const shockProb = 1 / (1 + Math.exp(-8 * (shockRatio - 1.8)));
+  const volTrend = (st.ewma - realizedVol) / (st.ewma || 1e-10);
+  const confidence = shockRatio < 2.5 ? 0.7 : Math.max(0.3, 0.7 - (shockRatio - 2.5) * 0.3);
+  if (shockRatio > 2.0) st.lastShock = Date.now();
+  return { nextPeriodVolatility: parseFloat(st.ewma.toFixed(6)), volatilityTrend: parseFloat(volTrend.toFixed(4)), volatilityShockProbability: parseFloat(shockProb.toFixed(4)), confidence: parseFloat(confidence.toFixed(4)) };
+}
+
+// ==========================================
+// PHASE 2: DISTRIBUTION ANALYTICS
+// ==========================================
+function computeDistributionStats(trades: TradeRecord[]): DistributionStats {
+  if (trades.length < 5) return { skewness: 0, kurtosis: 0, varianceClustering: 0, avgConsecutiveLosses: 0, avgDrawdownDuration: 0, recoveryFactor: 1, regimeSharpe: {}, regimeExpectancy: {}, tailRiskExposure: 0 };
+  const pnls = trades.map(t => t.pnl);
+  const mean = pnls.reduce((s, p) => s + p, 0) / pnls.length;
+  const std = Math.sqrt(pnls.reduce((s, p) => s + (p - mean) ** 2, 0) / pnls.length) || 1;
+  const skewness = pnls.reduce((s, p) => s + ((p - mean) / std) ** 3, 0) / pnls.length;
+  const kurtosis = pnls.reduce((s, p) => s + ((p - mean) / std) ** 4, 0) / pnls.length - 3;
+  let run = 0, maxRun = 0, totalRuns = 0, runs = 0;
+  for (const p of pnls) { if (p < 0) { run++; maxRun = Math.max(maxRun, run); } else { if (run > 0) { totalRuns += run; runs++; } run = 0; } }
+  if (run > 0) { totalRuns += run; runs++; }
+  const avgConsecutiveLosses = runs > 0 ? totalRuns / runs : 0;
+  const half = Math.floor(pnls.length / 2);
+  const v1 = pnls.slice(0, half).reduce((s, p) => s + (p - mean) ** 2, 0) / half;
+  const v2 = pnls.slice(half).reduce((s, p) => s + (p - mean) ** 2, 0) / (pnls.length - half);
+  const varianceClustering = v1 > 0 ? Math.abs(v2 - v1) / v1 : 0;
+  const regimeSharpe: Record<string, number> = {};
+  const regimeExpectancy: Record<string, number> = {};
+  const groups: Record<string, number[]> = {};
+  for (const t of trades) { const r = t.regimeAtEntry; if (!groups[r]) groups[r] = []; groups[r].push(t.pnl); }
+  for (const [regime, rp] of Object.entries(groups)) {
+    const rm = rp.reduce((s, p) => s + p, 0) / rp.length;
+    const rs = Math.sqrt(rp.reduce((s, p) => s + (p - rm) ** 2, 0) / rp.length) || 1;
+    regimeExpectancy[regime] = parseFloat(rm.toFixed(2));
+    regimeSharpe[regime] = parseFloat((rm / rs).toFixed(3));
   }
+  const tailRiskExposure = pnls.filter(p => p < -2 * std).length / pnls.length;
+  const totalGain = pnls.filter(p => p > 0).reduce((s, p) => s + p, 0);
+  const totalLoss = pnls.filter(p => p < 0).reduce((s, p) => s + Math.abs(p), 0);
+  const recoveryFactor = totalLoss > 0 ? parseFloat((totalGain / totalLoss).toFixed(3)) : 999;
+  return { skewness: parseFloat(skewness.toFixed(4)), kurtosis: parseFloat(kurtosis.toFixed(4)), varianceClustering: parseFloat(varianceClustering.toFixed(4)), avgConsecutiveLosses: parseFloat(avgConsecutiveLosses.toFixed(2)), avgDrawdownDuration: maxRun, recoveryFactor, regimeSharpe, regimeExpectancy, tailRiskExposure: parseFloat(tailRiskExposure.toFixed(4)) };
+}
 
-  governorMemory.approvals++;
-  governorMemory.lastInsight = logic;
-  return { approved: true, polishedStake: finalStake, reasoning: logic };
+// ==========================================
+// PHASE 2: REGIME-ADAPTIVE EXIT ENGINE
+// ==========================================
+function computeAdaptiveExitParams(regimeState: RegimeState, hurstVal: number): { stopMultiplier: number; tpMultiplier: number; maxTicks: number; useTrailing: boolean } {
+  const isTrend = regimeState.trendProbability > 0.45;
+  const isMR = regimeState.meanReversionProbability > 0.40;
+  const isTransition = regimeState.transitionProbability > 0.35;
+  if (isTransition) return { stopMultiplier: 1.5, tpMultiplier: 1.5, maxTicks: 25, useTrailing: false };
+  if (isTrend && !isMR) return { stopMultiplier: 3.0, tpMultiplier: 3.5, maxTicks: 75, useTrailing: true };
+  if (isMR && !isTrend) return { stopMultiplier: 1.8, tpMultiplier: 2.0, maxTicks: 30, useTrailing: false };
+  return { stopMultiplier: 2.2, tpMultiplier: 2.5, maxTicks: 45, useTrailing: hurstVal > 0.55 };
+}
+
+// ==========================================
+// PHASE 2: STATISTICAL FEATURE STORE
+// ==========================================
+const featureStore: Record<string, FeatureSnapshot[]> = {};
+const MAX_FEATURE_HISTORY = 500;
+
+function recordFeatureSnapshot(symbol: string, price: number, rsi: number, bbPct: number, adx: number, atr: number, hurst: number, conviction: number, regimeState: RegimeState, volForecast: VolatilityForecast, epoch: number) {
+  if (!featureStore[symbol]) featureStore[symbol] = [];
+  featureStore[symbol].push({ epoch, symbol, price, rsi, bbPct, adx, atr, hurst, conviction, regimeState, volatilityForecast: volForecast });
+  if (featureStore[symbol].length > MAX_FEATURE_HISTORY) featureStore[symbol] = featureStore[symbol].slice(-MAX_FEATURE_HISTORY);
+}
+
+function computeInstrumentStats(symbol: string): InstrumentStats {
+  const trades = completedTrades.filter(t => t.symbol === symbol);
+  const wins = trades.filter(t => t.pnl > 0);
+  const totalTrades = trades.length;
+  const winningTrades = wins.length;
+  const winRate = totalTrades > 0 ? winningTrades / totalTrades : 0;
+  const totalPnl = trades.reduce((s, t) => s + t.pnl, 0);
+  const expectancy = totalTrades > 0 ? totalPnl / totalTrades : 0;
+  const pnls = trades.map(t => t.pnl);
+  const meanPnl = pnls.length > 0 ? pnls.reduce((s, p) => s + p, 0) / pnls.length : 0;
+  const stdPnl = pnls.length > 1 ? Math.sqrt(pnls.reduce((s, p) => s + (p - meanPnl) ** 2, 0) / pnls.length) : 1;
+  const sharpeRatio = stdPnl > 0 ? meanPnl / stdPnl : 0;
+  const downPnls = pnls.filter(p => p < 0);
+  const downStd = downPnls.length > 1 ? Math.sqrt(downPnls.reduce((s, p) => s + (p - meanPnl) ** 2, 0) / downPnls.length) : 1;
+  const sortinoRatio = downStd > 0 ? meanPnl / downStd : 0;
+  let peak = 0, maxDd = 0, running = 0;
+  for (const p of pnls) { running += p; peak = Math.max(peak, running); maxDd = Math.max(maxDd, peak - running); }
+  const durations = trades.map(t => t.exitEpoch - t.entryEpoch).filter(d => d > 0 && d < 86400);
+  const avgHoldingTime = durations.length > 0 ? durations.reduce((s, d) => s + d, 0) / durations.length : 0;
+  const bestTrade = pnls.length > 0 ? Math.max(...pnls) : 0;
+  const worstTrade = pnls.length > 0 ? Math.min(...pnls) : 0;
+  const totalGain = pnls.filter(p => p > 0).reduce((s, p) => s + p, 0);
+  const totalLoss = pnls.filter(p => p < 0).reduce((s, p) => s + Math.abs(p), 0);
+  const profitFactor = totalLoss > 0 ? totalGain / totalLoss : totalGain > 0 ? 999 : 0;
+  const recoveryFactor = totalLoss > 0 ? totalGain / totalLoss : 999;
+  const regimePerformance: Record<string, { trades: number; wins: number; pnl: number; expectancy: number }> = {};
+  for (const t of trades) {
+    const r = t.regimeAtEntry;
+    if (!regimePerformance[r]) regimePerformance[r] = { trades: 0, wins: 0, pnl: 0, expectancy: 0 };
+    regimePerformance[r].trades++;
+    if (t.pnl > 0) regimePerformance[r].wins++;
+    regimePerformance[r].pnl += t.pnl;
+    regimePerformance[r].expectancy = regimePerformance[r].trades > 0 ? regimePerformance[r].pnl / regimePerformance[r].trades : 0;
+  }
+  const distribution = computeDistributionStats(trades);
+  return { symbol, totalTrades, winningTrades, winRate, totalPnl, expectancy, sharpeRatio: parseFloat(sharpeRatio.toFixed(4)), sortinoRatio: parseFloat(sortinoRatio.toFixed(4)), maxDrawdown: parseFloat(maxDd.toFixed(2)), avgHoldingTime: parseFloat(avgHoldingTime.toFixed(1)), bestTrade: parseFloat(bestTrade.toFixed(2)), worstTrade: parseFloat(worstTrade.toFixed(2)), profitFactor: parseFloat(profitFactor.toFixed(3)), recoveryFactor: parseFloat(recoveryFactor.toFixed(3)), regimePerformance, distribution, featureHistory: featureStore[symbol] || [] };
 }
 
 function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: number) {
@@ -2041,6 +2547,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const vwapVal = computeVWAP(prices, 30);
   const { atr, adx } = computeATRAndADX(candles, 14);
   const currentRegime = detectRegime(symbol);
+  const regimeState = computeRegimeState(symbol);
+  sub.regimeState = regimeState;
 
   // Update real-time properties for UI live charts
   sub.rsiVal = parseFloat(rsiVal.toFixed(2));
@@ -2134,105 +2642,68 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   // Accumulate RSI array for divergence checks
   const dRsiArr = prices.slice(-100).map((_, i, arr) => computeRSI(prices.slice(-100).slice(0, i + 1), 14));
 
-  // 6. Evaluate Signals (Dynamic SFT-V2 Fractal Strategy with Mean-Fader Fallback)
-  let triggerTrade = false;
-  let direction: "LONG" | "SHORT" = "LONG";
-  let score = 0;
-  let conditionsList: string[] = [];
-
+  // 6. Evaluate Signals via continuous probabilities
   const isPersistentRegime = hMicro >= 0.65 && hMeso >= 0.62 && rsMacroH >= 0.60 && rSqr >= 0.92;
 
-  if (isPersistentRegime) {
-    // SFT-V2 Fractal Pursuit Entry (Trend-following inside persistent memory corridors)
-    // Calibration: Require ADX > 25 for Trend Following
-    if (adx < 25) {
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_REGIME] 🚫 Trend signal ignored. ADX (${adx.toFixed(1)}) < 25 requirement for persistence corridor.`);
-      return;
-    }
-    const isLocalBull = currentPrice > kamaLocal;
-    const isHigherBull = currentPrice > smaHigher;
-    
-    if (isLocalBull === isHigherBull) {
-      triggerTrade = true;
-      direction = isLocalBull ? "LONG" : "SHORT";
-      score = 5; // Elite level persistence score
-      conditionsList = ["SFT_V2_FRACTAL", "KAMA_LOCAL", "SMA_HIGHER", "PERS_CONFIRM"];
-      logs.push(`[SFT_V2_TACTICAL] 🌪️ Fractal Persistence detected on ${symbol} (H_μ: ${hMicro.toFixed(2)}, H_m: ${hMeso.toFixed(2)}, H_M: ${rsMacroH.toFixed(2)}). Local KAMA and Higher SMA aligned in ${direction} direction. Active Conviction Score: ${(conviction * 100).toFixed(1)}%.`);
-    } else {
-      // Timeframe conflict in a persistent regime; standard mean reversion is dangerous, stand-by
-      if (Math.random() < 0.05) {
-        logs.push(`[SFT_V2_STANDBY] ⚠️ High persistence on ${symbol} but timeframe conflict detected (Local Bull: ${isLocalBull}, MTF Bull: ${isHigherBull}). Standby to avoid chops.`);
-      }
-    }
-  } else {
-    // FALLBACK: Standard Mean-Fader signals for stationary/random-walk regimes
-    const highAdxMeanReversionPenalty = adx > 45 ? 1 : 0;
-    if (highAdxMeanReversionPenalty && Math.random() < 0.05) {
-      logs.push(`[SFT_V2_REGIME] ⚠️ High ADX (${adx.toFixed(1)}) detected. Mean Reversion requires stronger confluence instead of being hard-blocked.`);
-    }
-    const isOversold = currentPrice <= lower;
-    const isRsiOversoldRange = rsiVal <= sub.rsiOversoldThreshold;
-    const isBelowVwap = currentPrice < vwapVal;
-    const isBullDivergent = checkDivergence(prices, dRsiArr, "BULLISH");
-    const isBullReversalPattern = checkReversalCandle(candles);
+  const bbRange = upper - lower || 1;
+  const meanReversionIntensity = clamp01((directionalDistance(currentPrice, lower, upper, "MR") + clamp01((sub.rsiOversoldThreshold - rsiVal) / sub.rsiOversoldThreshold)) / 2);
+  const breakoutAlignment = clamp01(Math.abs(currentPrice - kamaLocal) / Math.max(1e-6, Math.abs(smaHigher - kamaLocal)));
 
-    const longScore = (isOversold ? 1 : 0) + 
-                      (isRsiOversoldRange ? 1 : 0) + 
-                      (isBelowVwap ? 1 : 0) + 
-                      (isBullDivergent ? 1 : 0) + 
-                      (isBullReversalPattern ? 1 : 0);
+  const oversoldIntensity = clamp01((lower - Math.min(currentPrice, lower)) / bbRange);
+  const overboughtIntensity = clamp01((Math.max(currentPrice, upper) - upper) / bbRange);
+  const rsiLongFavor = clamp01((sub.rsiOversoldThreshold - rsiVal) / sub.rsiOversoldThreshold);
+  const rsiShortFavor = clamp01((rsiVal - sub.rsiOverboughtThreshold) / (100 - sub.rsiOverboughtThreshold));
+  const vwapDelta = vwapVal !== 0 ? (currentPrice - vwapVal) / vwapVal : 0;
+  const vwapLongFavor = clamp01(-vwapDelta * 3);
+  const vwapShortFavor = clamp01(vwapDelta * 3);
+  const divergenceBoostLong = checkDivergence(prices, dRsiArr, "BULLISH") ? 0.45 : 0;
+  const divergenceBoostShort = checkDivergence(prices, dRsiArr, "BEARISH") ? 0.45 : 0;
+  const reversalBoostLong = checkReversalCandle(candles) ? 0.25 : 0;
+  const reversalBoostShort = reversalBoostLong;
 
-    const isOverbought = currentPrice >= upper;
-    const isRsiOverboughtRange = rsiVal >= sub.rsiOverboughtThreshold;
-    const isAboveVwap = currentPrice > vwapVal;
-    const isBearDivergent = checkDivergence(prices, dRsiArr, "BEARISH");
-    const isBearReversalPattern = checkReversalCandle(candles);
+  const longStrengthRaw =
+    (isPersistentRegime ? clamp01((kamaLocal < currentPrice && smaHigher < currentPrice ? 0.75 + breakoutAlignment * 0.25 : 0.35)) : 0) * 0.35 +
+    oversoldIntensity * 0.25 +
+    rsiLongFavor * 0.18 +
+    vwapLongFavor * 0.15 +
+    divergenceBoostLong * 0.4 +
+    reversalBoostLong * 0.3 +
+    meanReversionIntensity * 0.2;
 
-    const shortScore = (isOverbought ? 1 : 0) + 
-                       (isRsiOverboughtRange ? 1 : 0) + 
-                       (isAboveVwap ? 1 : 0) + 
-                       (isBearDivergent ? 1 : 0) + 
-                       (isBearReversalPattern ? 1 : 0);
+  const shortStrengthRaw =
+    (isPersistentRegime ? clamp01((kamaLocal > currentPrice && smaHigher > currentPrice ? 0.75 + breakoutAlignment * 0.25 : 0.35)) : 0) * 0.35 +
+    overboughtIntensity * 0.25 +
+    rsiShortFavor * 0.18 +
+    vwapShortFavor * 0.15 +
+    divergenceBoostShort * 0.4 +
+    reversalBoostShort * 0.3 +
+    meanReversionIntensity * 0.2;
 
-    // Audit Fix #3: Implement Dynamic Confluence Scaling
-    // Automatically scale down the required confluence criteria to (N-1) during high-volatility regimes (ADX > 30)
-    let dynamicMinConfluence = sub.minConfluenceScore;
-    if (adx > 45) {
-      dynamicMinConfluence = Math.min(5, sub.minConfluenceScore + highAdxMeanReversionPenalty);
-      if (Math.random() < 0.05) logs.push(`[SFT_V2_DYNAMIC] ⚖️ High momentum detected (ADX: ${adx.toFixed(1)}). Scaling mean-reversion confluence from ${sub.minConfluenceScore} up to ${dynamicMinConfluence}.`);
-    }
+  const longStrength = clamp01(longStrengthRaw);
+  const shortStrength = clamp01(shortStrengthRaw);
+  const direction: "LONG" | "SHORT" = longStrength >= shortStrength ? "LONG" : "SHORT";
+  const signalStrength = direction === "LONG" ? longStrength : shortStrength;
+  const signalDelta = longStrength - shortStrength;
 
-    sub.confluenceScore = Math.max(longScore, shortScore);
-
-    if (longScore >= dynamicMinConfluence) {
-      triggerTrade = true;
-      direction = "LONG";
-      score = longScore;
-      if (isOversold) conditionsList.push("BB_OVERSOLD");
-      if (isRsiOversoldRange) conditionsList.push("RSI_OVERSOLD_ZONE");
-      if (isBelowVwap) conditionsList.push("BELOW_VWAP");
-      if (isBullDivergent) conditionsList.push("BULLISH_DIVERG");
-      if (isBullReversalPattern) conditionsList.push("REVERSAL_CANDLE");
-    } else if (shortScore >= dynamicMinConfluence) {
-      triggerTrade = true;
-      direction = "SHORT";
-      score = shortScore;
-      if (isOverbought) conditionsList.push("BB_OVERBOUGHT");
-      if (isRsiOverboughtRange) conditionsList.push("RSI_OVERBOUGHT_ZONE");
-      if (isAboveVwap) conditionsList.push("ABOVE_VWAP");
-      if (isBearDivergent) conditionsList.push("BEARISH_DIVERG");
-      if (isBearReversalPattern) conditionsList.push("REVERSAL_CANDLE");
-    }
+  const conditionsList: string[] = [];
+  if (signalStrength > 0.4) {
+    if ((direction === "LONG" ? oversoldIntensity : overboughtIntensity) > 0.2) conditionsList.push(direction === "LONG" ? "BB_OVERSHOOT" : "BB_EXHAUSTION");
+    if ((direction === "LONG" ? rsiLongFavor : rsiShortFavor) > 0.2) conditionsList.push("RSI_IMBAL");
+    if ((direction === "LONG" ? vwapLongFavor : vwapShortFavor) > 0.2) conditionsList.push("VWAP_DISLOC");
+    if ((direction === "LONG" ? divergenceBoostLong : divergenceBoostShort) > 0.1) conditionsList.push("DIVERGENCE_CONF");
+    if (isPersistentRegime) conditionsList.push("PERSISTENT_HURST");
   }
 
   const tickEffMode = getEffectiveTradeType();
+  const score = Math.round(signalStrength * 10);
 
-  if (triggerTrade) {
-    logs.push(`[DEBUG_TRIGGER] triggerTrade=${triggerTrade}, tradingEnabled=${tradingEnabled}, symbol=${symbol}, score=${score}, direction=${direction}`);
+  const minActivation = Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
+  if (signalStrength < minActivation) {
+    sub.confluenceScore = score;
+    return;
   }
 
-  // 7. Execute Transaction Order Proposal
-  if (triggerTrade && tradingEnabled) {
+  if (tradingEnabled) {
     logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}`);
     // ----------------------------------------------------
     // MITIGATION: Extra filtration based on contract mode
@@ -2279,20 +2750,27 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       effMode: tickEffMode as any,
       conviction: cScore,
       reason: conditionsList.join(", "),
-      indicators: { rsi: rsiVal, adx, hurst: sub.hurstVal }
+      indicators: {
+        rsi: rsiVal,
+        adx,
+        atr,
+        bbPct: currentPrice > 0 ? Math.max(0, Math.min(1, (currentPrice - lower) / (upper - lower || 1))) : 0.5,
+        vwapVal,
+        price: currentPrice,
+        isDivergent: direction === "LONG" ? checkDivergence(prices, dRsiArr, "BULLISH") : checkDivergence(prices, dRsiArr, "BEARISH"),
+        isReversalCandle: checkReversalCandle(candles),
+      }
     };
 
     const auditRes = scrutinizeProposal(proposal);
     if (!auditRes.approved) {
-      logs.push(`[GOVERNOR_VETO] 🛡️ Sector Audit failed for ${symbol} signal. Reason: ${auditRes.reasoning}`);
+      logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} REJECTED [${auditRes.confidenceTier}] conf=${(auditRes.finalConfidence*100).toFixed(0)}% transition=${(auditRes.transitionPenalty*100).toFixed(0)}% corr=${(auditRes.correlationPenalty*100).toFixed(0)}% vol=${(auditRes.volatilityPenalty*100).toFixed(0)}% reasons=${(auditRes.rejectionReasons||[]).join(",")}`);
       return;
     }
     
     // Apply polished parameters from Governor (Agentic autonomy in action)
-    stake = auditRes.polishedStake;
-    if (auditRes.reasoning.includes("POLISHED") || auditRes.reasoning.includes("ELITE")) {
-      logs.push(`[GOVERNOR_AGENT] 🖋️ ${auditRes.reasoning}`);
-    }
+    stake = auditRes.allocatedRisk;
+    logs.push(`[GOVERNOR_AGENT] ✅ ${symbol} APPROVED [${auditRes.confidenceTier}] conf=${(auditRes.finalConfidence*100).toFixed(0)}% edge=${(auditRes.expectedEdge*100).toFixed(0)}% sharpeΔ=${auditRes.expectedSharpeImpact.toFixed(3)} risk=$${auditRes.allocatedRisk}`);
 
     logs.push(`[TRACE] Final stake approved: amount=${stake}, balance=${balance}`);
 
@@ -2388,6 +2866,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
       isFractalTrend: isPersistentRegime,
+      maxTicksOverride: Math.max(15, Math.ceil((auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
+        : auditRes.confidenceTier === ConfidenceTier.MEDIUM ? sub.maxTicksInTrade * 0.85
+        : sub.maxTicksInTrade * 0.65) * equityCurveThrottle.maxPositionDurationScale)),
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
@@ -2416,7 +2897,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       return;
     }
     logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal. Pending local position ${positionId} awaiting buy confirmation.`);
-    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Elite: ${auditRes.reasoning.includes("ELITE")}]`);
+    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
 }
@@ -2865,7 +3346,7 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
 
     // Maximum ticks limit reached based on sub-algorithm customizable safety guidelines
     const isTimeExitEnabled = subAlg ? subAlg.timeExitEnabled : true;
-    const limitTicks = subAlg ? subAlg.maxTicksInTrade : currentParams.maxTicksInTrade;
+    const limitTicks = pos.maxTicksOverride ?? (subAlg ? subAlg.maxTicksInTrade : currentParams.maxTicksInTrade);
 
     if (!exitTriggered && isTimeExitEnabled && pos.ticksElapsed >= limitTicks) {
       exitTriggered = true;
@@ -2991,7 +3472,17 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     conditionsMet: pos.entryConditions && pos.entryConditions.length > 0 ? pos.entryConditions : (pos.direction === "LONG" ? ["OVER_OVERSOLD"] : ["OVER_OVERBOUGHT"]),
     maxAdverseExcursion: pos.maxAdverseExcursion ?? 0,
     derivCloseConfirmed,
+    derivedSharpeContribution: parseFloat((finalPnl / Math.max(1, Math.abs(pos.stake))).toFixed(4)),
   };
+
+  const latencySample = Math.abs((epoch - (pos.closeRequestedAt || pos.entryEpoch)) || 1);
+  executionHealth.fillLatency = parseFloat((executionHealth.fillLatency * 0.7 + Math.min(2.0, latencySample / 60) * 0.3).toFixed(4));
+  executionHealth.slippageEstimate = parseFloat((executionHealth.slippageEstimate * 0.6 + ((authoritativePnl ?? finalPnl) - finalPnl) * 0.1).toFixed(4));
+  executionHealth.rejectionRate = Math.max(0, Math.min(1, executionHealth.rejectionRate * 0.95));
+  if (executionHealth.desyncDetected && executionHealth.degradedSince && Date.now() - executionHealth.degradedSince > 600000) {
+    executionHealth.desyncDetected = false;
+    executionHealth.degradedSince = 0;
+  }
 
   completedTrades.push(record);
   // Balance is authoritative from Deriv WS stream — do not write locally here.
@@ -4708,6 +5199,35 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     hybridGreeningTriggerPct,
     governorFocusSymbol,
     governorStatus,
+    governor: {
+      approvals: governorMemory.approvals,
+      vetoes: governorMemory.vetoes,
+      approvalRate: governorMemory.approvals + governorMemory.vetoes > 0
+        ? parseFloat((governorMemory.approvals / (governorMemory.approvals + governorMemory.vetoes)).toFixed(4))
+        : null,
+      lastInsight: governorMemory.lastInsight,
+      perSymbol: Object.fromEntries(
+        Object.keys(subAlgorithms).map(sym => {
+          const sp = subAlgorithms[sym].lastSignalProbability;
+          return [sym, sp ? {
+            confidence: sp.confidence,
+            expectedEdge: sp.expectedEdge,
+            uncertainty: sp.uncertainty,
+            volatilityScore: sp.volatilityScore,
+            regimeCompatibility: sp.regimeCompatibility,
+            executionQuality: sp.executionQuality,
+          } : null];
+        })
+      ),
+    },
+    uncertaintyState,
+    portfolioHeat: portfolioHeatState,
+    equityCurve: {
+      state: equityCurveState,
+      throttle: equityCurveThrottle,
+    },
+    opportunityDensity: opportunityDensityMetrics,
+    executionHealth,
     subAlgorithms,
     stats: {
       totalTrades: total,
@@ -5026,6 +5546,11 @@ app.post("/api/reset", async (req, res) => {
     // iml_trades uses text id — wipe it separately with correct filter
     try {
       await supabaseClient.from("iml_trades").delete().neq("id", "__NONE__");
+    } catch (_) {}
+    // Overwrite iml_state dashboard document with clean in-memory state so stale symbols never reload
+    try {
+      await saveStateToSupabase();
+      logs.push(`[SUPABASE_RESET] iml_state dashboard document refreshed with clean state ✓`);
     } catch (_) {}
   }
 

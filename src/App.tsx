@@ -46,13 +46,12 @@ import {
 } from "recharts";
 
 const INSTRUMENTS = {
-  R_10: { name: "Volatility 10 (1s)", volatility: 0.12, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 100.0 },
   R_25: { name: "Volatility 25 (1s)", volatility: 0.28, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 250.0 },
   R_75: { name: "Volatility 75 (1s)", volatility: 0.85, tickType: "std", idealStrategy: "breakout", basePrice: 750.0 },
-  R_100: { name: "Volatility 100 Index", volatility: 1.05, tickType: "std", idealStrategy: "breakout", basePrice: 1000.0 },
   CRASH500: { name: "Crash 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
   BOOM500: { name: "Boom 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
 };
+const ALLOWED_SYMBOLS = new Set(Object.keys(INSTRUMENTS));
 
 export default function App() {
   // Top level server states
@@ -63,8 +62,8 @@ export default function App() {
   const [sessionOpenPnl, setSessionOpenPnl] = useState<number>(0.00);
   const [estimatedSessionEquity, setEstimatedSessionEquity] = useState<number>(0.00);
   const [tradingEnabled, setTradingEnabled] = useState<boolean>(false);
-  const [symbol, setSymbol] = useState<string>("R_10");
-  const [symbolName, setSymbolName] = useState<string>("Volatility 10 (1s)");
+  const [symbol, setSymbol] = useState<string>("R_25");
+  const [symbolName, setSymbolName] = useState<string>("Volatility 25 (1s)");
   const [idealStrategy, setIdealStrategy] = useState<string>("mean_reversion");
   const [tradingMode, setTradingMode] = useState<"MULTIPLIER" | "HYBRID_LINEAR" | "AUTO">("AUTO");
   const [isAuthorized, setIsAuthorized] = useState<boolean>(false);
@@ -130,8 +129,12 @@ export default function App() {
     sessionBlocked: false
   });
 
-  const [governorFocusSymbol, setGovernorFocusSymbol] = useState<string>("R_10");
+  const [governorFocusSymbol, setGovernorFocusSymbol] = useState<string>("R_25");
   const [governorStatus, setGovernorStatus] = useState<string>("");
+  const [governorDiagnostics, setGovernorDiagnostics] = useState<{
+    approvals: number; vetoes: number; approvalRate: number | null; lastInsight: string;
+    perSymbol: Record<string, { confidence: number; expectedEdge: number; uncertainty: number; volatilityScore: number; regimeCompatibility: number } | null>;
+  } | null>(null);
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
   const [logs, setLogs] = useState<string[]>([]);
@@ -193,17 +196,24 @@ export default function App() {
         return;
       }
       const data = await res.json();
+
+      const safeSymbol = ALLOWED_SYMBOLS.has(data.symbol) ? data.symbol : "R_25";
+      const safeMeta = INSTRUMENTS[safeSymbol as keyof typeof INSTRUMENTS];
+      const filteredSubAlgorithms = Object.fromEntries(
+        Object.entries(data.subAlgorithms || {}).filter(([key]) => ALLOWED_SYMBOLS.has(key))
+      );
+      const filteredSymbolDistribution = Array.isArray(data.symbolDistribution)
+        ? data.symbolDistribution.filter((item: any) => ALLOWED_SYMBOLS.has(item.symbol))
+        : [];
       
       setBalance(data.balance);
       setPeakBalance(data.peakBalance);
       setSessionStartBalance(data.sessionStartBalance || data.balance);
-      setSessionClosedPnl(data.sessionClosedPnl || 0);
-      setSessionOpenPnl(data.sessionOpenPnl || 0);
-      setEstimatedSessionEquity(data.estimatedSessionEquity || data.balance);
+      // sessionClosedPnl is recomputed below from filtered trades — do not use server value
       setTradingEnabled(data.tradingEnabled);
-      setSymbol(data.symbol);
-      setSymbolName(data.symbolName);
-      setIdealStrategy(data.idealStrategy);
+      setSymbol(safeSymbol);
+      setSymbolName(safeMeta?.name || data.symbolName || "Volatility 25 (1s)");
+      setIdealStrategy(safeMeta?.idealStrategy || data.idealStrategy || "mean_reversion");
       setTradingMode(data.tradingMode);
       setIsAuthorized(data.isAuthorized);
 
@@ -221,22 +231,39 @@ export default function App() {
       setRiskPreset(data.riskPreset);
       setCurrentRegime(data.regime);
       setCurrentPrice(data.currentPrice);
-      setActivePositions(data.activePositions);
-      setCompletedTrades(data.completedTrades);
-      setCompletedTradesTotal(data.completedTradesTotal || data.stats?.totalTrades || data.completedTrades?.length || 0);
-      setCompletedTradesReturned(data.completedTradesReturned || data.completedTrades?.length || 0);
-      setCompletedTradesCumulativeOffset(data.completedTradesCumulativeOffset || 0);
-      if (data.symbolDistribution) setSymbolDistribution(data.symbolDistribution);
-      setStats(data.stats);
+      const filteredActivePositions = (data.activePositions || []).filter((p: any) => ALLOWED_SYMBOLS.has(p.symbol));
+      const filteredCompletedTrades = (data.completedTrades || []).filter((t: any) => ALLOWED_SYMBOLS.has(t.symbol));
+      const filteredOpenPnl = filteredActivePositions.reduce((s: number, p: any) => s + (p.pnl || 0), 0);
+      const filteredClosedPnl = filteredCompletedTrades.reduce((s: number, t: any) => s + (t.pnl || 0), 0);
+      const filteredWins = filteredCompletedTrades.filter((t: any) => t.pnl > 0).length;
+      const filteredTotal = filteredCompletedTrades.length;
+      setActivePositions(filteredActivePositions);
+      setCompletedTrades(filteredCompletedTrades);
+      setCompletedTradesTotal(filteredTotal);
+      setCompletedTradesReturned(filteredTotal);
+      setCompletedTradesCumulativeOffset(0);
+      setSessionClosedPnl(filteredClosedPnl);
+      setSessionOpenPnl(filteredOpenPnl);
+      const sessionBase = data.sessionStartBalance || data.balance;
+      setEstimatedSessionEquity(sessionBase + filteredClosedPnl + filteredOpenPnl);
+      if (filteredSymbolDistribution.length > 0) setSymbolDistribution(filteredSymbolDistribution);
+      setStats({
+        ...data.stats,
+        totalTrades: filteredTotal,
+        wins: filteredWins,
+        winRate: filteredTotal > 0 ? parseFloat(((filteredWins / filteredTotal) * 100).toFixed(1)) : 0,
+        totalPnl: parseFloat(filteredClosedPnl.toFixed(2)),
+      });
       setCurrentParams(data.parameters);
       setCircuitStats({
         cooldownRemaining: data.circuitBreaker.cooldownRemaining,
         cooldownMessage: data.circuitBreaker.cooldownMessage,
         sessionBlocked: data.circuitBreaker.sessionBlocked
       });
-      setGovernorFocusSymbol(data.governorFocusSymbol || "R_10");
+      setGovernorFocusSymbol(ALLOWED_SYMBOLS.has(data.governorFocusSymbol) ? data.governorFocusSymbol : safeSymbol);
       setGovernorStatus(data.governorStatus || "GOVERNING: Active and regulating live sub-algorithms.");
-      setSubAlgorithms(data.subAlgorithms || {});
+      if (data.governor) setGovernorDiagnostics(data.governor);
+      setSubAlgorithms(filteredSubAlgorithms);
       setLogs(data.logs);
       setServerConnected(true);
     } catch (err) {
@@ -1014,10 +1041,61 @@ export default function App() {
           </div>
         </div>
 
-        {/* Dynamic Parallel Sub-Algorithm status grid cards! Supports 6 columns beautifully */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-4">
+        {/* Governor Diagnostics Strip */}
+        {governorDiagnostics && (
+          <div className="mb-4 space-y-2">
+            <div className="flex flex-wrap gap-3 text-xs font-mono">
+              <div className="flex items-center gap-1.5 bg-[#0d1512]/80 border border-brand-teal/20 px-3 py-1.5 rounded">
+                <span className="text-brand-mint/50 uppercase">Approvals</span>
+                <span className="text-brand-teal font-bold">{governorDiagnostics.approvals}</span>
+              </div>
+              <div className="flex items-center gap-1.5 bg-[#0d1512]/80 border border-red-500/20 px-3 py-1.5 rounded">
+                <span className="text-brand-mint/50 uppercase">Vetoes</span>
+                <span className="text-red-400 font-bold">{governorDiagnostics.vetoes}</span>
+              </div>
+              <div className="flex items-center gap-1.5 bg-[#0d1512]/80 border border-amber-500/20 px-3 py-1.5 rounded">
+                <span className="text-brand-mint/50 uppercase">Approval Rate</span>
+                <span className={`font-bold ${governorDiagnostics.approvalRate !== null && governorDiagnostics.approvalRate >= 0.5 ? 'text-brand-teal' : 'text-amber-400'}`}>
+                  {governorDiagnostics.approvalRate !== null ? `${(governorDiagnostics.approvalRate * 100).toFixed(1)}%` : "—"}
+                </span>
+              </div>
+            </div>
+            <div className="bg-[#0d1512]/60 border border-brand-slate/20 rounded px-3 py-1.5 text-xs font-mono text-brand-peach/80 truncate">
+              <span className="text-brand-mint/40 mr-2 uppercase text-[10px]">Last Insight</span>
+              {governorDiagnostics.lastInsight}
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+              {Object.entries(governorDiagnostics.perSymbol).map(([sym, _sp]) => {
+                const sp = _sp as { confidence: number; expectedEdge: number; uncertainty: number; volatilityScore: number; regimeCompatibility: number } | null;
+                return (
+                  <div key={sym} className="bg-[#0d1512]/80 border border-brand-slate/20 rounded p-2 space-y-1">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-mono font-bold text-brand-peach">{sym}</span>
+                      {sp && <span className={`text-[10px] font-mono font-bold ${sp.confidence >= 0.55 ? 'text-brand-teal' : sp.confidence >= 0.45 ? 'text-amber-400' : 'text-red-400'}`}>
+                        {(sp.confidence * 100).toFixed(0)}%
+                      </span>}
+                    </div>
+                    {sp ? (
+                      <div className="grid grid-cols-2 gap-x-2 text-[10px] font-mono text-brand-mint/60">
+                        <span>Edge <span className="text-brand-mint">{(sp.expectedEdge * 100).toFixed(0)}%</span></span>
+                        <span>Uncert <span className={sp.uncertainty > 0.6 ? 'text-red-400' : 'text-brand-mint'}>{(sp.uncertainty * 100).toFixed(0)}%</span></span>
+                        <span>Vol <span className="text-brand-mint">{(sp.volatilityScore * 100).toFixed(0)}%</span></span>
+                        <span>Regime <span className="text-brand-mint">{(sp.regimeCompatibility * 100).toFixed(0)}%</span></span>
+                      </div>
+                    ) : (
+                      <span className="text-[10px] font-mono text-brand-mint/30">No signal data</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* Dynamic Parallel Sub-Algorithm status grid cards */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-4 gap-5 xl:gap-6">
           {Object.keys(subAlgorithms).length === 0 ? (
-            <div className="col-span-5 text-center py-12 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-600 text-base font-mono">
+            <div className="col-span-full text-center py-12 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-600 text-base font-mono">
               Bootstrapping IML subprocess registries and indicator warming tables...
             </div>
           ) : (
@@ -1218,10 +1296,8 @@ export default function App() {
                 
                 // Define unique colors per symbol
                 const colors: Record<string, { active: string, inactive: string }> = {
-                  R_10: { active: "bg-blue-500/90 border-blue-500 text-white shadow shadow-blue-500/25 font-bold", inactive: "bg-blue-900/25 border-blue-800/60 text-blue-300 hover:bg-blue-900/60 hover:text-blue-300" },
                   R_25: { active: "bg-emerald-500/90 border-emerald-500 text-white shadow shadow-emerald-500/25 font-bold", inactive: "bg-emerald-900/25 border-emerald-800/60 text-emerald-300 hover:bg-emerald-900/60 hover:text-emerald-300" },
                   R_75: { active: "bg-purple-500/90 border-purple-500 text-white shadow shadow-purple-500/25 font-bold", inactive: "bg-purple-900/25 border-purple-800/60 text-purple-300 hover:bg-purple-900/60 hover:text-purple-300" },
-                  R_100: { active: "bg-orange-500/90 border-orange-500 text-white shadow shadow-orange-500/25 font-bold", inactive: "bg-orange-900/25 border-orange-800/60 text-orange-300 hover:bg-orange-900/60 hover:text-orange-300" },
                   CRASH500: { active: "bg-rose-500/90 border-rose-500 text-white shadow shadow-rose-500/25 font-bold", inactive: "bg-rose-900/25 border-rose-800/60 text-rose-300 hover:bg-rose-900/60 hover:text-rose-300" },
                   BOOM500: { active: "bg-cyan-500/90 border-cyan-500 text-white shadow shadow-cyan-500/25 font-bold", inactive: "bg-cyan-900/25 border-cyan-800/60 text-cyan-300 hover:bg-cyan-900/60 hover:text-cyan-300" },
                 };
@@ -3555,10 +3631,8 @@ export default function App() {
         const winRatePct = wr * 100;
         
         // Define hardcoded INSTRUMENTS object fallback
-        const titleName = selectedPerfDetail === "R_10" ? "Volatility 10 Index" :
-                          selectedPerfDetail === "R_25" ? "Volatility 25 Index" :
+        const titleName = selectedPerfDetail === "R_25" ? "Volatility 25 Index" :
                           selectedPerfDetail === "R_75" ? "Volatility 75 Index" :
-                          selectedPerfDetail === "R_100" ? "Volatility 100 Index" :
                           selectedPerfDetail === "CRASH500" ? "Crash 500 Index" :
                           selectedPerfDetail === "BOOM500" ? "Boom 500 Index" : selectedPerfDetail;
 
@@ -3586,11 +3660,6 @@ export default function App() {
 
         // Analytical custom descriptions
         const strategyDescriptions: Record<string, { desc: string, strengths: string[], behavior: string }> = {
-          R_10: {
-            desc: "Volatility Index 10 Micro-Trend Scalper, utilizing high speed indicator matching to snap incremental profits off immediate trend shifts.",
-            strengths: ["Ultra-fast micro-tick convergence filtering", "Low capital drawdowns during transitions", "Defends positions tightly with trailing brackets"],
-            behavior: "High-frequency trade trigger module. Operates on 1s tick integrations. Opens small-sized orders and hedges with progressive break-even shifting."
-          },
           R_25: {
             desc: "Compression Wave Mean Reverter focused on Volatility Index 25. Takes positions at Bollinger edges when momentum shows exhaustion signs.",
             strengths: ["Aesthetic mean reversion precision", "Filters noisy fakeouts using RSI boundaries", "Vigorous ranging optimization ratio"],
@@ -3600,11 +3669,6 @@ export default function App() {
             desc: "Apex Volatility Breakout algorithm deployed on Volatility Index 75 (1s). Rides massive expansions and volume impulses.",
             strengths: ["Captures full trend lifecycle", "Trailing stops locked aggressively", "Favourable asymmetrical reward ratio"],
             behavior: "Enters trades when ADX rises above 20 and close breaks Bollinger bandwidth boundaries, holding exposure with an active trace tracker."
-          },
-          R_100: {
-            desc: "Extreme Velocity Bollinger Fader assigned to heavy Volatility Index 100. Excels in capturing market reversing limits at high-tide boundaries.",
-            strengths: ["Captures market apexes perfectly", "Staggered risk calculations per entry", "Fast settlement triggers"],
-            behavior: "Scours volatility metrics to place counter-trend directives when extreme confluences match (RSI > 67 / < 33). Fades momentum exhausts."
           },
           CRASH500: {
             desc: "Tail-risk hedging spike absorber for CRASH index assets. Enters extreme short exposures at high volume limits.",
