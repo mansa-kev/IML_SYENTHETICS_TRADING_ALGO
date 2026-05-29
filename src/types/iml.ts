@@ -337,6 +337,109 @@ export interface LiveMetrics {
 // PHASE 2: PROBABILISTIC INTELLIGENCE TYPES
 // ==========================================
 
+
+// ==========================================
+// PHASE 3: ADAPTIVE META-INTELLIGENCE TYPES
+// ==========================================
+
+export type AdaptiveIntelligenceMode = "OBSERVE" | "SHADOW" | "LIMITED" | "ACTIVE";
+
+export interface MetaLearningState {
+  strategyWeights: Record<string, number>;
+  regimePerformance: Record<string, number>;
+  executionHealthScore: number;
+  uncertaintyScore: number;
+  adaptationConfidence: number;
+  sampleSize: number;
+  lastUpdatedEpoch: number;
+  updateReason: string;
+}
+
+export interface PolicyAdjustment {
+  riskMultiplier: number;
+  exitAdjustment: number;
+  tradeFrequencyAdjustment: number;
+  confidenceAdjustment: number;
+  uncertaintyPenalty: number;
+  sampleSize: number;
+  policyConfidence: number;
+  updateReason: string;
+}
+
+export interface EnsembleDecision {
+  selectedStrategies: string[];
+  strategyWeights: Record<string, number>;
+  correlationPenalty: number;
+  ensembleConfidence: number;
+  uncertaintyScore: number;
+  expectedPortfolioSharpeImpact: number;
+}
+
+export interface RegimeEvolution {
+  structuralShiftProbability: number;
+  volatilityShiftProbability: number;
+  persistenceShiftProbability: number;
+  tailShiftProbability: number;
+  spikeFrequencyShiftProbability: number;
+  confidence: number;
+}
+
+export interface AnomalyState {
+  anomalyProbability: number;
+  severity: number;
+  recommendedRiskReduction: number;
+  systemConfidence: number;
+  reasons: string[];
+}
+
+export interface LongHorizonMemoryState {
+  tradesObserved: number;
+  longTermSharpe: number;
+  longTermSortino: number;
+  longTermExpectancy: number;
+  volatilityMemory: number;
+  persistenceMemory: number;
+  drawdownMemory: number;
+  regimeReliability: Record<string, number>;
+  lastUpdatedEpoch: number;
+}
+
+export interface ExecutionHealthScore {
+  latencyScore: number;
+  fillQualityScore: number;
+  synchronizationScore: number;
+  degradationProbability: number;
+}
+
+export interface AdaptiveUncertaintyState extends UncertaintyState {
+  recommendedRiskAdjustment: number;
+  distributionConfidence: number;
+  modelStability: number;
+}
+
+export interface MonteCarloEvolutionState {
+  scenarios: number;
+  survivabilityProbability: number;
+  worstCaseDrawdown: number;
+  correlatedLossRisk: number;
+  executionDegradationRisk: number;
+  lastRunEpoch: number;
+}
+
+export interface AdaptiveIntelligenceState {
+  mode: AdaptiveIntelligenceMode;
+  metaLearning: MetaLearningState;
+  policy: PolicyAdjustment;
+  ensemble: EnsembleDecision;
+  regimeEvolution: Record<string, RegimeEvolution>;
+  anomaly: Record<string, AnomalyState>;
+  longHorizonMemory: Record<string, LongHorizonMemoryState>;
+  execution: ExecutionHealthScore;
+  uncertainty: AdaptiveUncertaintyState;
+  monteCarlo: MonteCarloEvolutionState;
+  lastShadowComparison: string;
+}
+
 export interface TradeQuality {
   expectedEdge: number;
   successProbability: number;

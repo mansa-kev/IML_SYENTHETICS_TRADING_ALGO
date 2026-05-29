@@ -143,6 +143,8 @@ export default function App() {
     executionHealth?: any;
     portfolioRisk?: any;
     instrumentDiagnostics?: Record<string, any>;
+    microConservativeReadiness?: any;
+    adaptiveIntelligence?: any;
   }>({});
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
@@ -280,6 +282,8 @@ export default function App() {
         executionHealth: data.executionHealth,
         portfolioRisk: data.portfolioRisk,
         instrumentDiagnostics: data.instrumentDiagnostics,
+        microConservativeReadiness: data.microConservativeReadiness,
+        adaptiveIntelligence: data.adaptiveIntelligence,
       });
       setSubAlgorithms(filteredSubAlgorithms);
       setLogs(data.logs);
@@ -1178,6 +1182,105 @@ export default function App() {
             </div>
           </div>
         </div>
+
+
+        {probabilisticDiagnostics.microConservativeReadiness && (
+          <div className={`mb-4 rounded-xl p-4 border ${probabilisticDiagnostics.microConservativeReadiness.microSafe ? "bg-emerald-950/30 border-emerald-400/20" : "bg-red-950/20 border-red-400/20"}`}>
+            <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+              <div>
+                <span className="block text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Real Capital Micro Conservative Readiness</span>
+                <span className="text-sm font-mono text-brand-mint/70">$50–$100 profile • R_25 primary • R_75 reduced • report-first risk audit</span>
+              </div>
+              <span className={`px-2 py-1 rounded text-xs font-mono font-bold ${probabilisticDiagnostics.microConservativeReadiness.microSafe ? "bg-emerald-500/10 text-emerald-300 border border-emerald-400/30" : "bg-red-500/10 text-red-300 border border-red-400/30"}`}>
+                {probabilisticDiagnostics.microConservativeReadiness.liveReadiness}
+              </span>
+            </div>
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-3">
+              <div className="bg-slate-950/40 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Profile</span>
+                <span className="text-sm font-mono font-black text-brand-peach">{probabilisticDiagnostics.microConservativeReadiness.profile}</span>
+              </div>
+              <div className="bg-slate-950/40 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Risk Budget</span>
+                <span className="text-sm font-mono font-black text-brand-teal">${Number(probabilisticDiagnostics.microConservativeReadiness.recommendedRiskBudget || 0).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/40 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Max Loss</span>
+                <span className="text-sm font-mono font-black text-red-300">${Number(probabilisticDiagnostics.microConservativeReadiness.recommendedMaxLoss || 0).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/40 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Max Stake</span>
+                <span className="text-sm font-mono font-black text-purple-200">${Number(probabilisticDiagnostics.microConservativeReadiness.recommendedMaxStake || 0).toFixed(2)}</span>
+              </div>
+            </div>
+            <div className="space-y-1 text-[10px] font-mono text-brand-mint/60">
+              {(probabilisticDiagnostics.microConservativeReadiness.readinessReasons || []).slice(0, 3).map((reason: string, idx: number) => (
+                <div key={`micro-reason-${idx}`}>• {reason}</div>
+              ))}
+            </div>
+          </div>
+        )}
+
+
+        {probabilisticDiagnostics.adaptiveIntelligence && (
+          <div className="mb-4 bg-[#0d1512]/80 border border-purple-400/20 rounded-xl p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <span className="block text-[10px] font-mono uppercase tracking-widest text-purple-300/70">Phase 3 Adaptive Meta-Intelligence</span>
+                <span className="text-sm font-mono text-brand-mint/70">{probabilisticDiagnostics.adaptiveIntelligence.lastShadowComparison}</span>
+              </div>
+              <span className="px-2 py-1 rounded bg-purple-500/10 border border-purple-400/30 text-purple-200 text-xs font-mono font-bold">
+                {probabilisticDiagnostics.adaptiveIntelligence.mode}
+              </span>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-3 xl:grid-cols-6 gap-2">
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Adapt Conf</span>
+                <span className="text-lg font-mono font-black text-purple-200">{(Number(probabilisticDiagnostics.adaptiveIntelligence.metaLearning?.adaptationConfidence || 0) * 100).toFixed(0)}%</span>
+              </div>
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Policy Risk</span>
+                <span className="text-lg font-mono font-black text-brand-peach">×{Number(probabilisticDiagnostics.adaptiveIntelligence.policy?.riskMultiplier || 1).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Trade Freq</span>
+                <span className="text-lg font-mono font-black text-brand-teal">×{Number(probabilisticDiagnostics.adaptiveIntelligence.policy?.tradeFrequencyAdjustment || 1).toFixed(2)}</span>
+              </div>
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Survival MC</span>
+                <span className="text-lg font-mono font-black text-emerald-300">{(Number(probabilisticDiagnostics.adaptiveIntelligence.monteCarlo?.survivabilityProbability ?? 1) * 100).toFixed(0)}%</span>
+              </div>
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Worst DD</span>
+                <span className="text-lg font-mono font-black text-red-300">{(Number(probabilisticDiagnostics.adaptiveIntelligence.monteCarlo?.worstCaseDrawdown || 0) * 100).toFixed(1)}%</span>
+              </div>
+              <div className="bg-slate-950/50 border border-slate-800 rounded p-2">
+                <span className="text-[10px] uppercase font-mono text-slate-500 block">Exec Degrade</span>
+                <span className="text-lg font-mono font-black text-amber-300">{(Number(probabilisticDiagnostics.adaptiveIntelligence.execution?.degradationProbability || 0) * 100).toFixed(0)}%</span>
+              </div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2">
+              {Object.entries(probabilisticDiagnostics.adaptiveIntelligence.metaLearning?.strategyWeights || {}).map(([sym, weight]) => {
+                const anomaly = probabilisticDiagnostics.adaptiveIntelligence.anomaly?.[sym];
+                const memory = probabilisticDiagnostics.adaptiveIntelligence.longHorizonMemory?.[sym];
+                return (
+                  <div key={`ai-${sym}`} className="bg-slate-950/40 border border-slate-800 rounded p-2 text-[10px] font-mono text-brand-mint/60">
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-brand-peach font-bold text-xs">{sym}</span>
+                      <span className="text-purple-200 font-bold">W {(Number(weight) * 100).toFixed(1)}%</span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-x-2">
+                      <span>Anom {(Number(anomaly?.anomalyProbability || 0) * 100).toFixed(0)}%</span>
+                      <span>RiskCut {(Number(anomaly?.recommendedRiskReduction || 0) * 100).toFixed(0)}%</span>
+                      <span>LT Sharpe {Number(memory?.longTermSharpe || 0).toFixed(2)}</span>
+                      <span>Trades {memory?.tradesObserved || 0}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {governorDiagnostics && (
           <div className="mb-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2">
