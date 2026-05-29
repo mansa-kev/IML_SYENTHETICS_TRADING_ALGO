@@ -60,6 +60,9 @@ export interface ActivePosition {
   closeRequestedAt?: number;
   closeRequestedReason?: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
   maxTicksOverride?: number;
+  entrySignalProbability?: number;
+  entryExpectedEdge?: number;
+  entryExpectedSharpeImpact?: number;
 }
 
 export interface TradeRecord {
@@ -240,6 +243,9 @@ export interface PortfolioHeatState {
   maxConcentration: number;
   heatCapExceeded: boolean;
   adjustedLeverageScale: number;
+  correlationAdjustedHeat?: number;
+  marginalCandidateHeat?: number;
+  clusterCapExceeded?: Record<string, boolean>;
 }
 
 export interface OpportunityDensityMetrics {
@@ -255,6 +261,8 @@ export interface OpportunityDensityMetrics {
 export interface SpikeHarvestState {
   spikeDetected: boolean;
   spikeEpoch: number;
+  spikeDirection?: "UP" | "DOWN";
+  spikeMagnitudeAtr?: number;
   spikeExhaustionProbability: number;
   recoveryProbability: number;
   persistenceDecay: number;
@@ -328,6 +336,109 @@ export interface LiveMetrics {
 // ==========================================
 // PHASE 2: PROBABILISTIC INTELLIGENCE TYPES
 // ==========================================
+
+
+// ==========================================
+// PHASE 3: ADAPTIVE META-INTELLIGENCE TYPES
+// ==========================================
+
+export type AdaptiveIntelligenceMode = "OBSERVE" | "SHADOW" | "LIMITED" | "ACTIVE";
+
+export interface MetaLearningState {
+  strategyWeights: Record<string, number>;
+  regimePerformance: Record<string, number>;
+  executionHealthScore: number;
+  uncertaintyScore: number;
+  adaptationConfidence: number;
+  sampleSize: number;
+  lastUpdatedEpoch: number;
+  updateReason: string;
+}
+
+export interface PolicyAdjustment {
+  riskMultiplier: number;
+  exitAdjustment: number;
+  tradeFrequencyAdjustment: number;
+  confidenceAdjustment: number;
+  uncertaintyPenalty: number;
+  sampleSize: number;
+  policyConfidence: number;
+  updateReason: string;
+}
+
+export interface EnsembleDecision {
+  selectedStrategies: string[];
+  strategyWeights: Record<string, number>;
+  correlationPenalty: number;
+  ensembleConfidence: number;
+  uncertaintyScore: number;
+  expectedPortfolioSharpeImpact: number;
+}
+
+export interface RegimeEvolution {
+  structuralShiftProbability: number;
+  volatilityShiftProbability: number;
+  persistenceShiftProbability: number;
+  tailShiftProbability: number;
+  spikeFrequencyShiftProbability: number;
+  confidence: number;
+}
+
+export interface AnomalyState {
+  anomalyProbability: number;
+  severity: number;
+  recommendedRiskReduction: number;
+  systemConfidence: number;
+  reasons: string[];
+}
+
+export interface LongHorizonMemoryState {
+  tradesObserved: number;
+  longTermSharpe: number;
+  longTermSortino: number;
+  longTermExpectancy: number;
+  volatilityMemory: number;
+  persistenceMemory: number;
+  drawdownMemory: number;
+  regimeReliability: Record<string, number>;
+  lastUpdatedEpoch: number;
+}
+
+export interface ExecutionHealthScore {
+  latencyScore: number;
+  fillQualityScore: number;
+  synchronizationScore: number;
+  degradationProbability: number;
+}
+
+export interface AdaptiveUncertaintyState extends UncertaintyState {
+  recommendedRiskAdjustment: number;
+  distributionConfidence: number;
+  modelStability: number;
+}
+
+export interface MonteCarloEvolutionState {
+  scenarios: number;
+  survivabilityProbability: number;
+  worstCaseDrawdown: number;
+  correlatedLossRisk: number;
+  executionDegradationRisk: number;
+  lastRunEpoch: number;
+}
+
+export interface AdaptiveIntelligenceState {
+  mode: AdaptiveIntelligenceMode;
+  metaLearning: MetaLearningState;
+  policy: PolicyAdjustment;
+  ensemble: EnsembleDecision;
+  regimeEvolution: Record<string, RegimeEvolution>;
+  anomaly: Record<string, AnomalyState>;
+  longHorizonMemory: Record<string, LongHorizonMemoryState>;
+  execution: ExecutionHealthScore;
+  uncertainty: AdaptiveUncertaintyState;
+  monteCarlo: MonteCarloEvolutionState;
+  lastShadowComparison: string;
+}
 
 export interface TradeQuality {
   expectedEdge: number;
@@ -435,6 +546,8 @@ export interface SubAlgorithm {
   // Phase 1 probabilistic fields
   regimeState?: RegimeState;
   lastSignalProbability?: ExtendedSignalProbability;
+  lastGovernorDecision?: GovernorDecision;
+  lastPersistenceProbability?: number;
   specialization?: "V75" | "V50" | "BOOM" | "CRASH";
   // Phase 2 state fields
   spikeHarvestState?: SpikeHarvestState;

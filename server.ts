@@ -10,7 +10,7 @@ import fs from "fs";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm, RegimeState, SignalProbability, ExtendedSignalProbability, ConfidenceTier, GovernorDecision, PortfolioRiskState, ExecutionHealth, LiveMetrics, TradeQuality, VolatilityForecast, DistributionStats, FeatureSnapshot, InstrumentStats, EquityCurveState, UncertaintyState, PortfolioHeatState, OpportunityDensityMetrics, SpikeHarvestState, EquityCurveThrottleConfig } from "./src/types/iml.js";
+import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm, RegimeState, SignalProbability, ExtendedSignalProbability, ConfidenceTier, GovernorDecision, PortfolioRiskState, ExecutionHealth, LiveMetrics, TradeQuality, VolatilityForecast, DistributionStats, FeatureSnapshot, InstrumentStats, EquityCurveState, UncertaintyState, PortfolioHeatState, OpportunityDensityMetrics, SpikeHarvestState, EquityCurveThrottleConfig, AdaptiveIntelligenceState, LongHorizonMemoryState, RegimeEvolution, AnomalyState } from "./src/types/iml.js";
 import { createClient } from "@supabase/supabase-js";
 import PDFDocument from "pdfkit";
 
@@ -183,8 +183,22 @@ const governorMemory: {
 // PROBABILISTIC PORTFOLIO INTELLIGENCE STATE
 // ==========================================
 const CORRELATION_CLUSTERS: Record<string, string[]> = {
-  VOL_CLUSTER: ["R_25", "R_75", "R_100"],
-  EVENT_CLUSTER: ["BOOM500", "CRASH500"],
+  MEAN_REVERSION_CLUSTER: ["R_25"],
+  HIGH_VOL_CLUSTER: ["R_75"],
+  EVENT_RISK_CLUSTER: ["BOOM500", "CRASH500"],
+};
+
+const CLUSTER_HEAT_CAPS: Record<string, number> = {
+  MEAN_REVERSION_CLUSTER: 0.45,
+  HIGH_VOL_CLUSTER: 0.42,
+  EVENT_RISK_CLUSTER: 0.50,
+};
+
+const CORRELATION_PRIORS: Record<string, Record<string, number>> = {
+  R_25: { R_25: 1.00, R_75: 0.38, CRASH500: 0.15, BOOM500: 0.12 },
+  R_75: { R_25: 0.38, R_75: 1.00, CRASH500: 0.22, BOOM500: 0.18 },
+  CRASH500: { R_25: 0.15, R_75: 0.22, CRASH500: 1.00, BOOM500: -0.40 },
+  BOOM500: { R_25: 0.12, R_75: 0.18, CRASH500: -0.40, BOOM500: 1.00 },
 };
 
 let executionHealth: ExecutionHealth = {
@@ -230,8 +244,91 @@ let equityCurveThrottle: EquityCurveThrottleConfig = {
   tradeAggressiveness: 1,
 };
 
+const PHASE3_MIN_WEIGHT_SAMPLE = 100;
+const PHASE3_FULL_WEIGHT_SAMPLE = 300;
+const PHASE3_MIN_POLICY_SAMPLE = 150;
+const PHASE3_MIN_ANOMALY_FEATURES = 500;
+
+function createDefaultMemoryState(): LongHorizonMemoryState {
+  return {
+    tradesObserved: 0,
+    longTermSharpe: 0,
+    longTermSortino: 0,
+    longTermExpectancy: 0,
+    volatilityMemory: 0,
+    persistenceMemory: 0.5,
+    drawdownMemory: 0,
+    regimeReliability: {},
+    lastUpdatedEpoch: 0,
+  };
+}
+
+let adaptiveIntelligenceState: AdaptiveIntelligenceState = {
+  mode: "SHADOW",
+  metaLearning: {
+    strategyWeights: {},
+    regimePerformance: {},
+    executionHealthScore: 0.7,
+    uncertaintyScore: 0.5,
+    adaptationConfidence: 0,
+    sampleSize: 0,
+    lastUpdatedEpoch: 0,
+    updateReason: "Shadow meta-intelligence initialized; no live control authority.",
+  },
+  policy: {
+    riskMultiplier: 1,
+    exitAdjustment: 1,
+    tradeFrequencyAdjustment: 1,
+    confidenceAdjustment: 0,
+    uncertaintyPenalty: 0,
+    sampleSize: 0,
+    policyConfidence: 0,
+    updateReason: "Policy engine in shadow mode pending minimum sample gates.",
+  },
+  ensemble: {
+    selectedStrategies: [],
+    strategyWeights: {},
+    correlationPenalty: 0,
+    ensembleConfidence: 0,
+    uncertaintyScore: 0.5,
+    expectedPortfolioSharpeImpact: 0,
+  },
+  regimeEvolution: {},
+  anomaly: {},
+  longHorizonMemory: {},
+  execution: {
+    latencyScore: 0.7,
+    fillQualityScore: 0.8,
+    synchronizationScore: 1,
+    degradationProbability: 0.1,
+  },
+  uncertainty: {
+    epistemicUncertainty: 0.35,
+    marketUncertainty: 0.40,
+    modelConfidence: 0.60,
+    regimeStability: 0.55,
+    recommendedRiskAdjustment: 1,
+    distributionConfidence: 0.5,
+    modelStability: 0.5,
+  },
+  monteCarlo: {
+    scenarios: 0,
+    survivabilityProbability: 1,
+    worstCaseDrawdown: 0,
+    correlatedLossRisk: 0,
+    executionDegradationRisk: 0,
+    lastRunEpoch: 0,
+  },
+  lastShadowComparison: "Awaiting live feature and trade samples.",
+};
+
 function clamp01(val: number): number {
   return Math.max(0, Math.min(1, val));
+}
+
+function normalizeRange(value: number, low: number, high: number): number {
+  if (high === low) return 0;
+  return clamp01((value - low) / (high - low));
 }
 
 function deriveExecutionQualityScore(): number {
@@ -256,23 +353,39 @@ function computePortfolioHeatSnapshot(candidate?: { symbol: string; stake: numbe
   let totalHeat = 0;
   Object.values(exposureBySymbol).forEach(v => { totalHeat += v; });
   const correlatedClusterHeat: Record<string, number> = {};
+  const clusterCapExceeded: Record<string, boolean> = {};
   let maxConcentration = 0;
   for (const [cluster, members] of Object.entries(CORRELATION_CLUSTERS)) {
     const value = members.reduce((sum, sym) => sum + (exposureBySymbol[sym] || 0), 0);
     correlatedClusterHeat[cluster] = parseFloat(value.toFixed(4));
+    clusterCapExceeded[cluster] = value > (CLUSTER_HEAT_CAPS[cluster] ?? 0.5);
     if (value > maxConcentration) maxConcentration = value;
   }
+
+  const symbols = Object.keys(exposureBySymbol);
+  let variance = 0;
+  for (const s1 of symbols) {
+    for (const s2 of symbols) {
+      const corr = CORRELATION_PRIORS[s1]?.[s2] ?? CORRELATION_PRIORS[s2]?.[s1] ?? (s1 === s2 ? 1 : 0.35);
+      variance += exposureBySymbol[s1] * exposureBySymbol[s2] * corr;
+    }
+  }
+  const correlationAdjustedHeat = Math.sqrt(Math.max(0, variance));
+
   const adjustedScale = Math.max(
     0.2,
-    1 - Math.max(0, totalHeat - 0.35) * 0.8 - Math.max(0, maxConcentration - 0.45) * 0.6
+    1 - Math.max(0, correlationAdjustedHeat - 0.25) * 1.15 - Math.max(0, maxConcentration - 0.35) * 0.8
   );
   const heatCap = equityCurveThrottle.portfolioHeatCap;
   return {
     totalHeat: parseFloat(totalHeat.toFixed(4)),
     correlatedClusterHeat,
     maxConcentration: parseFloat(maxConcentration.toFixed(4)),
-    heatCapExceeded: totalHeat > heatCap,
+    heatCapExceeded: correlationAdjustedHeat > heatCap || Object.values(clusterCapExceeded).some(Boolean),
     adjustedLeverageScale: parseFloat(adjustedScale.toFixed(4)),
+    correlationAdjustedHeat: parseFloat(correlationAdjustedHeat.toFixed(4)),
+    marginalCandidateHeat: candidate ? parseFloat(Math.max(0, correlationAdjustedHeat - computePortfolioHeatSnapshot().correlationAdjustedHeat!).toFixed(4)) : 0,
+    clusterCapExceeded,
   };
 }
 
@@ -772,6 +885,7 @@ async function saveStateToSupabase() {
       hybridGreeningTriggerPct,
       activePositions,
       completedTrades,
+      adaptiveIntelligenceState,
       currentParams,
       logs: logs.slice(-2000), // keep plenty of logs in database
       subAlgorithmsParams: subAlgState
@@ -958,6 +1072,9 @@ async function loadStateFromSupabase() {
       if (loaded.hybridEarlyCutoffEnabled !== undefined) hybridEarlyCutoffEnabled = loaded.hybridEarlyCutoffEnabled;
       if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
+      if (loaded.adaptiveIntelligenceState !== undefined) {
+        adaptiveIntelligenceState = { ...adaptiveIntelligenceState, ...loaded.adaptiveIntelligenceState };
+      }
       if (loaded.activePositions !== undefined) {
         const recoveredPositions = Array.isArray(loaded.activePositions) ? loaded.activePositions : [];
         const allowedInstruments = new Set(Object.keys(INSTRUMENTS));
@@ -1983,6 +2100,86 @@ function detectRegime(symbol: string): MarketRegime {
   return MarketRegime.TRANSITION;
 }
 
+function computePersistenceProbability(hMicro: number, hMeso: number, hMacro: number, rSquared: number, adx: number): number {
+  const micro = normalizeRange(hMicro, 0.50, 0.85);
+  const meso = normalizeRange(hMeso, 0.50, 0.80);
+  const macro = normalizeRange(hMacro, 0.50, 0.78);
+  const fit = normalizeRange(rSquared, 0.70, 0.98);
+  const trendStrength = normalizeRange(adx, 15, 55);
+  return parseFloat(clamp01(0.32 * micro + 0.22 * meso + 0.14 * macro + 0.17 * fit + 0.15 * trendStrength).toFixed(4));
+}
+
+function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: number, epoch: number, rsiVal: number, bbPct: number): SpikeHarvestState {
+  const prior = subAlgorithms[symbol]?.spikeHarvestState || {
+    spikeDetected: false,
+    spikeEpoch: 0,
+    spikeDirection: undefined,
+    spikeMagnitudeAtr: 0,
+    spikeExhaustionProbability: 0,
+    recoveryProbability: 0,
+    persistenceDecay: 0,
+    volatilityCollapseProbability: 0,
+    postSpikeTicksElapsed: 0,
+  };
+
+  if (symbol !== "CRASH500" && symbol !== "BOOM500") return prior;
+  const prices = tickBuffers[symbol] || [];
+  const prevPrice = prices.length >= 2 ? prices[prices.length - 2] : currentPrice;
+  const tickDelta = currentPrice - prevPrice;
+  const atrDenom = Math.max(atr, Math.abs(currentPrice) * 0.0008, 1e-6);
+  const magnitudeAtr = Math.abs(tickDelta) / atrDenom;
+  const expectedDirection: "UP" | "DOWN" = symbol === "BOOM500" ? "UP" : "DOWN";
+  const actualDirection: "UP" | "DOWN" = tickDelta >= 0 ? "UP" : "DOWN";
+  const isEventSpike = magnitudeAtr >= 2.6 && actualDirection === expectedDirection;
+
+  if (isEventSpike) {
+    return {
+      spikeDetected: true,
+      spikeEpoch: epoch,
+      spikeDirection: actualDirection,
+      spikeMagnitudeAtr: parseFloat(magnitudeAtr.toFixed(3)),
+      spikeExhaustionProbability: 0.05,
+      recoveryProbability: 0,
+      persistenceDecay: 0,
+      volatilityCollapseProbability: 0.05,
+      postSpikeTicksElapsed: 0,
+    };
+  }
+
+  if (!prior.spikeDetected) {
+    return {
+      ...prior,
+      spikeExhaustionProbability: parseFloat(Math.max(0, prior.spikeExhaustionProbability * 0.94).toFixed(4)),
+      recoveryProbability: parseFloat(Math.max(0, prior.recoveryProbability * 0.92).toFixed(4)),
+      persistenceDecay: parseFloat(Math.max(0, prior.persistenceDecay * 0.94).toFixed(4)),
+      volatilityCollapseProbability: parseFloat(Math.max(0, prior.volatilityCollapseProbability * 0.94).toFixed(4)),
+    };
+  }
+
+  const ticksElapsed = Math.max(0, epoch - prior.spikeEpoch);
+  const exhaustionByTime = normalizeRange(ticksElapsed, 8, 42);
+  const rsiExtremeRelief = symbol === "BOOM500" ? normalizeRange(82 - rsiVal, 0, 28) : normalizeRange(rsiVal - 18, 0, 28);
+  const bandReentry = symbol === "BOOM500" ? normalizeRange(1.15 - bbPct, 0, 0.55) : normalizeRange(bbPct + 0.15, 0, 0.55);
+  const persistenceDecay = normalizeRange(ticksElapsed, 10, 70);
+  const volatilityCollapseProbability = clamp01(0.45 * exhaustionByTime + 0.30 * bandReentry + 0.25 * rsiExtremeRelief);
+  const spikeSizeScore = normalizeRange(prior.spikeMagnitudeAtr || 0, 2.6, 7.5);
+  const spikeExhaustionProbability = clamp01(0.40 * exhaustionByTime + 0.25 * rsiExtremeRelief + 0.20 * bandReentry + 0.15 * persistenceDecay);
+  const recoveryProbability = clamp01(0.35 * spikeSizeScore + 0.30 * spikeExhaustionProbability + 0.20 * volatilityCollapseProbability + 0.15 * bandReentry);
+  const expired = ticksElapsed > 110 || (recoveryProbability < 0.20 && ticksElapsed > 70);
+
+  return {
+    spikeDetected: !expired,
+    spikeEpoch: expired ? 0 : prior.spikeEpoch,
+    spikeDirection: expired ? undefined : prior.spikeDirection,
+    spikeMagnitudeAtr: expired ? 0 : prior.spikeMagnitudeAtr,
+    spikeExhaustionProbability: parseFloat((expired ? 0 : spikeExhaustionProbability).toFixed(4)),
+    recoveryProbability: parseFloat((expired ? 0 : recoveryProbability).toFixed(4)),
+    persistenceDecay: parseFloat((expired ? 0 : persistenceDecay).toFixed(4)),
+    volatilityCollapseProbability: parseFloat((expired ? 0 : volatilityCollapseProbability).toFixed(4)),
+    postSpikeTicksElapsed: expired ? 0 : ticksElapsed,
+  };
+}
+
 // ==========================================
 // REAL-TIME DIRECT INDICATORS EXTRACTION ENGINE
 // ==========================================
@@ -2044,7 +2241,7 @@ function getCurrentIndicators(symbol: string) {
   };
 }
 
-let activeTradeType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
+let activeTradeType: "MULTIPLIER" | "HYBRID_LINEAR" = "HYBRID_LINEAR";
 
 function getEffectiveTradeType(): "MULTIPLIER" | "HYBRID_LINEAR" {
   if (tradingMode === "AUTO") return activeTradeType;
@@ -2098,28 +2295,23 @@ function evaluateGovernorFocus() {
   }
   let highestScore = -1;
   let bestSymbol = governorFocusSymbol;
-  let bestType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
+  let bestType: "MULTIPLIER" | "HYBRID_LINEAR" = "HYBRID_LINEAR";
 
   Object.values(subAlgorithms).forEach((sub) => {
-    // Determine prevailing mood for this instrument using Conviction Score (Hurst/Fractal metrics)
-    // A higher conviction score means the sub-algorithm has better structural alignment for trading.
-    const convictionScore = sub.convictionScore || 0;
-    const trendStrength = sub.adxVal || 0; // standard ADX is 0-100
-    
-    // Evaluate MULTIPLIER fit (loves strong trends)
-    const multScore = (trendStrength * 1.0) + (convictionScore * 50);
-    
-    // Evaluate HYBRID_LINEAR fit (favors persistent fractal structures, higher Hurst components)
-    const hybridScore = (convictionScore * 80) + (trendStrength * 0.5);
-    
-    // Find best mode for this specific symbol
-    let localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = "MULTIPLIER";
-    let localMaxScore = multScore;
-
-    if (hybridScore > localMaxScore) {
-      localMaxScore = hybridScore;
-      localBestType = "HYBRID_LINEAR";
-    }
+    const signal = sub.lastSignalProbability;
+    const regime = sub.regimeState;
+    const prior = INSTRUMENT_PRIORS[sub.symbol] || { confidence: 0.5, expectedEdge: 0.42, sharpe: 0.45 };
+    const heat = computePortfolioHeatSnapshot({ symbol: sub.symbol, stake: Math.max(1, balance * 0.0025), direction: "LONG" });
+    const confidence = signal?.confidence ?? prior.confidence;
+    const edge = signal?.expectedEdge ?? prior.expectedEdge;
+    const uncertainty = signal?.uncertainty ?? 0.45;
+    const executionQuality = signal?.executionQuality ?? deriveExecutionQualityScore();
+    const regimePenalty = regime ? regime.transitionProbability * 0.35 + regime.entropyScore * 0.25 : 0.2;
+    const heatPenalty = Math.max(0, (heat.correlationAdjustedHeat ?? heat.totalHeat) - equityCurveThrottle.portfolioHeatCap) * 1.4;
+    const localMaxScore = prior.sharpe * 0.35 + edge * 0.35 + confidence * 0.25 + executionQuality * 0.20 - uncertainty * 0.25 - regimePenalty - heatPenalty;
+    const localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = (regime?.trendProbability ?? 0) > 0.72 && confidence > 0.66 && uncertainty < 0.36
+      ? "MULTIPLIER"
+      : "HYBRID_LINEAR";
 
     if (localMaxScore > highestScore) {
       highestScore = localMaxScore;
@@ -2194,14 +2386,14 @@ function computePortfolioRiskState(): PortfolioRiskState {
   return riskState;
 }
 
-function computeSignalProbability(symbol: string, direction: "LONG" | "SHORT", rsiVal: number, bbPct: number, vwapVal: number, currentPrice: number, adx: number, atr: number, isDivergent: boolean, isReversalCandle: boolean, regimeState: RegimeState, hurstVal: number, conviction: number): ExtendedSignalProbability {
+function computeSignalProbability(symbol: string, direction: "LONG" | "SHORT", rsiVal: number, bbPct: number, vwapVal: number, currentPrice: number, adx: number, atr: number, isDivergent: boolean, isReversalCandle: boolean, regimeState: RegimeState, hurstVal: number, conviction: number, persistenceProbability = 0.5): ExtendedSignalProbability {
   const baseVol = INSTRUMENTS[symbol as keyof typeof INSTRUMENTS]?.volatility || 0.5;
   const isTrendRegime = regimeState.trendProbability > 0.40;
   const isMRRegime = regimeState.meanReversionProbability > 0.40;
   const isTransition = regimeState.transitionProbability > 0.35;
   let regimeCompatibility: number;
   if (isMRRegime && !isTrendRegime) regimeCompatibility = 0.75 + 0.25 * regimeState.meanReversionProbability;
-  else if (isTrendRegime && !isMRRegime) regimeCompatibility = 0.55 + 0.25 * regimeState.trendProbability;
+  else if (isTrendRegime && !isMRRegime) regimeCompatibility = 0.55 + 0.30 * regimeState.trendProbability + 0.15 * persistenceProbability;
   else if (isTransition) regimeCompatibility = 0.35;
   else regimeCompatibility = 0.50;
   const rsiExtreme = direction === "LONG" ? (rsiVal < 35 ? (35 - rsiVal) / 35 : 0) : (rsiVal > 65 ? (rsiVal - 65) / 35 : 0);
@@ -2209,16 +2401,17 @@ function computeSignalProbability(symbol: string, direction: "LONG" | "SHORT", r
   const vwapConfirm = direction === "LONG" ? (currentPrice < vwapVal ? 0.15 : -0.05) : (currentPrice > vwapVal ? 0.15 : -0.05);
   const divergenceBonus = isDivergent ? 0.25 : 0;
   const reversalBonus = isReversalCandle ? 0.15 : 0;
-  const rawEdge = 0.25 * rsiExtreme + 0.25 * bbExtreme + 0.10 * vwapConfirm + divergenceBonus + reversalBonus;
+  const persistenceEdge = isTrendRegime ? persistenceProbability * 0.28 : persistenceProbability * 0.08;
+  const rawEdge = 0.25 * rsiExtreme + 0.25 * bbExtreme + 0.10 * vwapConfirm + divergenceBonus + reversalBonus + persistenceEdge;
   const expectedEdge = rawEdge * regimeCompatibility;
   const regimeClarity = regimeState.confidence;
-  const hurstStability = hurstVal > 0.45 && hurstVal < 0.70 ? 0.8 : 0.5;
+  const hurstStability = 0.45 + 0.45 * persistenceProbability - (hurstVal > 0.82 ? 0.10 : 0);
   const signalStrength = Math.min(1, (rsiExtreme + bbExtreme + (isDivergent ? 0.5 : 0) + (isReversalCandle ? 0.3 : 0)) / 2);
-  const confidence = 0.35 * regimeClarity + 0.25 * hurstStability + 0.25 * conviction + 0.15 * signalStrength;
+  const confidence = 0.30 * regimeClarity + 0.25 * hurstStability + 0.20 * conviction + 0.15 * signalStrength + 0.10 * persistenceProbability;
   const volRatio = atr / (currentPrice * baseVol * 0.01);
   const volFavorable = volRatio > 0.5 && volRatio < 2.0 ? 1 - Math.abs(volRatio - 1) : 0.3;
   const volatilityScore = 0.5 * volFavorable + 0.3 * (1 - Math.abs(atr / (currentPrice * 0.005) - 1)) + 0.2 * (1 - regimeState.transitionProbability);
-  const tailRisk = isTransition ? 0.25 : (1 - regimeState.confidence) * 0.3 + (hurstVal < 0.45 ? 0.15 : 0);
+  const tailRisk = isTransition ? 0.25 : (1 - regimeState.confidence) * 0.3 + (persistenceProbability < 0.30 ? 0.12 : 0);
   const uncertainty = clamp01((1 - confidence) * (1 + regimeState.transitionProbability * 0.6) + tailRisk * 0.25);
   const expectedHoldingTime = isTrendRegime ? 45 : isMRRegime ? 20 : 30;
   const expectedRR = isTrendRegime ? 2.5 : isMRRegime ? 2.0 : 1.8;
@@ -2256,7 +2449,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
 
   const signalProfile = indicators.signalProbability || computeSignalProbability(
     symbol, direction, rsiVal, bbPct, vwapVal, currentPrice,
-    adxVal, atrVal, isDivergent, isReversalCandle, regimeState, sub.hurstVal || 0.5, conviction
+    adxVal, atrVal, isDivergent, isReversalCandle, regimeState, sub.hurstVal || 0.5, conviction, sub.lastPersistenceProbability ?? 0.5
   );
   sub.lastSignalProbability = signalProfile;
 
@@ -2321,9 +2514,14 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
 
   const candidateHeat = computePortfolioHeatSnapshot({ symbol, stake, direction });
   const heatPenalty = Math.max(0, candidateHeat.totalHeat - equityCurveThrottle.portfolioHeatCap);
+  const metaWeight = adaptiveIntelligenceState.metaLearning.strategyWeights[symbol] ?? (1 / Math.max(1, Object.keys(INSTRUMENTS).length));
+  const symbolAnomaly = adaptiveIntelligenceState.anomaly[symbol];
+  const adaptiveDefensivePenalty = adaptiveIntelligenceState.mode === "OBSERVE" || adaptiveIntelligenceState.mode === "SHADOW"
+    ? 0
+    : Math.min(0.30, adaptiveIntelligenceState.policy.uncertaintyPenalty + (symbolAnomaly?.recommendedRiskReduction ?? 0) * 0.35);
 
   const baseConfidence = Math.min(1, blendedConfidence * (0.7 + 0.3 * executionAdjustedEdge));
-  const totalPenalty = Math.min(0.85, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9);
+  const totalPenalty = Math.min(0.85, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty);
   const finalConfidence = parseFloat(Math.max(0.05, baseConfidence * (1 - totalPenalty)).toFixed(4));
 
   let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
@@ -2355,11 +2553,15 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     adjustedRisk *= Math.max(0.25, 1 - heatPenalty * 1.6);
   }
   if (symbol === governorFocusSymbol && finalConfidence > 0.60 && portfolioRisk.entropyLevel < 0.35) adjustedRisk *= 1.20;
+  if (adaptiveIntelligenceState.mode === "LIMITED" || adaptiveIntelligenceState.mode === "ACTIVE") {
+    adjustedRisk *= Math.max(0.55, Math.min(1.05, adaptiveIntelligenceState.policy.riskMultiplier));
+    adjustedRisk *= Math.max(0.70, Math.min(1.10, 0.85 + metaWeight));
+  }
   if (portfolioRisk.drawdownSeverity > 0.015) adjustedRisk *= 0.68;
   adjustedRisk = parseFloat(Math.max(0, Math.min(stake, adjustedRisk)).toFixed(2));
 
   const expectedSharpeImpact = parseFloat(Math.max(-1, Math.min(1,
-    (executionAdjustedEdge - 0.45) * 1.6 - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65
+    (executionAdjustedEdge - 0.45) * 1.6 - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65 - adaptiveDefensivePenalty * 0.5
   )).toFixed(4));
 
   const approved = confidenceTier !== ConfidenceTier.REJECT && adjustedRisk > 0;
@@ -2382,9 +2584,9 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (approved) governorMemory.approvals++;
   else governorMemory.vetoes++;
 
-  governorMemory.lastInsight = `Tier: ${confidenceTier} | Conf: ${(finalConfidence * 100).toFixed(0)}% | Risk: $${finalRisk.toFixed(2)} | Heat: ${(candidateHeat.totalHeat * 100).toFixed(0)}% | Equity State: ${equityCurveState}`;
+  governorMemory.lastInsight = `Tier: ${confidenceTier} | Conf: ${(finalConfidence * 100).toFixed(0)}% | Risk: $${finalRisk.toFixed(2)} | Heat: ${(candidateHeat.totalHeat * 100).toFixed(0)}% | Equity State: ${equityCurveState} | AILayer=${adaptiveIntelligenceState.mode}`;
 
-  return {
+  const decision: GovernorDecision = {
     approved,
     confidenceTier,
     finalConfidence,
@@ -2403,6 +2605,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     equityCurveState,
     rejectionReasons: rejectionReasons.length ? rejectionReasons : undefined,
   };
+  sub.lastGovernorDecision = decision;
+  return decision;
 }
 
 // ==========================================
@@ -2465,8 +2669,257 @@ function computeDistributionStats(trades: TradeRecord[]): DistributionStats {
 }
 
 // ==========================================
-// PHASE 2: REGIME-ADAPTIVE EXIT ENGINE
+// PHASE 3: ADAPTIVE META-INTELLIGENCE LAYER
 // ==========================================
+
+function mean(values: number[]): number {
+  return values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : 0;
+}
+
+function stddev(values: number[]): number {
+  if (values.length < 2) return 0;
+  const avg = mean(values);
+  return Math.sqrt(values.reduce((sum, value) => sum + (value - avg) ** 2, 0) / values.length);
+}
+
+function ewma(previous: number, next: number, alpha: number): number {
+  return previous === 0 ? next : previous * (1 - alpha) + next * alpha;
+}
+
+function getOrCreateMemory(symbol: string): LongHorizonMemoryState {
+  if (!adaptiveIntelligenceState.longHorizonMemory[symbol]) {
+    adaptiveIntelligenceState.longHorizonMemory[symbol] = createDefaultMemoryState();
+  }
+  return adaptiveIntelligenceState.longHorizonMemory[symbol];
+}
+
+function updateLongHorizonMemory(record: TradeRecord) {
+  const memory = getOrCreateMemory(record.symbol);
+  const symbolTrades = completedTrades.filter(t => t.symbol === record.symbol).slice(-500);
+  const pnls = symbolTrades.map(t => t.pnl);
+  const pnlMean = mean(pnls);
+  const pnlStd = stddev(pnls) || 1;
+  const downside = pnls.filter(p => p < 0);
+  const downsideStd = stddev(downside) || 1;
+  const recentFeatures = featureStore[record.symbol]?.slice(-250) || [];
+  const volatilitySample = mean(recentFeatures.map(f => f.volatilityForecast.nextPeriodVolatility).filter(Number.isFinite));
+  const persistenceSample = mean(recentFeatures.map(f => f.hurst).filter(Number.isFinite));
+  const runningPnls = pnls.reduce((acc, pnl) => {
+    const prev = acc.length ? acc[acc.length - 1] : 0;
+    acc.push(prev + pnl);
+    return acc;
+  }, [] as number[]);
+  let peak = 0;
+  let maxDrawdown = 0;
+  for (const value of runningPnls) {
+    peak = Math.max(peak, value);
+    maxDrawdown = Math.max(maxDrawdown, peak - value);
+  }
+  const regimeKey = String(record.regimeAtEntry || MarketRegime.TRANSITION);
+  const regimeTrades = symbolTrades.filter(t => t.regimeAtEntry === record.regimeAtEntry);
+  const regimeWins = regimeTrades.filter(t => t.pnl > 0).length;
+  memory.tradesObserved = symbolTrades.length;
+  memory.longTermSharpe = parseFloat(ewma(memory.longTermSharpe, pnlMean / pnlStd, 0.06).toFixed(4));
+  memory.longTermSortino = parseFloat(ewma(memory.longTermSortino, pnlMean / downsideStd, 0.06).toFixed(4));
+  memory.longTermExpectancy = parseFloat(ewma(memory.longTermExpectancy, pnlMean, 0.06).toFixed(4));
+  memory.volatilityMemory = parseFloat(ewma(memory.volatilityMemory, volatilitySample || 0, 0.04).toFixed(4));
+  memory.persistenceMemory = parseFloat(ewma(memory.persistenceMemory, persistenceSample || 0.5, 0.04).toFixed(4));
+  memory.drawdownMemory = parseFloat(ewma(memory.drawdownMemory, maxDrawdown, 0.05).toFixed(4));
+  memory.regimeReliability[regimeKey] = parseFloat((regimeTrades.length ? regimeWins / regimeTrades.length : 0.5).toFixed(4));
+  memory.lastUpdatedEpoch = record.exitEpoch;
+}
+
+function computeRegimeEvolution(symbol: string): RegimeEvolution {
+  const features = featureStore[symbol] || [];
+  if (features.length < 40) {
+    return { structuralShiftProbability: 0.1, volatilityShiftProbability: 0.1, persistenceShiftProbability: 0.1, tailShiftProbability: 0.1, spikeFrequencyShiftProbability: 0.1, confidence: Math.min(0.3, features.length / 120) };
+  }
+  const recent = features.slice(-60);
+  const baseline = features.slice(Math.max(0, features.length - 300), Math.max(0, features.length - 60));
+  const baseVol = mean(baseline.map(f => f.volatilityForecast.nextPeriodVolatility)) || mean(recent.map(f => f.volatilityForecast.nextPeriodVolatility)) || 1;
+  const recentVol = mean(recent.map(f => f.volatilityForecast.nextPeriodVolatility)) || baseVol;
+  const basePersistence = mean(baseline.map(f => f.hurst)) || 0.5;
+  const recentPersistence = mean(recent.map(f => f.hurst)) || 0.5;
+  const baseEntropy = mean(baseline.map(f => f.regimeState.entropyScore)) || 0.3;
+  const recentEntropy = mean(recent.map(f => f.regimeState.entropyScore)) || 0.3;
+  const tailEvents = recent.filter(f => f.volatilityForecast.volatilityShockProbability > 0.55).length / recent.length;
+  const isSpikeInstrument = symbol.includes("BOOM") || symbol.includes("CRASH");
+  const spikeEvents = isSpikeInstrument ? recent.filter(f => f.volatilityForecast.volatilityShockProbability > 0.75).length / recent.length : 0;
+  const volatilityShiftProbability = clamp01(Math.abs(recentVol - baseVol) / Math.max(baseVol, 1e-6));
+  const persistenceShiftProbability = clamp01(Math.abs(recentPersistence - basePersistence) * 3.2);
+  const structuralShiftProbability = clamp01(0.45 * volatilityShiftProbability + 0.35 * persistenceShiftProbability + 0.20 * Math.abs(recentEntropy - baseEntropy));
+  return {
+    structuralShiftProbability: parseFloat(structuralShiftProbability.toFixed(4)),
+    volatilityShiftProbability: parseFloat(volatilityShiftProbability.toFixed(4)),
+    persistenceShiftProbability: parseFloat(persistenceShiftProbability.toFixed(4)),
+    tailShiftProbability: parseFloat(tailEvents.toFixed(4)),
+    spikeFrequencyShiftProbability: parseFloat(spikeEvents.toFixed(4)),
+    confidence: parseFloat(clamp01(features.length / PHASE3_MIN_ANOMALY_FEATURES).toFixed(4)),
+  };
+}
+
+function computeAnomalyState(symbol: string, evolution: RegimeEvolution): AnomalyState {
+  const features = featureStore[symbol] || [];
+  const latest = features[features.length - 1];
+  const reasons: string[] = [];
+  let severity = 0;
+  if (latest?.volatilityForecast.volatilityShockProbability && latest.volatilityForecast.volatilityShockProbability > 0.62) {
+    severity += 0.22;
+    reasons.push("volatility_shock_probability");
+  }
+  if (evolution.structuralShiftProbability > 0.55) {
+    severity += 0.25;
+    reasons.push("structural_shift");
+  }
+  if (evolution.persistenceShiftProbability > 0.55) {
+    severity += 0.18;
+    reasons.push("persistence_decay_or_shift");
+  }
+  if (executionHealth.desyncDetected || executionHealth.rejectionRate > 0.12) {
+    severity += 0.20;
+    reasons.push("execution_instability");
+  }
+  if (portfolioHeatState.heatCapExceeded) {
+    severity += 0.15;
+    reasons.push("portfolio_heat_cap");
+  }
+  const anomalyProbability = clamp01(severity + evolution.tailShiftProbability * 0.25);
+  return {
+    anomalyProbability: parseFloat(anomalyProbability.toFixed(4)),
+    severity: parseFloat(clamp01(severity).toFixed(4)),
+    recommendedRiskReduction: parseFloat(clamp01(anomalyProbability * 0.55).toFixed(4)),
+    systemConfidence: parseFloat(clamp01(Math.min(evolution.confidence, features.length / PHASE3_MIN_ANOMALY_FEATURES)).toFixed(4)),
+    reasons: reasons.length ? reasons : ["normal_shadow_observation"],
+  };
+}
+
+function computeExecutionHealthScore() {
+  const latencyScore = clamp01(1 - executionHealth.fillLatency / 1.5);
+  const fillQualityScore = clamp01(1 - Math.abs(executionHealth.slippageEstimate) / 2.0);
+  const synchronizationScore = executionHealth.desyncDetected ? 0.2 : 1;
+  const degradationProbability = clamp01(0.45 * (1 - latencyScore) + 0.30 * (1 - fillQualityScore) + 0.20 * (1 - synchronizationScore) + 0.05 * executionHealth.rejectionRate * 5);
+  return {
+    latencyScore: parseFloat(latencyScore.toFixed(4)),
+    fillQualityScore: parseFloat(fillQualityScore.toFixed(4)),
+    synchronizationScore: parseFloat(synchronizationScore.toFixed(4)),
+    degradationProbability: parseFloat(degradationProbability.toFixed(4)),
+  };
+}
+
+function computeMonteCarloEvolutionState() {
+  const nowEpoch = Math.floor(Date.now() / 1000);
+  if (adaptiveIntelligenceState.monteCarlo.lastRunEpoch && nowEpoch - adaptiveIntelligenceState.monteCarlo.lastRunEpoch < 60) {
+    return adaptiveIntelligenceState.monteCarlo;
+  }
+  const trades = completedTrades.slice(-300);
+  const portfolioRisk = computePortfolioRiskState();
+  if (trades.length < 30) {
+    return { scenarios: 0, survivabilityProbability: 1, worstCaseDrawdown: 0, correlatedLossRisk: portfolioRisk.totalExposure, executionDegradationRisk: adaptiveIntelligenceState.execution.degradationProbability, lastRunEpoch: nowEpoch };
+  }
+  const pnls = trades.map(t => t.pnl);
+  const pnlStd = stddev(pnls) || 1;
+  const avgLoss = Math.abs(mean(pnls.filter(p => p < 0))) || pnlStd;
+  const scenarios = 250;
+  let survivals = 0;
+  let worstDrawdown = 0;
+  let correlatedLossHits = 0;
+  for (let i = 0; i < scenarios; i++) {
+    let equity = balance || 10000;
+    let peak = equity;
+    let dd = 0;
+    for (let j = 0; j < 40; j++) {
+      const sample = pnls[Math.floor(Math.random() * pnls.length)] || 0;
+      const shock = Math.random() < 0.08 ? -avgLoss * (1.5 + Math.random() * 2.5) : 0;
+      const corrShock = Math.random() < portfolioRisk.volatilityCluster * 0.08 ? -avgLoss * 1.8 : 0;
+      if (corrShock < 0) correlatedLossHits++;
+      equity += sample + shock + corrShock;
+      peak = Math.max(peak, equity);
+      dd = Math.max(dd, (peak - equity) / Math.max(peak, 1));
+    }
+    worstDrawdown = Math.max(worstDrawdown, dd);
+    if (dd < 0.12) survivals++;
+  }
+  return {
+    scenarios,
+    survivabilityProbability: parseFloat((survivals / scenarios).toFixed(4)),
+    worstCaseDrawdown: parseFloat(worstDrawdown.toFixed(4)),
+    correlatedLossRisk: parseFloat(clamp01(correlatedLossHits / (scenarios * 40)).toFixed(4)),
+    executionDegradationRisk: adaptiveIntelligenceState.execution.degradationProbability,
+    lastRunEpoch: nowEpoch,
+  };
+}
+
+function updateAdaptiveIntelligence(reason = "scheduled_shadow_update") {
+  const symbols = Object.keys(INSTRUMENTS);
+  const totalTrades = completedTrades.length;
+  const portfolioRisk = computePortfolioRiskState();
+  adaptiveIntelligenceState.execution = computeExecutionHealthScore();
+  const strategyWeights: Record<string, number> = {};
+  const regimePerformance: Record<string, number> = {};
+  let weightedSharpe = 0;
+  let confidenceMass = 0;
+  for (const symbol of symbols) {
+    const stats = computeInstrumentStats(symbol);
+    const memory = getOrCreateMemory(symbol);
+    const sampleConfidence = clamp01((stats.totalTrades - PHASE3_MIN_WEIGHT_SAMPLE) / (PHASE3_FULL_WEIGHT_SAMPLE - PHASE3_MIN_WEIGHT_SAMPLE));
+    const conservativeSharpe = Math.max(-1, Math.min(1.5, memory.longTermSharpe || stats.sharpeRatio || 0));
+    const anomaly = computeAnomalyState(symbol, computeRegimeEvolution(symbol));
+    const baseWeight = 1 / Math.max(1, symbols.length);
+    const performanceTilt = sampleConfidence > 0 ? conservativeSharpe * 0.08 * sampleConfidence : 0;
+    const defensivePenalty = anomaly.recommendedRiskReduction * 0.35 + portfolioRisk.entropyLevel * 0.08;
+    strategyWeights[symbol] = parseFloat(Math.max(0.05, Math.min(0.45, baseWeight + performanceTilt - defensivePenalty)).toFixed(4));
+    for (const [regime, perf] of Object.entries(stats.regimePerformance)) {
+      regimePerformance[`${symbol}:${regime}`] = parseFloat(perf.expectancy.toFixed(4));
+    }
+    adaptiveIntelligenceState.regimeEvolution[symbol] = computeRegimeEvolution(symbol);
+    adaptiveIntelligenceState.anomaly[symbol] = computeAnomalyState(symbol, adaptiveIntelligenceState.regimeEvolution[symbol]);
+    weightedSharpe += strategyWeights[symbol] * conservativeSharpe;
+    confidenceMass += sampleConfidence;
+  }
+  const weightSum = Object.values(strategyWeights).reduce((sum, value) => sum + value, 0) || 1;
+  Object.keys(strategyWeights).forEach(symbol => { strategyWeights[symbol] = parseFloat((strategyWeights[symbol] / weightSum).toFixed(4)); });
+  const maxAnomaly = Math.max(0, ...Object.values(adaptiveIntelligenceState.anomaly).map(a => a.anomalyProbability));
+  const adaptationConfidence = parseFloat(clamp01(confidenceMass / symbols.length).toFixed(4));
+  adaptiveIntelligenceState.metaLearning = {
+    strategyWeights,
+    regimePerformance,
+    executionHealthScore: parseFloat((1 - adaptiveIntelligenceState.execution.degradationProbability).toFixed(4)),
+    uncertaintyScore: parseFloat(clamp01(uncertaintyState.epistemicUncertainty * 0.35 + uncertaintyState.marketUncertainty * 0.45 + maxAnomaly * 0.20).toFixed(4)),
+    adaptationConfidence,
+    sampleSize: totalTrades,
+    lastUpdatedEpoch: Math.floor(Date.now() / 1000),
+    updateReason: adaptationConfidence <= 0 ? `Shadow only: ${reason}; minimum ${PHASE3_MIN_WEIGHT_SAMPLE}+ trades per strategy required.` : `Conservative shadow weights updated: ${reason}.`,
+  };
+  adaptiveIntelligenceState.ensemble = {
+    selectedStrategies: Object.entries(strategyWeights).filter(([, weight]) => weight >= 0.10).map(([symbol]) => symbol),
+    strategyWeights,
+    correlationPenalty: parseFloat((portfolioHeatState.correlationAdjustedHeat ?? portfolioHeatState.totalHeat ?? 0).toFixed(4)),
+    ensembleConfidence: adaptationConfidence,
+    uncertaintyScore: adaptiveIntelligenceState.metaLearning.uncertaintyScore,
+    expectedPortfolioSharpeImpact: parseFloat(weightedSharpe.toFixed(4)),
+  };
+  const policyConfidence = clamp01((totalTrades - PHASE3_MIN_POLICY_SAMPLE) / 250);
+  const defensiveRiskCut = Math.max(maxAnomaly * 0.45, adaptiveIntelligenceState.execution.degradationProbability * 0.35, portfolioRisk.entropyLevel * 0.25);
+  adaptiveIntelligenceState.policy = {
+    riskMultiplier: parseFloat((policyConfidence > 0 ? Math.max(0.55, 1 - defensiveRiskCut) : 1).toFixed(4)),
+    exitAdjustment: parseFloat(Math.max(0.75, 1 - maxAnomaly * 0.25).toFixed(4)),
+    tradeFrequencyAdjustment: parseFloat(Math.max(0.45, 1 - maxAnomaly * 0.50 - adaptiveIntelligenceState.execution.degradationProbability * 0.35).toFixed(4)),
+    confidenceAdjustment: parseFloat((maxAnomaly * 0.12 + uncertaintyState.marketUncertainty * 0.08).toFixed(4)),
+    uncertaintyPenalty: parseFloat((adaptiveIntelligenceState.metaLearning.uncertaintyScore * 0.25).toFixed(4)),
+    sampleSize: totalTrades,
+    policyConfidence: parseFloat(policyConfidence.toFixed(4)),
+    updateReason: policyConfidence <= 0 ? `Shadow policy only; ${PHASE3_MIN_POLICY_SAMPLE}+ trades required before influence.` : "Defensive bounded policy recommendation available to governor.",
+  };
+  adaptiveIntelligenceState.uncertainty = {
+    ...uncertaintyState,
+    recommendedRiskAdjustment: adaptiveIntelligenceState.policy.riskMultiplier,
+    distributionConfidence: parseFloat(clamp01(1 - mean(Object.values(adaptiveIntelligenceState.anomaly).map(a => a.anomalyProbability))).toFixed(4)),
+    modelStability: parseFloat(clamp01(1 - adaptiveIntelligenceState.metaLearning.uncertaintyScore).toFixed(4)),
+  };
+  adaptiveIntelligenceState.monteCarlo = computeMonteCarloEvolutionState();
+  adaptiveIntelligenceState.lastShadowComparison = `Mode=${adaptiveIntelligenceState.mode}; policyRisk=${adaptiveIntelligenceState.policy.riskMultiplier.toFixed(2)}; maxAnomaly=${maxAnomaly.toFixed(2)}; survivability=${adaptiveIntelligenceState.monteCarlo.survivabilityProbability.toFixed(2)}.`;
+}
+
 function computeAdaptiveExitParams(regimeState: RegimeState, hurstVal: number): { stopMultiplier: number; tpMultiplier: number; maxTicks: number; useTrailing: boolean } {
   const isTrend = regimeState.trendProbability > 0.45;
   const isMR = regimeState.meanReversionProbability > 0.40;
@@ -2594,8 +3047,17 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const rsMacroH = sub.hurstMacro || 0.5;
   const rSqr = sub.hurstRSquared || 0.9;
   const conviction = sub.convictionScore || 0.5;
+  const persistenceProbability = computePersistenceProbability(hMicro, hMeso, rsMacroH, rSqr, adx);
+  sub.lastPersistenceProbability = persistenceProbability;
   const kamaLocal = sub.kamaValue || currentPrice;
   const smaHigher = computeSMA(prices, 600); // SMA is light
+  const currentBbPct = parseFloat(((currentPrice - lower) / (upper - lower || 1)).toFixed(3));
+  sub.spikeHarvestState = updateSpikeHarvestState(symbol, currentPrice, atr, epoch, rsiVal, currentBbPct);
+  const volForecast = forecastVolatility(symbol);
+  recordFeatureSnapshot(symbol, currentPrice, rsiVal, currentBbPct, adx, atr, hMicro, conviction, regimeState, volForecast, epoch);
+  if (epoch % 60 === 0) {
+    updateAdaptiveIntelligence("feature_shadow_update");
+  }
 
   // 4. Update the Governor's Focused Instrument dynamically
   evaluateGovernorFocus();
@@ -2634,7 +3096,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   if (!tradingEnabled) {
     // Single terse heartbeat every 5 minutes on the primary symbol only — proves engine is alive
     if (epoch % 300 === 0 && symbol === selectedSymbol) {
-      logs.push(`[IML_MONITOR] 🔍 PAUSED — Monitoring ${symbol} | RSI: ${rsiVal.toFixed(1)} | ADX: ${adx.toFixed(1)} | Regime: ${currentRegime} | H_μ: ${hMicro.toFixed(3)} | Conviction: ${(conviction * 100).toFixed(0)}% | Positions: ${activePositions.length}`);
+      logs.push(`[IML_MONITOR] 🔍 PAUSED — Monitoring ${symbol} | RSI: ${rsiVal.toFixed(1)} | ADX: ${adx.toFixed(1)} | Regime: ${currentRegime} | PersistenceP: ${(persistenceProbability * 100).toFixed(0)}% | Conviction: ${(conviction * 100).toFixed(0)}% | Positions: ${activePositions.length}`);
     }
     return;
   }
@@ -2643,7 +3105,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const dRsiArr = prices.slice(-100).map((_, i, arr) => computeRSI(prices.slice(-100).slice(0, i + 1), 14));
 
   // 6. Evaluate Signals via continuous probabilities
-  const isPersistentRegime = hMicro >= 0.65 && hMeso >= 0.62 && rsMacroH >= 0.60 && rSqr >= 0.92;
+  const isPersistentRegime = persistenceProbability >= Math.max(0.48, equityCurveThrottle.confidenceThreshold);
 
   const bbRange = upper - lower || 1;
   const meanReversionIntensity = clamp01((directionalDistance(currentPrice, lower, upper, "MR") + clamp01((sub.rsiOversoldThreshold - rsiVal) / sub.rsiOversoldThreshold)) / 2);
@@ -2661,26 +3123,33 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const reversalBoostLong = checkReversalCandle(candles) ? 0.25 : 0;
   const reversalBoostShort = reversalBoostLong;
 
+  const spikeState = sub.spikeHarvestState;
+  const spikeRecoveryLong = symbol === "CRASH500" && spikeState?.spikeDetected ? spikeState.recoveryProbability : 0;
+  const spikeRecoveryShort = symbol === "BOOM500" && spikeState?.spikeDetected ? spikeState.recoveryProbability : 0;
+  const spikeSuppression = (symbol === "CRASH500" || symbol === "BOOM500") && spikeState?.spikeDetected && (spikeState.postSpikeTicksElapsed || 0) < 8 ? 0.55 : 1;
+
   const longStrengthRaw =
-    (isPersistentRegime ? clamp01((kamaLocal < currentPrice && smaHigher < currentPrice ? 0.75 + breakoutAlignment * 0.25 : 0.35)) : 0) * 0.35 +
+    (isPersistentRegime ? clamp01((kamaLocal < currentPrice && smaHigher < currentPrice ? 0.45 + persistenceProbability * 0.55 + breakoutAlignment * 0.15 : persistenceProbability * 0.35)) : persistenceProbability * 0.12) * 0.35 +
     oversoldIntensity * 0.25 +
     rsiLongFavor * 0.18 +
     vwapLongFavor * 0.15 +
     divergenceBoostLong * 0.4 +
     reversalBoostLong * 0.3 +
-    meanReversionIntensity * 0.2;
+    meanReversionIntensity * 0.2 +
+    spikeRecoveryLong * 0.55;
 
   const shortStrengthRaw =
-    (isPersistentRegime ? clamp01((kamaLocal > currentPrice && smaHigher > currentPrice ? 0.75 + breakoutAlignment * 0.25 : 0.35)) : 0) * 0.35 +
+    (isPersistentRegime ? clamp01((kamaLocal > currentPrice && smaHigher > currentPrice ? 0.45 + persistenceProbability * 0.55 + breakoutAlignment * 0.15 : persistenceProbability * 0.35)) : persistenceProbability * 0.12) * 0.35 +
     overboughtIntensity * 0.25 +
     rsiShortFavor * 0.18 +
     vwapShortFavor * 0.15 +
     divergenceBoostShort * 0.4 +
     reversalBoostShort * 0.3 +
-    meanReversionIntensity * 0.2;
+    meanReversionIntensity * 0.2 +
+    spikeRecoveryShort * 0.55;
 
-  const longStrength = clamp01(longStrengthRaw);
-  const shortStrength = clamp01(shortStrengthRaw);
+  const longStrength = clamp01(longStrengthRaw * spikeSuppression);
+  const shortStrength = clamp01(shortStrengthRaw * spikeSuppression);
   const direction: "LONG" | "SHORT" = longStrength >= shortStrength ? "LONG" : "SHORT";
   const signalStrength = direction === "LONG" ? longStrength : shortStrength;
   const signalDelta = longStrength - shortStrength;
@@ -2691,7 +3160,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     if ((direction === "LONG" ? rsiLongFavor : rsiShortFavor) > 0.2) conditionsList.push("RSI_IMBAL");
     if ((direction === "LONG" ? vwapLongFavor : vwapShortFavor) > 0.2) conditionsList.push("VWAP_DISLOC");
     if ((direction === "LONG" ? divergenceBoostLong : divergenceBoostShort) > 0.1) conditionsList.push("DIVERGENCE_CONF");
-    if (isPersistentRegime) conditionsList.push("PERSISTENT_HURST");
+    if (persistenceProbability > 0.48) conditionsList.push("PERSISTENCE_PROB");
+    if ((direction === "LONG" ? spikeRecoveryLong : spikeRecoveryShort) > 0.45) conditionsList.push("POST_SPIKE_RECOVERY");
   }
 
   const tickEffMode = getEffectiveTradeType();
@@ -2781,16 +3251,17 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
     // Volatility-adjusted Boundaries & Dynamic Position/Leverage Multiplier Sizing
     logs.push(`[TRACE] Setting stopLoss and takeProfit distances...`);
-    const atrBuffer = atr * sub.atrStopMultiplier;
+    const adaptiveExit = computeAdaptiveExitParams(regimeState, hMicro);
+    const atrBuffer = atr * Math.max(1.0, Math.min(sub.atrStopMultiplier, adaptiveExit.stopMultiplier));
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
-    let takeProfitDistance = stopLossDistance * 2.0; // Optimized standard exit ratio (IML recommended higher R)
+    let takeProfitDistance = stopLossDistance * adaptiveExit.tpMultiplier;
     let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
     let targetRisk = 25.00;
 
     if (tickEffMode === "HYBRID_LINEAR") {
       const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
       targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
-      takeProfitDistance = stopLossDistance * hybridRewardRatio;
+      takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
       stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
       logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
     } else if (tickEffMode === "MULTIPLIER") {
@@ -2866,9 +3337,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
       isFractalTrend: isPersistentRegime,
-      maxTicksOverride: Math.max(15, Math.ceil((auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
+      maxTicksOverride: Math.max(15, Math.ceil(Math.min(adaptiveExit.maxTicks, auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
         : auditRes.confidenceTier === ConfidenceTier.MEDIUM ? sub.maxTicksInTrade * 0.85
         : sub.maxTicksInTrade * 0.65) * equityCurveThrottle.maxPositionDurationScale)),
+      entrySignalProbability: auditRes.finalConfidence,
+      entryExpectedEdge: auditRes.executionAdjustedEdge,
+      entryExpectedSharpeImpact: auditRes.expectedSharpeImpact,
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
@@ -3473,6 +3947,8 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     maxAdverseExcursion: pos.maxAdverseExcursion ?? 0,
     derivCloseConfirmed,
     derivedSharpeContribution: parseFloat((finalPnl / Math.max(1, Math.abs(pos.stake))).toFixed(4)),
+    entrySignalProbability: pos.entrySignalProbability,
+    entryExpectedEdge: pos.entryExpectedEdge,
   };
 
   const latencySample = Math.abs((epoch - (pos.closeRequestedAt || pos.entryEpoch)) || 1);
@@ -3485,6 +3961,9 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   }
 
   completedTrades.push(record);
+  updateLongHorizonMemory(record);
+  updateAdaptiveIntelligence("settlement_update");
+  scheduleStateSaveToSupabase();
   // Balance is authoritative from Deriv WS stream — do not write locally here.
   // peakBalance tracking is maintained from the stream handler.
   logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Source: ${derivCloseConfirmed ? "Deriv authoritative close confirmation" : "local engine settlement"}`);
@@ -3513,6 +3992,399 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   }
 }
 
+
+const MICRO_CONSERVATIVE_REFERENCE_BALANCE = 50;
+
+const REPORT_ENDPOINT_INVENTORY = [
+  { method: "GET", path: "/api/state", purpose: "Primary live dashboard state: account, governor, portfolio heat, uncertainty, opportunity density, adaptive intelligence, sub-algorithms, positions, and logs." },
+  { method: "GET", path: "/api/real-capital-report", purpose: "Deterministic real-capital operating report JSON for risk, staking, endpoints, instruments, execution health, and micro-account readiness." },
+  { method: "GET", path: "/api/report-summary", purpose: "Latest generated PDF report summary and download URL." },
+  { method: "POST", path: "/api/force-report", purpose: "Manual trigger for the full PDF sector report." },
+  { method: "POST", path: "/api/analyze", purpose: "AI/offline narrative analysis endpoint backed by deterministic system telemetry." },
+  { method: "GET", path: "/api/ml-export", purpose: "CSV-style learning and trade analytics export for offline review." },
+  { method: "GET", path: "/api/logs/export", purpose: "CSV log export for audit and incident reconstruction." },
+  { method: "POST", path: "/api/config", purpose: "Runtime configuration endpoint for symbol focus, risk preset, hybrid risk controls, and sub-algorithm parameters." },
+  { method: "POST", path: "/api/resume-session", purpose: "Session resume endpoint after circuit-breaker/cooldown handling." },
+  { method: "GET", path: "/api/ticks", purpose: "Recent tick stream endpoint for the selected instrument." },
+  { method: "POST", path: "/api/trade", purpose: "Manual trade execution endpoint; must use the same economic preflight after the staking-engine upgrade." },
+  { method: "POST", path: "/api/close-position", purpose: "Manual/defensive close endpoint for open positions." },
+  { method: "POST", path: "/api/reset", purpose: "Full local/cloud state reset endpoint for controlled operational resets." },
+  { method: "GET", path: "/reports/:file", purpose: "Serves generated PDF reports from the reports directory." },
+];
+
+function money(value: number): string {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `$${safe.toFixed(2)}`;
+}
+
+function pct(value: number): string {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `${(safe * 100).toFixed(2)}%`;
+}
+
+function pctWhole(value: number): string {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `${(safe * 100).toFixed(0)}%`;
+}
+
+function visualBar(value: number, width = 20): string {
+  const filled = Math.max(0, Math.min(width, Math.round(clamp01(value) * width)));
+  return `${"█".repeat(filled)}${"░".repeat(width - filled)}`;
+}
+
+function getMicroConservativeProfile(accountBalance = MICRO_CONSERVATIVE_REFERENCE_BALANCE) {
+  if (accountBalance < 50) {
+    return {
+      name: "NANO_SURVIVAL",
+      referenceBalance: accountBalance,
+      operatingBand: "$30–$50",
+      baseRiskPct: 0.0035,
+      maxRiskPct: 0.0050,
+      maxStakePct: 0.0125,
+      dailyLossPct: 0.03,
+      maxConcurrentPositions: 1,
+      minRewardToRisk: 1.80,
+      maxStakeToReward: 3.00,
+      primarySymbols: ["R_25"],
+      reducedSymbols: ["R_75"],
+      disabledUntilPreflight: ["BOOM500", "CRASH500"],
+      verdict: "Operate minimum-size only; every order must prove reward exceeds loss before execution.",
+    };
+  }
+  if (accountBalance < 250) {
+    return {
+      name: "MICRO_CONSERVATIVE",
+      referenceBalance: accountBalance,
+      operatingBand: "$50–$100 default, valid up to $250",
+      baseRiskPct: 0.0050,
+      maxRiskPct: 0.0075,
+      maxStakePct: 0.0200,
+      dailyLossPct: 0.03,
+      maxConcurrentPositions: 1,
+      minRewardToRisk: 2.00,
+      maxStakeToReward: 3.00,
+      primarySymbols: ["R_25"],
+      reducedSymbols: ["R_75"],
+      disabledUntilPreflight: ["BOOM500", "CRASH500"],
+      verdict: "Recommended operator profile for the requested $50 live-start plan.",
+    };
+  }
+  if (accountBalance < 1000) {
+    return {
+      name: "SMALL_ACCOUNT_CONSERVATIVE",
+      referenceBalance: accountBalance,
+      operatingBand: "$250–$1,000",
+      baseRiskPct: 0.0075,
+      maxRiskPct: 0.0100,
+      maxStakePct: 0.0300,
+      dailyLossPct: 0.03,
+      maxConcurrentPositions: 2,
+      minRewardToRisk: 2.00,
+      maxStakeToReward: 3.50,
+      primarySymbols: ["R_25", "R_75"],
+      reducedSymbols: ["BOOM500", "CRASH500"],
+      disabledUntilPreflight: [],
+      verdict: "Full four-symbol portfolio can be staged only after order economics are enforced.",
+    };
+  }
+  return {
+    name: "STANDARD_CONSERVATIVE",
+    referenceBalance: accountBalance,
+    operatingBand: "$1,000+",
+    baseRiskPct: 0.0100,
+    maxRiskPct: 0.0125,
+    maxStakePct: 0.0400,
+    dailyLossPct: 0.03,
+    maxConcurrentPositions: 3,
+    minRewardToRisk: 2.00,
+    maxStakeToReward: 4.00,
+    primarySymbols: Object.keys(INSTRUMENTS),
+    reducedSymbols: [],
+    disabledUntilPreflight: [],
+    verdict: "Standard portfolio operation after live validation and economic preflight.",
+  };
+}
+
+function estimatePositionEconomics(position: ActivePosition) {
+  const effectiveMultiplier = position.multiplier ?? (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200);
+  const stopDistance = Math.abs(position.entryPrice - position.stopLoss);
+  const targetDistance = Math.abs(position.takeProfit - position.entryPrice);
+  const expectedLossPct = position.entryPrice > 0 ? (stopDistance / position.entryPrice) * effectiveMultiplier : 0;
+  const expectedRewardPct = position.entryPrice > 0 ? (targetDistance / position.entryPrice) * effectiveMultiplier : 0;
+  const maxLossAmount = Math.min(position.stake, position.isHybridLinear && position.targetRiskAmount ? position.targetRiskAmount : position.stake * expectedLossPct);
+  const targetProfitAmount = position.stake * expectedRewardPct;
+  const rewardToRisk = maxLossAmount > 0 ? targetProfitAmount / maxLossAmount : 0;
+  const stakeToReward = targetProfitAmount > 0 ? position.stake / targetProfitAmount : Infinity;
+  return {
+    id: position.id,
+    symbol: position.symbol,
+    direction: position.direction,
+    stake: parseFloat(position.stake.toFixed(2)),
+    effectiveMultiplier,
+    maxLossAmount: parseFloat(maxLossAmount.toFixed(2)),
+    targetProfitAmount: parseFloat(targetProfitAmount.toFixed(2)),
+    rewardToRisk: parseFloat(rewardToRisk.toFixed(3)),
+    stakeToReward: Number.isFinite(stakeToReward) ? parseFloat(stakeToReward.toFixed(3)) : 999,
+    riskPctOfEquity: parseFloat((maxLossAmount / Math.max(1, balance)).toFixed(4)),
+  };
+}
+
+function buildConfiguredRiskEconomics(profile = getMicroConservativeProfile()) {
+  const referenceBalance = profile.referenceBalance || MICRO_CONSERVATIVE_REFERENCE_BALANCE;
+  const configuredRisk = hybridRiskType === "PERCENT" ? referenceBalance * hybridRiskPercent / 100 : hybridRiskFixedAmount;
+  const currentHybridCap = Math.max(0.35, Math.min(configuredRisk, referenceBalance * 0.1));
+  const recommendedRiskBudget = Math.max(0.35, referenceBalance * profile.baseRiskPct);
+  const recommendedMaxLoss = Math.max(0.35, referenceBalance * profile.maxRiskPct);
+  const recommendedMaxStake = Math.max(0.35, referenceBalance * profile.maxStakePct);
+  const dailyLossLimit = referenceBalance * profile.dailyLossPct;
+  const fixedRiskUnsafe = hybridRiskType === "FIXED" && hybridRiskFixedAmount > recommendedMaxLoss;
+  const percentRiskUnsafe = hybridRiskType === "PERCENT" && hybridRiskPercent / 100 > profile.maxRiskPct;
+  const tenPctCapUnsafe = currentHybridCap > recommendedMaxLoss;
+  const reasons: string[] = [];
+  if (fixedRiskUnsafe) reasons.push(`Fixed risk ${money(hybridRiskFixedAmount)} exceeds ${profile.name} max-loss budget ${money(recommendedMaxLoss)}.`);
+  if (percentRiskUnsafe) reasons.push(`Percent risk ${hybridRiskPercent.toFixed(2)}% exceeds ${profile.name} max ${pct(profile.maxRiskPct)}.`);
+  if (tenPctCapUnsafe) reasons.push(`Current hybrid cap ${money(currentHybridCap)} can exceed micro-safe max loss ${money(recommendedMaxLoss)}.`);
+  if (referenceBalance < 75 && activePositions.length > 0) reasons.push("Nano accounts should hold only one minimum-size position and require immediate economic preflight.");
+  return {
+    configuredRiskType: hybridRiskType,
+    configuredFixedRisk: hybridRiskFixedAmount,
+    configuredRiskPercent: hybridRiskPercent,
+    referenceBalance,
+    configuredRiskBudget: parseFloat(configuredRisk.toFixed(2)),
+    currentHybridEffectiveCap: parseFloat(currentHybridCap.toFixed(2)),
+    recommendedRiskBudget: parseFloat(recommendedRiskBudget.toFixed(2)),
+    recommendedMaxLoss: parseFloat(recommendedMaxLoss.toFixed(2)),
+    recommendedMaxStake: parseFloat(recommendedMaxStake.toFixed(2)),
+    dailyLossLimit: parseFloat(dailyLossLimit.toFixed(2)),
+    currentRiskPctOfEquity: parseFloat((configuredRisk / Math.max(1, referenceBalance)).toFixed(4)),
+    recommendedBaseRiskPct: profile.baseRiskPct,
+    recommendedMaxRiskPct: profile.maxRiskPct,
+    recommendedMaxStakePct: profile.maxStakePct,
+    fixedRiskUnsafe,
+    percentRiskUnsafe,
+    tenPctCapUnsafe,
+    microSafe: reasons.length === 0 && tradingMode !== "MULTIPLIER",
+    reasons: reasons.length ? reasons : ["Current configured risk is inside the selected micro-conservative risk envelope."],
+  };
+}
+
+function buildRealCapitalReportSnapshot() {
+  updateAdaptiveIntelligence("real_capital_report_snapshot");
+  const profile = getMicroConservativeProfile(MICRO_CONSERVATIVE_REFERENCE_BALANCE);
+  const riskAudit = buildConfiguredRiskEconomics(profile);
+  const portfolioRisk = computePortfolioRiskState();
+  const portfolioHeat = computePortfolioHeatSnapshot();
+  const activeEconomics = activePositions.map(estimatePositionEconomics);
+  const totalOpenMaxLoss = activeEconomics.reduce((sum, p) => sum + p.maxLossAmount, 0);
+  const totalOpenTargetProfit = activeEconomics.reduce((sum, p) => sum + p.targetProfitAmount, 0);
+  const endpointCoverage = REPORT_ENDPOINT_INVENTORY;
+  const symbolReports = Object.keys(INSTRUMENTS).map(symbol => {
+    const stats = computeInstrumentStats(symbol);
+    const sub = subAlgorithms[symbol];
+    const regime = sub.regimeState || computeRegimeState(symbol);
+    const anomaly = adaptiveIntelligenceState.anomaly[symbol];
+    const memory = adaptiveIntelligenceState.longHorizonMemory[symbol] || createDefaultMemoryState();
+    const cluster = Object.entries(CORRELATION_CLUSTERS).find(([, symbols]) => symbols.includes(symbol))?.[0] || "UNCLUSTERED";
+    return {
+      symbol,
+      name: INSTRUMENTS[symbol as keyof typeof INSTRUMENTS].name,
+      role: profile.primarySymbols.includes(symbol) ? "PRIMARY" : profile.reducedSymbols.includes(symbol) ? "REDUCED" : profile.disabledUntilPreflight.includes(symbol) ? "DISABLED_UNTIL_PREFLIGHT" : "STANDARD",
+      enabled: sub.enabled,
+      cluster,
+      idealStrategy: INSTRUMENTS[symbol as keyof typeof INSTRUMENTS].idealStrategy,
+      targetRiskStakeMultiplier: sub.targetRiskStakeMultiplier,
+      targetLossPct: sub.targetLossPct,
+      totalTrades: stats.totalTrades,
+      winRate: stats.winRate,
+      expectancy: stats.expectancy,
+      sharpeRatio: stats.sharpeRatio,
+      sortinoRatio: stats.sortinoRatio,
+      profitFactor: stats.profitFactor,
+      maxDrawdown: stats.maxDrawdown,
+      regime,
+      lastSignalProbability: sub.lastSignalProbability || null,
+      lastGovernorDecision: sub.lastGovernorDecision || null,
+      anomaly: anomaly || null,
+      longHorizonMemory: memory,
+      spikeHarvestState: sub.spikeHarvestState || null,
+      persistenceProbability: sub.lastPersistenceProbability ?? null,
+    };
+  });
+  const endpointRiskNotes = [
+    "All live execution paths must route through the same order-economics preflight before live deployment.",
+    "Manual /api/trade must not bypass the governor or micro-risk rules after the staking engine is upgraded.",
+    "Reports must be generated from deterministic telemetry first; AI narrative is advisory only.",
+  ];
+  const readinessReasons: string[] = [];
+  if (!riskAudit.microSafe) readinessReasons.push(...riskAudit.reasons);
+  if (activePositions.length > profile.maxConcurrentPositions) readinessReasons.push(`Open positions ${activePositions.length} exceed ${profile.name} limit ${profile.maxConcurrentPositions}.`);
+  if (tradingMode === "MULTIPLIER") readinessReasons.push("MULTIPLIER-only mode is not recommended for the $50 micro-conservative start profile.");
+  if (riskPreset !== "CONSERVATIVE") readinessReasons.push(`Risk preset is ${riskPreset}; report recommends CONSERVATIVE for the first $50 live-start phase.`);
+  if (profile.disabledUntilPreflight.some(sym => subAlgorithms[sym]?.enabled)) readinessReasons.push(`Event-risk instruments (${profile.disabledUntilPreflight.join(", ")}) remain enabled before universal order-economics preflight.`);
+  const liveReadiness = readinessReasons.length === 0 ? "MICRO_READY_AFTER_PREFLIGHT" : "REPORT_READY_STAKING_FIX_REQUIRED";
+  return {
+    generatedAt: new Date().toISOString(),
+    sessionId: botSessionId,
+    liveReadiness,
+    readinessReasons: readinessReasons.length ? readinessReasons : ["Configuration matches the requested micro-conservative envelope, pending final preflight enforcement."],
+    account: {
+      balance: parseFloat(balance.toFixed(2)),
+      requestedLiveStartBalance: MICRO_CONSERVATIVE_REFERENCE_BALANCE,
+      peakBalance: parseFloat(peakBalance.toFixed(2)),
+      sessionStartBalance: parseFloat((sessionStartBalance || balance).toFixed(2)),
+      tradingEnabled,
+      tradingMode,
+      riskPreset,
+      selectedSymbol,
+      governorFocusSymbol,
+      sessionBlocked,
+      activePositions: activePositions.length,
+      completedTrades: completedTrades.length,
+    },
+    requestedProfile: profile,
+    stakingAudit: riskAudit,
+    activePositionEconomics: activeEconomics,
+    portfolioTotals: {
+      totalOpenStake: parseFloat(activePositions.reduce((sum, p) => sum + p.stake, 0).toFixed(2)),
+      totalOpenMaxLoss: parseFloat(totalOpenMaxLoss.toFixed(2)),
+      totalOpenTargetProfit: parseFloat(totalOpenTargetProfit.toFixed(2)),
+      openRiskPctOfEquity: parseFloat((totalOpenMaxLoss / Math.max(1, balance)).toFixed(4)),
+      openRewardToRisk: totalOpenMaxLoss > 0 ? parseFloat((totalOpenTargetProfit / totalOpenMaxLoss).toFixed(3)) : 0,
+    },
+    portfolioRisk,
+    portfolioHeat,
+    equityCurve: { state: equityCurveState, throttle: equityCurveThrottle },
+    uncertaintyState,
+    opportunityDensity: opportunityDensityMetrics,
+    executionHealth,
+    adaptiveIntelligence: adaptiveIntelligenceState,
+    symbols: symbolReports,
+    endpointCoverage,
+    endpointRiskNotes,
+    visuals: {
+      portfolioHeat: visualBar(portfolioHeat.totalHeat || 0),
+      correlationHeat: visualBar((portfolioHeat as any).correlationAdjustedHeat || portfolioHeat.totalHeat || 0),
+      executionDegradation: visualBar(adaptiveIntelligenceState.execution.degradationProbability || 0),
+      modelUncertainty: visualBar(adaptiveIntelligenceState.metaLearning.uncertaintyScore || uncertaintyState.marketUncertainty || 0),
+      openRisk: visualBar(totalOpenMaxLoss / Math.max(1, balance * profile.dailyLossPct)),
+    },
+    recommendations: [
+      "Implement the micro-safe staking engine next: percent-based default, governor allocation as final ceiling, and order-economics preflight before Deriv proposal dispatch.",
+      "For the requested $50 live-start plan, default to MICRO_CONSERVATIVE: R_25 primary, R_75 reduced, BOOM/CRASH disabled until preflight validates reward-to-risk and stake-to-reward.",
+      "Disable fixed $25 risk for micro accounts; percent risk should default around 0.50% with an absolute economic sanity check against Deriv minimum stake.",
+      "Reject any order where target reward is below max loss × minimum R:R or stake-to-target-reward is structurally absurd.",
+      "Keep Phase 3 adaptive intelligence in SHADOW mode until the staking layer has produced a clean sample of live executions.",
+    ],
+  };
+}
+
+function renderRealCapitalMarkdownReport(snapshot = buildRealCapitalReportSnapshot()): string {
+  const lines: string[] = [];
+  lines.push(`# Infinity Markets Lab — Real Capital Risk & Adaptive Intelligence Report`);
+  lines.push(`Generated: ${snapshot.generatedAt}`);
+  lines.push(`Session: ${snapshot.sessionId}`);
+  lines.push("");
+  lines.push(`## 1. Executive Risk Verdict`);
+  lines.push(`| Field | Value |`);
+  lines.push(`|---|---:|`);
+  lines.push(`| Live readiness | **${snapshot.liveReadiness}** |`);
+  lines.push(`| Current loaded balance | ${money(snapshot.account.balance)} |`);
+  lines.push(`| Requested live-start balance | ${money(snapshot.account.requestedLiveStartBalance)} |`);
+  lines.push(`| Trading mode | ${snapshot.account.tradingMode} |`);
+  lines.push(`| Risk preset | ${snapshot.account.riskPreset} |`);
+  lines.push(`| Requested profile | ${snapshot.requestedProfile.name} (${snapshot.requestedProfile.operatingBand}) |`);
+  lines.push(`| Max concurrent positions | ${snapshot.requestedProfile.maxConcurrentPositions} |`);
+  lines.push(`| Primary symbols | ${snapshot.requestedProfile.primarySymbols.join(", ")} |`);
+  lines.push(`| Reduced symbols | ${snapshot.requestedProfile.reducedSymbols.join(", ") || "None"} |`);
+  lines.push(`| Disabled until preflight | ${snapshot.requestedProfile.disabledUntilPreflight.join(", ") || "None"} |`);
+  lines.push("");
+  lines.push(`**Readiness reasons**`);
+  snapshot.readinessReasons.forEach((reason: string) => lines.push(`- ${reason}`));
+  lines.push("");
+  lines.push(`## 2. Micro-Conservative Staking Audit`);
+  lines.push(`| Metric | Current | Recommended |`);
+  lines.push(`|---|---:|---:|`);
+  lines.push(`| Risk type | ${snapshot.stakingAudit.configuredRiskType} | PERCENT |`);
+  lines.push(`| Configured fixed risk | ${money(snapshot.stakingAudit.configuredFixedRisk)} | <= ${money(snapshot.stakingAudit.recommendedMaxLoss)} |`);
+  lines.push(`| Configured percent risk | ${snapshot.stakingAudit.configuredRiskPercent.toFixed(2)}% | ${(snapshot.stakingAudit.recommendedBaseRiskPct * 100).toFixed(2)}% base / ${(snapshot.stakingAudit.recommendedMaxRiskPct * 100).toFixed(2)}% max |`);
+  lines.push(`| Current hybrid effective cap | ${money(snapshot.stakingAudit.currentHybridEffectiveCap)} | ${money(snapshot.stakingAudit.recommendedMaxLoss)} max loss |`);
+  lines.push(`| Recommended risk budget | — | ${money(snapshot.stakingAudit.recommendedRiskBudget)} |`);
+  lines.push(`| Recommended max stake | — | ${money(snapshot.stakingAudit.recommendedMaxStake)} |`);
+  lines.push(`| Daily loss limit | — | ${money(snapshot.stakingAudit.dailyLossLimit)} |`);
+  lines.push("");
+  lines.push(`Risk audit status: **${snapshot.stakingAudit.microSafe ? "INSIDE MICRO ENVELOPE" : "FIX REQUIRED"}**`);
+  snapshot.stakingAudit.reasons.forEach((reason: string) => lines.push(`- ${reason}`));
+  lines.push("");
+  lines.push(`## 3. Visual Risk Bars`);
+  lines.push(`\`\`\``);
+  lines.push(`Portfolio Heat       ${snapshot.visuals.portfolioHeat} ${pctWhole(snapshot.portfolioHeat.totalHeat || 0)}`);
+  lines.push(`Correlation Heat     ${snapshot.visuals.correlationHeat} ${pctWhole((snapshot.portfolioHeat as any).correlationAdjustedHeat || snapshot.portfolioHeat.totalHeat || 0)}`);
+  lines.push(`Execution Degrade    ${snapshot.visuals.executionDegradation} ${pctWhole(snapshot.adaptiveIntelligence.execution.degradationProbability || 0)}`);
+  lines.push(`Model Uncertainty    ${snapshot.visuals.modelUncertainty} ${pctWhole(snapshot.adaptiveIntelligence.metaLearning.uncertaintyScore || 0)}`);
+  lines.push(`Daily Loss Usage     ${snapshot.visuals.openRisk} ${pctWhole(snapshot.portfolioTotals.openRiskPctOfEquity / Math.max(0.0001, snapshot.requestedProfile.dailyLossPct))}`);
+  lines.push(`\`\`\``);
+  lines.push("");
+  lines.push(`## 4. Active Position Economics`);
+  if (snapshot.activePositionEconomics.length === 0) {
+    lines.push(`No active positions. Next build should enforce preflight before any new position is sent to Deriv.`);
+  } else {
+    lines.push(`| ID | Symbol | Stake | Max Loss | Target Profit | R:R | Stake/Reward | Risk % Equity |`);
+    lines.push(`|---|---|---:|---:|---:|---:|---:|---:|`);
+    snapshot.activePositionEconomics.forEach((p: any) => lines.push(`| ${p.id} | ${p.symbol} | ${money(p.stake)} | ${money(p.maxLossAmount)} | ${money(p.targetProfitAmount)} | ${p.rewardToRisk.toFixed(2)} | ${p.stakeToReward.toFixed(2)} | ${pct(p.riskPctOfEquity)} |`));
+  }
+  lines.push("");
+  lines.push(`## 5. Portfolio Intelligence`);
+  lines.push(`| Metric | Value |`);
+  lines.push(`|---|---:|`);
+  lines.push(`| Total open stake | ${money(snapshot.portfolioTotals.totalOpenStake)} |`);
+  lines.push(`| Total open max loss | ${money(snapshot.portfolioTotals.totalOpenMaxLoss)} |`);
+  lines.push(`| Total open target profit | ${money(snapshot.portfolioTotals.totalOpenTargetProfit)} |`);
+  lines.push(`| Open risk % of equity | ${pct(snapshot.portfolioTotals.openRiskPctOfEquity)} |`);
+  lines.push(`| Open reward-to-risk | ${snapshot.portfolioTotals.openRewardToRisk.toFixed(2)}R |`);
+  lines.push(`| Equity curve state | ${snapshot.equityCurve.state} |`);
+  lines.push(`| Heat cap | ${pct(snapshot.equityCurve.throttle.portfolioHeatCap)} |`);
+  lines.push("");
+  lines.push(`## 6. Symbol-by-Symbol Operating Map`);
+  lines.push(`| Symbol | Role | Enabled | Cluster | Strategy | Trades | Win % | Sharpe | Anomaly | Regime Trend/MR/Transition |`);
+  lines.push(`|---|---|---:|---|---|---:|---:|---:|---:|---|`);
+  snapshot.symbols.forEach((s: any) => lines.push(`| ${s.symbol} | ${s.role} | ${s.enabled ? "Yes" : "No"} | ${s.cluster} | ${s.idealStrategy} | ${s.totalTrades} | ${s.winRate.toFixed(1)} | ${s.sharpeRatio.toFixed(2)} | ${pctWhole(s.anomaly?.anomalyProbability || 0)} | ${pctWhole(s.regime.trendProbability)}/${pctWhole(s.regime.meanReversionProbability)}/${pctWhole(s.regime.transitionProbability)} |`));
+  lines.push("");
+  lines.push(`## 7. Governor, Uncertainty & Adaptive Intelligence`);
+  lines.push(`- Governor focus: **${snapshot.account.governorFocusSymbol}**`);
+  lines.push(`- Adaptive intelligence mode: **${snapshot.adaptiveIntelligence.mode}**`);
+  lines.push(`- Adaptation confidence: **${pctWhole(snapshot.adaptiveIntelligence.metaLearning.adaptationConfidence || 0)}**`);
+  lines.push(`- Policy risk multiplier: **×${Number(snapshot.adaptiveIntelligence.policy.riskMultiplier || 1).toFixed(2)}**`);
+  lines.push(`- Monte Carlo survivability: **${pctWhole(snapshot.adaptiveIntelligence.monteCarlo.survivabilityProbability || 1)}**`);
+  lines.push(`- Worst simulated drawdown: **${pct(snapshot.adaptiveIntelligence.monteCarlo.worstCaseDrawdown || 0)}**`);
+  lines.push(`- Market uncertainty: **${pctWhole(snapshot.uncertaintyState.marketUncertainty)}**`);
+  lines.push(`- Model confidence: **${pctWhole(snapshot.uncertaintyState.modelConfidence)}**`);
+  lines.push("");
+  lines.push(`## 8. Execution Health`);
+  lines.push(`| Metric | Value |`);
+  lines.push(`|---|---:|`);
+  lines.push(`| Fill latency score source | ${snapshot.executionHealth.fillLatency.toFixed(4)} |`);
+  lines.push(`| Slippage estimate | ${snapshot.executionHealth.slippageEstimate.toFixed(4)} |`);
+  lines.push(`| Rejection rate | ${pct(snapshot.executionHealth.rejectionRate)} |`);
+  lines.push(`| Desync detected | ${snapshot.executionHealth.desyncDetected ? "YES" : "NO"} |`);
+  lines.push("");
+  lines.push(`## 9. Endpoint Coverage Map`);
+  lines.push(`| Method | Endpoint | Purpose |`);
+  lines.push(`|---|---|---|`);
+  snapshot.endpointCoverage.forEach((e: any) => lines.push(`| ${e.method} | \`${e.path}\` | ${e.purpose} |`));
+  lines.push("");
+  lines.push(`## 10. Recommendations / Next Build Gate`);
+  snapshot.recommendations.forEach((rec: string) => lines.push(`- ${rec}`));
+  return lines.join("\n");
+}
+
+function drawReportBar(doc: any, label: string, value: number, x: number, y: number, width: number, color: string) {
+  const fillWidth = Math.max(0, Math.min(width, width * clamp01(value)));
+  doc.fontSize(7).font('Helvetica-Bold').fillColor('#475569').text(label, x, y, { width: 150 });
+  doc.rect(x + 155, y + 1, width, 8).fill('#e2e8f0');
+  doc.rect(x + 155, y + 1, fillWidth, 8).fill(color);
+  doc.fontSize(7).font('Helvetica').fillColor('#0f172a').text(`${(clamp01(value) * 100).toFixed(0)}%`, x + 160 + width, y - 1, { width: 45 });
+}
+
 async function initiateIntensiveReport() {
   logs.push(`[REPORT_SYSTEM] Intensive analysis initiated by mother algorithm.`);
   
@@ -3522,8 +4394,7 @@ async function initiateIntensiveReport() {
      const reportTrades = [...completedTrades];
      
      if (reportTrades.length < 2) {
-       logs.push(`[REPORT_SYSTEM] Insufficient live trade data for analysis (${reportTrades.length} settled trades). Minimum 2 live trades required.`);
-       return;
+       logs.push(`[REPORT_SYSTEM] Limited settled trade sample (${reportTrades.length}). Generating real-capital operating report with live state, staking audit, and endpoint coverage.`);
      }
 
      const finalTotal = reportTrades.length;
@@ -3546,6 +4417,8 @@ async function initiateIntensiveReport() {
        const dd = ((maxBal - currentBal) / maxBal) * 100;
        if (dd > maxDD) maxDD = dd;
      });
+
+     const realCapitalSnapshot = buildRealCapitalReportSnapshot();
 
      // Calculate milestones (every 100 trades or chunks of completed)
      const milestones = [];
@@ -3575,11 +4448,18 @@ async function initiateIntensiveReport() {
        - Calculated Profit Factor: ${profitFactor.toFixed(2)}
        - Maximum Peak Drawdown: ${maxDD.toFixed(1)}%
        - Current Stochastic Config: ${JSON.stringify(currentParams)}
+       - Real Capital Readiness: ${realCapitalSnapshot.liveReadiness}
+       - Micro Profile: ${realCapitalSnapshot.requestedProfile.name} (${realCapitalSnapshot.requestedProfile.operatingBand})
+       - Staking Audit: ${JSON.stringify(realCapitalSnapshot.stakingAudit)}
+       - Portfolio Totals: ${JSON.stringify(realCapitalSnapshot.portfolioTotals)}
+       - Endpoint Coverage Count: ${realCapitalSnapshot.endpointCoverage.length}
        
        Provide:
        1. Executive Telemetry Critique.
-       2. Regime suitabilty & behavioral patterns.
+       2. Regime suitability & behavioral patterns.
        3. Specific calibrated recommendations for indicator boundaries (RSI thresholds, ATR multipliers).
+       4. Micro-conservative live-capital safety verdict for $50-$100 accounts.
+       5. Staking economics warnings, especially any stake/reward or risk-budget inconsistencies.
        
        Format as highly professional, concise, raw text and markdown. Avoid any conversational greeting.
      `;
@@ -3668,8 +4548,8 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.moveDown(1.5);
        
        // Page 1 Layout: Cover & Mathematical Grid
-       doc.fontSize(22).font('Helvetica-Bold').fillColor('#0f172a').text('INFINITY MARKETS LAB SYSTEM SECTOR REPORT', { align: 'center' });
-       doc.fontSize(10).font('Helvetica-Oblique').fillColor('#64748b').text('Autonomous Mother Algorithm Performance Ledger & AI Advisory', { align: 'center' });
+       doc.fontSize(22).font('Helvetica-Bold').fillColor('#0f172a').text('INFINITY MARKETS LAB REAL CAPITAL SYSTEM REPORT', { align: 'center' });
+       doc.fontSize(10).font('Helvetica-Oblique').fillColor('#64748b').text('Adaptive Portfolio Intelligence • Micro Conservative Risk Audit • Endpoint Coverage', { align: 'center' });
        doc.moveDown(1.5);
        
        // System Metadata Block
@@ -3711,7 +4591,7 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.font('Helvetica').text(`${maxDD.toFixed(1)}%`, 460, startY + 18);
        
        doc.font('Helvetica-Bold').text(`Avg. PnL per Trade:`, 320, startY + 36);
-       doc.font('Helvetica').text(`$${(totalPnl / finalTotal).toFixed(2)}`, 460, startY + 36);
+       doc.font('Helvetica').text(`$${(finalTotal > 0 ? totalPnl / finalTotal : 0).toFixed(2)}`, 460, startY + 36);
        
        doc.moveDown(3.5);
        
@@ -3755,10 +4635,14 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        const padRange = padMax - padMin;
        
        // Curve drawing
+       const pointDenominator = Math.max(1, points.length - 1);
        doc.strokeColor('#10b981').lineWidth(2);
        doc.moveTo(graphX, graphY + graphH - ((points[0] - padMin) / padRange) * graphH);
+       if (points.length === 1) {
+         doc.lineTo(graphX + graphW, graphY + graphH - ((points[0] - padMin) / padRange) * graphH);
+       }
        for (let i = 1; i < points.length; i++) {
-         const cx = graphX + (i / (points.length - 1)) * graphW;
+         const cx = graphX + (i / pointDenominator) * graphW;
          const cy = graphY + graphH - ((points[i] - padMin) / padRange) * graphH;
          doc.lineTo(cx, cy);
        }
@@ -3769,7 +4653,7 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.strokeColor('transparent');
        doc.moveTo(graphX, graphY + graphH);
        for (let i = 0; i < points.length; i++) {
-         const cx = graphX + (i / (points.length - 1)) * graphW;
+         const cx = graphX + (i / pointDenominator) * graphW;
          const cy = graphY + graphH - ((points[i] - padMin) / padRange) * graphH;
          doc.lineTo(cx, cy);
        }
@@ -3859,8 +4743,133 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        }
        
 
+
+
        // ══════════════════════════════════════════════════════════════════════
-       // PAGE 3: QUANTITATIVE RISK ANALYTICS
+       // PAGE 3: REAL CAPITAL MICRO-CONSERVATIVE OPERATING AUDIT
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#dc2626');
+       doc.moveDown(1.5);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('REAL CAPITAL MICRO-CONSERVATIVE OPERATING AUDIT', 50, doc.y);
+       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Requested live-start profile: $50 account • percent-based risk • R_25 primary • R_75 reduced', 50, doc.y + 16);
+       doc.moveDown(2.5);
+
+       const readinessColor = realCapitalSnapshot.liveReadiness.includes('REQUIRED') ? '#ef4444' : '#10b981';
+       doc.roundedRect(50, doc.y, 512, 48, 8).fill('#0f172a');
+       doc.fontSize(9).font('Helvetica-Bold').fillColor('#94a3b8').text('LIVE READINESS VERDICT', 68, doc.y + 11);
+       doc.fontSize(16).font('Helvetica-Bold').fillColor(readinessColor).text(realCapitalSnapshot.liveReadiness, 68, doc.y + 25, { width: 330 });
+       doc.fontSize(8).font('Helvetica').fillColor('#cbd5e1').text(realCapitalSnapshot.requestedProfile.verdict, 365, doc.y + 14, { width: 175 });
+       doc.moveDown(4.2);
+
+       const microY = doc.y;
+       const microRows = [
+         ['Requested Start Balance', money(realCapitalSnapshot.account.requestedLiveStartBalance), '$50–$100 target band'],
+         ['Risk Type', realCapitalSnapshot.stakingAudit.configuredRiskType, 'PERCENT required'],
+         ['Configured Risk', money(realCapitalSnapshot.stakingAudit.configuredRiskBudget), money(realCapitalSnapshot.stakingAudit.recommendedRiskBudget) + ' base'],
+         ['Max Loss Cap', money(realCapitalSnapshot.stakingAudit.currentHybridEffectiveCap), money(realCapitalSnapshot.stakingAudit.recommendedMaxLoss) + ' max'],
+         ['Max Stake', money(realCapitalSnapshot.stakingAudit.recommendedMaxStake), '2.00% equity cap'],
+         ['Daily Loss Limit', money(realCapitalSnapshot.stakingAudit.dailyLossLimit), '3.00% equity stop'],
+       ];
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('ACCOUNT SAFETY TABLE', 50, microY);
+       doc.strokeColor('#cbd5e1').lineWidth(1).moveTo(50, microY + 14).lineTo(560, microY + 14).stroke();
+       doc.fontSize(7).font('Helvetica-Bold').fillColor('#64748b').text('METRIC', 50, microY + 24).text('CURRENT', 220, microY + 24).text('MICRO LIMIT', 365, microY + 24);
+       microRows.forEach((row, i) => {
+         const y = microY + 40 + i * 18;
+         doc.rect(50, y - 3, 512, 16).fill(i % 2 === 0 ? '#f8fafc' : '#ffffff');
+         doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#334155').text(row[0], 56, y, { width: 150 });
+         doc.font('Helvetica').fillColor('#0f172a').text(row[1], 220, y, { width: 125 });
+         doc.fillColor('#475569').text(row[2], 365, y, { width: 180 });
+       });
+       doc.y = microY + 155;
+
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('VISUAL RISK METER', 50, doc.y);
+       doc.moveDown(1);
+       const barsY = doc.y;
+       drawReportBar(doc, 'Portfolio Heat', realCapitalSnapshot.portfolioHeat.totalHeat || 0, 55, barsY, 220, '#14b8a6');
+       drawReportBar(doc, 'Correlation Heat', (realCapitalSnapshot.portfolioHeat as any).correlationAdjustedHeat || realCapitalSnapshot.portfolioHeat.totalHeat || 0, 55, barsY + 18, 220, '#6366f1');
+       drawReportBar(doc, 'Execution Degrade', realCapitalSnapshot.adaptiveIntelligence.execution.degradationProbability || 0, 55, barsY + 36, 220, '#f59e0b');
+       drawReportBar(doc, 'Model Uncertainty', realCapitalSnapshot.adaptiveIntelligence.metaLearning.uncertaintyScore || 0, 55, barsY + 54, 220, '#ef4444');
+       doc.y = barsY + 78;
+
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('ACTIVE POSITION ECONOMICS', 50, doc.y);
+       doc.fontSize(7).font('Helvetica').fillColor('#64748b').text('This is the anti-absurdity table: stake, estimated max loss, target reward, reward-to-risk, and stake/reward.', 50, doc.y + 14, { width: 500 });
+       doc.moveDown(2.1);
+       const econY = doc.y;
+       doc.fontSize(6.8).font('Helvetica-Bold').fillColor('#64748b');
+       doc.text('SYMBOL', 50, econY); doc.text('STAKE', 105, econY); doc.text('MAX LOSS', 160, econY); doc.text('TARGET', 225, econY); doc.text('R:R', 290, econY); doc.text('STAKE/REWARD', 335, econY); doc.text('RISK %', 430, econY); doc.text('VERDICT', 485, econY);
+       if (realCapitalSnapshot.activePositionEconomics.length === 0) {
+         doc.fontSize(8).font('Helvetica-Oblique').fillColor('#64748b').text('No active positions. Next build should enforce these economics before every Deriv proposal.', 50, econY + 20, { width: 500 });
+         doc.y = econY + 45;
+       } else {
+         realCapitalSnapshot.activePositionEconomics.slice(0, 10).forEach((pos: any, i: number) => {
+           const y = econY + 18 + i * 16;
+           const pass = pos.rewardToRisk >= realCapitalSnapshot.requestedProfile.minRewardToRisk && pos.stakeToReward <= realCapitalSnapshot.requestedProfile.maxStakeToReward && pos.riskPctOfEquity <= realCapitalSnapshot.requestedProfile.maxRiskPct;
+           doc.rect(50, y - 3, 512, 14).fill(i % 2 === 0 ? '#f8fafc' : '#ffffff');
+           doc.fontSize(6.8).font('Helvetica').fillColor('#0f172a').text(pos.symbol, 50, y).text(money(pos.stake), 105, y).text(money(pos.maxLossAmount), 160, y).text(money(pos.targetProfitAmount), 225, y).text(pos.rewardToRisk.toFixed(2), 290, y).text(pos.stakeToReward.toFixed(2), 335, y).text(pct(pos.riskPctOfEquity), 430, y).fillColor(pass ? '#10b981' : '#ef4444').text(pass ? 'PASS' : 'FIX', 485, y);
+         });
+         doc.y = econY + 25 + realCapitalSnapshot.activePositionEconomics.length * 16;
+       }
+
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('READINESS REASONS', 50, doc.y);
+       doc.moveDown(0.6);
+       realCapitalSnapshot.readinessReasons.slice(0, 7).forEach((reason: string) => {
+         doc.fontSize(7.2).font('Helvetica').fillColor('#475569').text(`• ${reason}`, 60, doc.y, { width: 490 });
+         doc.moveDown(0.35);
+       });
+
+       // ══════════════════════════════════════════════════════════════════════
+       // PAGE 4: ENDPOINT & SUBSYSTEM COVERAGE MATRIX
+       // ══════════════════════════════════════════════════════════════════════
+       doc.addPage();
+       doc.rect(40, 40, 532, 10).fill('#2563eb');
+       doc.moveDown(1.5);
+       doc.fontSize(18).font('Helvetica-Bold').fillColor('#0f172a').text('SYSTEM ENDPOINT & SUBSYSTEM COVERAGE MATRIX', 50, doc.y);
+       doc.fontSize(9).font('Helvetica-Oblique').fillColor('#64748b').text('Every operational endpoint and intelligence subsystem that the report must observe', 50, doc.y + 16);
+       doc.moveDown(2.5);
+
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('ENDPOINT INVENTORY', 50, doc.y);
+       doc.moveDown(1.1);
+       const epStart = doc.y;
+       realCapitalSnapshot.endpointCoverage.forEach((ep: any, i: number) => {
+         const y = epStart + i * 25;
+         if (y > 735) return;
+         doc.rect(50, y - 3, 512, 22).fill(i % 2 === 0 ? '#f8fafc' : '#ffffff');
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#1d4ed8').text(`${ep.method} ${ep.path}`, 55, y, { width: 155 });
+         doc.font('Helvetica').fillColor('#475569').text(ep.purpose, 220, y, { width: 325 });
+       });
+       doc.y = Math.min(745, epStart + realCapitalSnapshot.endpointCoverage.length * 25 + 10);
+       if (doc.y > 700) { doc.addPage(); doc.rect(40, 40, 532, 10).fill('#2563eb'); doc.moveDown(2); }
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('INSTRUMENT PERMISSION MATRIX', 50, doc.y);
+       doc.moveDown(1.1);
+       const instY = doc.y;
+       doc.fontSize(7).font('Helvetica-Bold').fillColor('#64748b').text('SYMBOL', 50, instY).text('ROLE', 105, instY).text('CLUSTER', 195, instY).text('ENABLED', 290, instY).text('SHARPE', 350, instY).text('ANOMALY', 410, instY).text('REGIME T/MR/TR', 475, instY);
+       realCapitalSnapshot.symbols.forEach((sym: any, i: number) => {
+         const y = instY + 18 + i * 18;
+         doc.rect(50, y - 3, 512, 16).fill(i % 2 === 0 ? '#f8fafc' : '#ffffff');
+         doc.fontSize(7).font('Helvetica-Bold').fillColor('#0f172a').text(sym.symbol, 50, y).font('Helvetica').fillColor(sym.role === 'PRIMARY' ? '#10b981' : sym.role.includes('DISABLED') ? '#ef4444' : '#f59e0b').text(sym.role, 105, y, { width: 85 }).fillColor('#475569').text(sym.cluster, 195, y, { width: 85 }).text(sym.enabled ? 'YES' : 'NO', 290, y).text(sym.sharpeRatio.toFixed(2), 350, y).text(pctWhole(sym.anomaly?.anomalyProbability || 0), 410, y).text(`${pctWhole(sym.regime.trendProbability)}/${pctWhole(sym.regime.meanReversionProbability)}/${pctWhole(sym.regime.transitionProbability)}`, 475, y, { width: 85 });
+       });
+       doc.y = instY + 18 + realCapitalSnapshot.symbols.length * 18 + 14;
+       doc.fontSize(10).font('Helvetica-Bold').fillColor('#0f172a').text('NEXT BUILD GATES', 50, doc.y);
+       doc.moveDown(0.7);
+       realCapitalSnapshot.recommendations.forEach((rec: string, i: number) => {
+         if (doc.y > 750) return;
+         doc.fontSize(7.2).font('Helvetica').fillColor('#475569').text(`${i + 1}. ${rec}`, 60, doc.y, { width: 490 });
+         doc.moveDown(0.4);
+       });
+
+       if (finalTotal === 0) {
+         doc.moveDown(1);
+         doc.strokeColor('#cbd5e1').lineWidth(0.5).moveTo(50, doc.y).lineTo(560, doc.y).stroke();
+         doc.moveDown(0.5);
+         doc.fontSize(8).font('Helvetica-Bold').fillColor('#0f172a').text('ZERO-TRADE REPORT MODE', 50, doc.y, { align: 'center', width: 512 });
+         doc.fontSize(7).font('Helvetica').fillColor('#64748b').text('No settled trades exist yet. Report intentionally stops after real-capital readiness, endpoint coverage, and instrument permission matrices to avoid false statistical conclusions.', 50, doc.y + 12, { align: 'center', width: 512 });
+         doc.end();
+         return;
+       }
+
+       // ══════════════════════════════════════════════════════════════════════
+       // PAGE 5: QUANTITATIVE RISK ANALYTICS
        // ══════════════════════════════════════════════════════════════════════
        doc.addPage();
        doc.rect(40, 40, 532, 10).fill('#0f172a');
@@ -4494,7 +5503,17 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        winRate: winRate.toFixed(1),
        totalPnl: totalPnl.toFixed(2),
        maxDrawdown: maxDD.toFixed(1),
-       profitFactor: profitFactor.toFixed(2)
+       profitFactor: profitFactor.toFixed(2),
+       realCapital: {
+         liveReadiness: realCapitalSnapshot.liveReadiness,
+         profile: realCapitalSnapshot.requestedProfile.name,
+         balance: realCapitalSnapshot.account.balance,
+         microSafe: realCapitalSnapshot.stakingAudit.microSafe,
+         recommendedRiskBudget: realCapitalSnapshot.stakingAudit.recommendedRiskBudget,
+         recommendedMaxLoss: realCapitalSnapshot.stakingAudit.recommendedMaxLoss,
+         recommendedMaxStake: realCapitalSnapshot.stakingAudit.recommendedMaxStake,
+         readinessReasons: realCapitalSnapshot.readinessReasons,
+       }
      };
      
      (globalThis as any).lastReportSummary = reportSummaryInMem;
@@ -4954,26 +5973,18 @@ function getGeminiClient(): GoogleGenAI | null {
 
 // Generate narrative trading reports via AI
 async function generateAiReport(userPrompt?: string): Promise<string> {
+  const realCapitalSnapshot = buildRealCapitalReportSnapshot();
+  const deterministicReport = renderRealCapitalMarkdownReport(realCapitalSnapshot);
   const client = getGeminiClient();
   if (!client) {
-    // Elegant fallback guidance if key is absent
-    return `### **IML System Analyzer (Offline Mode)**
-    
-*The Gemini AI API Key was not yet configured in the Secrets panel on AI Studio.*
-Here is an automated system validation report based on direct mathematical tracking:
+    return `${deterministicReport}
 
-- **Instrument profile:** ${INSTRUMENTS[selectedSymbol as keyof typeof INSTRUMENTS]?.name || "None"}
-- **Equity Peak:** $${peakBalance.toFixed(2)}
-- **Win Rate:** ${completedTrades.length > 0 ? ((completedTrades.filter(t => t.pnl > 0).length / completedTrades.length) * 100).toFixed(1) : "N/A"}%
-- **Current Optimized parameters:** 
-  - RSI Lower: ${currentParams.rsiOversoldThreshold} (Safety Gated) 
-  - RSI Upper: ${currentParams.rsiOverboughtThreshold}
-  - ATR Stop Multiplier: ${currentParams.atrStopMultiplier}
+---
 
-*Configure your API Key under **Settings > Secrets** to enable full narrative pattern reasoning, multi-instrument comparison, and behavioral diagnostic tips with Gemini 3.5.*`;
+## Offline Narrative Note
+The Gemini AI API key is not configured. The report above is deterministic and generated from live system telemetry, risk settings, portfolio state, endpoints, and Micro Conservative staking assumptions.`;
   }
 
-  // Prep narrative payload data for LLM
   const analyticsData = {
     activeSessionId: botSessionId,
     selectedSymbol,
@@ -4986,6 +5997,22 @@ Here is an automated system validation report based on direct mathematical track
     totalTrades: completedTrades.length,
     winRate: completedTrades.length > 0 ? (completedTrades.filter(t => t.pnl > 0).length / completedTrades.length) * 100 : 0,
     parameters: currentParams,
+    realCapital: {
+      liveReadiness: realCapitalSnapshot.liveReadiness,
+      account: realCapitalSnapshot.account,
+      requestedProfile: realCapitalSnapshot.requestedProfile,
+      stakingAudit: realCapitalSnapshot.stakingAudit,
+      portfolioTotals: realCapitalSnapshot.portfolioTotals,
+      endpointCoverage: realCapitalSnapshot.endpointCoverage.map((e: any) => `${e.method} ${e.path}`),
+      readinessReasons: realCapitalSnapshot.readinessReasons,
+      recommendations: realCapitalSnapshot.recommendations,
+    },
+    adaptiveIntelligence: {
+      mode: adaptiveIntelligenceState.mode,
+      adaptationConfidence: adaptiveIntelligenceState.metaLearning.adaptationConfidence,
+      policy: adaptiveIntelligenceState.policy,
+      monteCarlo: adaptiveIntelligenceState.monteCarlo,
+    },
     circuitBreaker: {
       consecutiveLosses,
       cooldownRemaining: circuitBreakerCooldown,
@@ -4997,31 +6024,34 @@ Here is an automated system validation report based on direct mathematical track
       pnl: t.pnl,
       reason: t.exitReason,
       regime: t.regimeAtEntry,
+      entrySignalProbability: t.entrySignalProbability,
+      entryExpectedEdge: t.entryExpectedEdge,
     })),
   };
 
   const contextPrompt = `You are Infinity Markets Lab AI, an elite institutional risk engineer and trading system advisor specializing in synthetic indices stochastic models.
-Review this current automated bot's session data:
+The deterministic report has already been generated and must remain the authority. Add a concise advisory after it. Do not contradict the deterministic risk verdict.
+
+System data:
 ${JSON.stringify(analyticsData, null, 2)}
 
 User asks: "${userPrompt || "Analyze my current trading metrics, explain performance across regimes, and provide safety tips."}"
 
-Please provide an extremely insightful, professional, and clear response highlighting:
-1. Behavioral Diagnostic of recent trades.
-2. Market Regime match assessment (Is our strategy suited to the active regime?).
-3. Technical Adjustment Proposal: Suggest specific updates to current risk rules or indicator boundaries.
-Format output beautifully with clean markdown headers and lists. Follow research-informed principles (No Martingale, capital preservation is primary, Kelly limits, volume adjustments). Use friendly, professional composure tone. Avoid self-praising or dry corporate filler text.`;
+Focus your advisory on:
+1. Micro Conservative $50-$100 live-readiness.
+2. Staking economics and any absurd stake/reward conditions.
+3. Portfolio heat, instrument restrictions, and endpoint coverage.
+4. Next build gates before live trading.
+Use clean markdown. Do not recommend Martingale or aggressive profit chasing.`;
 
   try {
     const response = await client.models.generateContent({
       model: "gemini-1.5-flash",
       contents: contextPrompt,
     });
-    return response.text || "No response received from model.";
+    return `${deterministicReport}\n\n---\n\n## AI Advisory Overlay\n${response.text || "No advisory response received from model."}`;
   } catch (err: any) {
-    return `### **IML System Analyzer (Error)**
-    
-Failed to contact Gemini servers: ${err.message || err}. Reverting to local diagnostics. Check your API key.`;
+    return `${deterministicReport}\n\n---\n\n## AI Advisory Error\nFailed to contact Gemini servers: ${err.message || err}. The deterministic report above remains valid.`;
   }
 }
 
@@ -5173,6 +6203,10 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const sessionBaseline = sessionStartBalance || balance;
   const estimatedSessionEquity = parseFloat((sessionBaseline + totalPnl + openPnl).toFixed(2));
   const maxDrawdown = peakBalance === 0 ? 0 : parseFloat((((peakBalance - balance) / peakBalance) * 100).toFixed(2));
+  updateAdaptiveIntelligence("state_endpoint_snapshot");
+  const portfolioRisk = computePortfolioRiskState();
+  const instrumentDiagnostics = Object.fromEntries(Object.keys(INSTRUMENTS).map(sym => [sym, computeInstrumentStats(sym)]));
+  const realCapitalSnapshot = buildRealCapitalReportSnapshot();
 
   res.json({
     symbol: selectedSymbol,
@@ -5216,10 +6250,15 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
             volatilityScore: sp.volatilityScore,
             regimeCompatibility: sp.regimeCompatibility,
             executionQuality: sp.executionQuality,
+            persistenceProbability: subAlgorithms[sym].lastPersistenceProbability ?? null,
+            regimeState: subAlgorithms[sym].regimeState ?? null,
+            governorDecision: subAlgorithms[sym].lastGovernorDecision ?? null,
+            spikeHarvestState: subAlgorithms[sym].spikeHarvestState ?? null,
           } : null];
         })
       ),
     },
+    portfolioRisk,
     uncertaintyState,
     portfolioHeat: portfolioHeatState,
     equityCurve: {
@@ -5228,6 +6267,18 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     },
     opportunityDensity: opportunityDensityMetrics,
     executionHealth,
+    instrumentDiagnostics,
+    microConservativeReadiness: {
+      liveReadiness: realCapitalSnapshot.liveReadiness,
+      profile: realCapitalSnapshot.requestedProfile.name,
+      microSafe: realCapitalSnapshot.stakingAudit.microSafe,
+      recommendedRiskBudget: realCapitalSnapshot.stakingAudit.recommendedRiskBudget,
+      recommendedMaxLoss: realCapitalSnapshot.stakingAudit.recommendedMaxLoss,
+      recommendedMaxStake: realCapitalSnapshot.stakingAudit.recommendedMaxStake,
+      activePositionEconomics: realCapitalSnapshot.activePositionEconomics,
+      readinessReasons: realCapitalSnapshot.readinessReasons,
+    },
+    adaptiveIntelligence: adaptiveIntelligenceState,
     subAlgorithms,
     stats: {
       totalTrades: total,
@@ -5468,7 +6519,33 @@ app.post("/api/force-report", (req, res) => {
 
 // Report summary endpoint
 app.get("/api/report-summary", (req, res) => {
-  res.json((globalThis as any).lastReportSummary || { summary: "No report generated yet.", pdfUrl: null, milestones: [] });
+  const snapshot = buildRealCapitalReportSnapshot();
+  res.json((globalThis as any).lastReportSummary || {
+    summary: "No PDF report generated yet. Real-capital audit snapshot is available.",
+    pdfUrl: null,
+    milestones: [],
+    realCapital: {
+      liveReadiness: snapshot.liveReadiness,
+      profile: snapshot.requestedProfile.name,
+      balance: snapshot.account.balance,
+      microSafe: snapshot.stakingAudit.microSafe,
+      recommendedRiskBudget: snapshot.stakingAudit.recommendedRiskBudget,
+      recommendedMaxLoss: snapshot.stakingAudit.recommendedMaxLoss,
+      recommendedMaxStake: snapshot.stakingAudit.recommendedMaxStake,
+      readinessReasons: snapshot.readinessReasons,
+    }
+  });
+});
+
+app.get("/api/real-capital-report", (req, res) => {
+  const snapshot = buildRealCapitalReportSnapshot();
+  const format = String(req.query.format || "json").toLowerCase();
+  if (format === "markdown" || format === "md") {
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.send(renderRealCapitalMarkdownReport(snapshot));
+    return;
+  }
+  res.json(snapshot);
 });
 
 // Serve generated reports
