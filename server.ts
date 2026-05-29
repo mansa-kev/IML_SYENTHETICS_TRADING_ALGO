@@ -2104,9 +2104,21 @@ const INSTRUMENT_PRIORS: Record<string, { confidence: number; expectedEdge: numb
 // ==========================================
 // DERIV LIVE API WEB-SOCKET INTEGRATION BRIDGE
 // ==========================================
-const DERIV_APP_ID = process.env.DERIV_APP_ID || "1089"; // Default App ID
-const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || ""; // User API Token
+const DERIV_APP_ID = (process.env.DERIV_APP_ID || "1089").trim(); // Default App ID
+const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || "").trim(); // User API Token (server-side only)
+type DerivRuntimeSource = "ENV" | "SUPABASE" | "MANUAL";
+const DERIV_RUNTIME_SOURCE: DerivRuntimeSource = DERIV_API_TOKEN ? "ENV" : "MANUAL";
 const SHADOW_LIVE_VALIDATION = process.env.IML_SHADOW_LIVE_VALIDATION === "true";
+const derivInitializationErrors: string[] = [];
+
+function recordDerivInitializationError(message: string) {
+  const safe = message.replace(DERIV_API_TOKEN, "[REDACTED_DERIV_TOKEN]");
+  derivInitializationErrors.push(safe);
+  if (derivInitializationErrors.length > 25) derivInitializationErrors.splice(0, derivInitializationErrors.length - 25);
+  logs.push(`[DERIV_DIAGNOSTIC] ${safe}`);
+}
+
+logs.push(`[DERIV_DIAGNOSTIC] Startup credential audit: appIdConfigured=${Boolean(DERIV_APP_ID)} tokenConfigured=${Boolean(DERIV_API_TOKEN)} runtimeSource=${DERIV_RUNTIME_SOURCE} shadowValidation=${SHADOW_LIVE_VALIDATION}.`);
 
 class DerivLiveBridge {
   private ws: WebSocket | null = null;
@@ -2115,12 +2127,39 @@ class DerivLiveBridge {
   private subscribedSymbols = new Set<string>();
 
   constructor() {
-    logs.push(`[DERIV_LIVE] 🔄 Initializing connection to wss://ws.derivws.com/websockets/v3...`);
+    logs.push(`[DERIV_LIVE] 🔄 Initializing connection to wss://ws.derivws.com/websockets/v3... tokenConfigured=${Boolean(DERIV_API_TOKEN)} source=${DERIV_RUNTIME_SOURCE}`);
+    this.connect();
+  }
+
+  public getWebsocketConnected(): boolean {
+    return Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
+  }
+
+  public getDerivDiagnostics() {
+    return {
+      derivConfigured: Boolean(DERIV_API_TOKEN),
+      derivConnected: this.getWebsocketConnected(),
+      derivAuthValidated: this.isAuthorized,
+      derivRuntimeSource: DERIV_RUNTIME_SOURCE,
+      derivInitializationErrors: [...derivInitializationErrors],
+      websocketConnected: this.getWebsocketConnected(),
+    };
+  }
+
+  public ensureConnected(reason = "runtime_check") {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+    logs.push(`[DERIV_LIVE] 🔄 Reconnect requested by ${reason}. tokenConfigured=${Boolean(DERIV_API_TOKEN)} source=${DERIV_RUNTIME_SOURCE}`);
     this.connect();
   }
 
   private connect() {
     try {
+      if (!DERIV_APP_ID) {
+        recordDerivInitializationError("DERIV_APP_ID is empty at runtime; falling back is disabled for explicit production diagnostics.");
+      }
+      if (!DERIV_API_TOKEN) {
+        recordDerivInitializationError("DERIV_API_TOKEN is not visible to the server runtime; live authorization cannot start.");
+      }
       this.ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
       
       this.ws.on("open", () => {
@@ -2128,8 +2167,10 @@ class DerivLiveBridge {
         logs.push(`[DERIV_LIVE] 🟢 WebSocket connection established safely with Deriv servers (App ID: ${DERIV_APP_ID}).`);
         
         if (DERIV_API_TOKEN) {
+          logs.push(`[DERIV_LIVE] 🔐 Server-side DERIV_API_TOKEN detected from ${DERIV_RUNTIME_SOURCE}; beginning secure authorization handshake.`);
           this.authorizeUser();
         } else {
+          recordDerivInitializationError("DERIV_API_TOKEN not configured in server runtime. Price stream remains read-only.");
           logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Live trading is disabled. Price data stream active (read-only).`);
           this.requestHistoryForSymbols();
           Object.keys(INSTRUMENTS).forEach((symbol) => {
@@ -2145,15 +2186,18 @@ class DerivLiveBridge {
       this.ws.on("close", () => {
         boundedPush(websocketEventSamples, { epochMs: Date.now(), event: "close" });
         this.isAuthorized = false;
+        recordDerivInitializationError("Deriv WebSocket closed; authorization state cleared pending reconnect.");
         logs.push(`[DERIV_LIVE] 🔴 Connection closed. Retrying connection in 5 seconds...`);
         this.scheduleReconnect();
       });
 
       this.ws.on("error", (err) => {
         boundedPush(websocketEventSamples, { epochMs: Date.now(), event: "error" });
+        recordDerivInitializationError(`Deriv WebSocket error: ${err.message}`);
         logs.push(`[DERIV_LIVE] ⚠️ WebSocket error encountered: ${err.message}`);
       });
     } catch (e: any) {
+      recordDerivInitializationError(`Failed to initiate Deriv WebSocket connection: ${e?.message || e}`);
       logs.push(`[DERIV_LIVE] ❌ Failed to initiate WebSocket connection: ${e?.message || e}`);
       this.scheduleReconnect();
     }
@@ -2170,11 +2214,12 @@ class DerivLiveBridge {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
     if (DERIV_API_TOKEN) {
-      logs.push(`[DERIV_LIVE] 🔑 Sending secure API Token authentication handshake payload...`);
+      logs.push(`[DERIV_LIVE] 🔑 Sending secure API Token authentication handshake payload from ${DERIV_RUNTIME_SOURCE} runtime source...`);
       this.ws.send(JSON.stringify({
         authorize: DERIV_API_TOKEN
       }));
     } else {
+      recordDerivInitializationError("authorizeUser called without DERIV_API_TOKEN in server runtime.");
       logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Trading is fully disabled until a valid token is provided.`);
     }
   }
@@ -2251,6 +2296,12 @@ class DerivLiveBridge {
           boundedPush(rejectionTimestamps, Date.now());
           logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry.`);
         }
+        if (msg.msg_type === "authorize" || msg.error?.code === "InvalidToken") {
+          this.isAuthorized = false;
+          recordDerivInitializationError(`Deriv authorization failed: ${msg.error.message || msg.error.code || "unknown_error"}`);
+        } else {
+          recordDerivInitializationError(`Deriv API warning (${msg.msg_type}): ${msg.error.message || msg.error.code || "unknown_error"}`);
+        }
         logs.push(`[DERIV_LIVE_ERROR] 🔴 Deriv returned warning: ${msg.error.message} (${msg.msg_type})`);
         return;
       }
@@ -2263,7 +2314,7 @@ class DerivLiveBridge {
         peakBalance = Math.max(peakBalance, balance);
         const accountType = auth.is_virtual ? "DEMO PAPER" : "REAL LIVE";
         
-        logs.push(`[DERIV_LIVE] 🏆 Authentication Succeeded! Account Type: [${accountType}] (${auth.email})`);
+        logs.push(`[DERIV_LIVE] 🏆 Authentication Succeeded! Account Type: [${accountType}] (${auth.email}) | source=${DERIV_RUNTIME_SOURCE}`);
         logs.push(`[DERIV_LIVE] Live account balance updated to: $${balance.toFixed(2)} ${auth.currency || "USD"}`);
 
         // Subscribe to real-time balance updates
@@ -7350,6 +7401,7 @@ app.get("/api/logs/export", async (req, res) => {
 
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
+  liveBridgeInstance.ensureConnected("api_state_readiness");
   updateCircuitBreakerCooldown();
   const currentRegime = detectRegime(selectedSymbol);
   const symbolPrices = tickBuffers[selectedSymbol] || [];
@@ -7372,6 +7424,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const portfolioRisk = computePortfolioRiskState();
   const instrumentDiagnostics = Object.fromEntries(Object.keys(INSTRUMENTS).map(sym => [sym, computeInstrumentStats(sym)]));
   const realCapitalSnapshot = buildRealCapitalReportSnapshot();
+  const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
 
   res.json({
     symbol: selectedSymbol,
@@ -7386,6 +7439,13 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     sessionOpenPnl: openPnl,
     estimatedSessionEquity,
     isAuthorized: liveBridgeInstance.getIsAuthorized(),
+    derivDiagnostics,
+    derivConfigured: derivDiagnostics.derivConfigured,
+    derivConnected: derivDiagnostics.derivConnected,
+    derivAuthValidated: derivDiagnostics.derivAuthValidated,
+    derivRuntimeSource: derivDiagnostics.derivRuntimeSource,
+    derivInitializationErrors: derivDiagnostics.derivInitializationErrors,
+    websocketConnected: derivDiagnostics.websocketConnected,
     tradingEnabled,
     tradingMode,
     riskPreset,
@@ -7543,7 +7603,14 @@ app.post("/api/config", (req, res) => {
       return res.status(403).json({ error: "Manual intervention required: 3% live equity loss limit reached. Please review risk and reset the session." });
     }
     if (enabled && !liveBridgeInstance.getIsAuthorized()) {
-      return res.status(403).json({ error: "Live Deriv authorization required to enable trading. Set DERIV_API_TOKEN." });
+      liveBridgeInstance.ensureConnected("config_enable_trading");
+      const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+      return res.status(403).json({
+        error: derivDiagnostics.derivConfigured
+          ? "Live Deriv authorization is still pending or failed. Backend token is configured; check derivDiagnostics for websocket/auth status."
+          : "Live Deriv authorization required. Configure DERIV_API_TOKEN in the server runtime.",
+        derivDiagnostics,
+      });
     }
     tradingEnabled = enabled;
     if (enabled) {
@@ -7597,7 +7664,14 @@ app.get("/api/ticks", (req, res) => {
 // Manual Force Trade Placement (Live Authorized Mode only)
 app.post("/api/trade", (req, res) => {
   if (!liveBridgeInstance.getIsAuthorized()) {
-    return res.status(403).json({ error: "Live Deriv authorization required. Set DERIV_API_TOKEN to place trades." });
+    liveBridgeInstance.ensureConnected("manual_trade_request");
+    const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+    return res.status(403).json({
+      error: derivDiagnostics.derivConfigured
+        ? "Live Deriv authorization is still pending or failed. Backend token is configured; check derivDiagnostics for websocket/auth status."
+        : "Live Deriv authorization required. Configure DERIV_API_TOKEN in the server runtime.",
+      derivDiagnostics,
+    });
   }
   const { direction } = req.body;
   if (!direction || (direction !== "LONG" && direction !== "SHORT")) {
@@ -7686,8 +7760,10 @@ app.post("/api/force-report", (req, res) => {
 
 // Report summary endpoint
 app.get("/api/report-summary", (req, res) => {
+  liveBridgeInstance.ensureConnected("report_summary_readiness");
   const snapshot = buildRealCapitalReportSnapshot();
-  res.json((globalThis as any).lastReportSummary || {
+  const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+  const baseSummary = (globalThis as any).lastReportSummary || {
     summary: "No PDF report generated yet. Real-capital audit snapshot is available.",
     pdfUrl: null,
     milestones: [],
@@ -7701,6 +7777,11 @@ app.get("/api/report-summary", (req, res) => {
       recommendedMaxStake: snapshot.stakingAudit.recommendedMaxStake,
       readinessReasons: snapshot.readinessReasons,
     }
+  };
+  res.json({
+    ...baseSummary,
+    derivDiagnostics,
+    deploymentReadiness: adaptiveIntelligenceState.deploymentReadiness,
   });
 });
 

@@ -145,6 +145,7 @@ export default function App() {
     instrumentDiagnostics?: Record<string, any>;
     microConservativeReadiness?: any;
     adaptiveIntelligence?: any;
+    derivDiagnostics?: any;
   }>({});
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
@@ -226,7 +227,7 @@ export default function App() {
       setSymbolName(safeMeta?.name || data.symbolName || "Volatility 25 (1s)");
       setIdealStrategy(safeMeta?.idealStrategy || data.idealStrategy || "mean_reversion");
       setTradingMode(data.tradingMode);
-      setIsAuthorized(data.isAuthorized);
+      setIsAuthorized(Boolean(data.derivAuthValidated ?? data.isAuthorized));
 
       if (data.hybridRiskType !== undefined) setHybridRiskType(data.hybridRiskType);
       if (data.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(data.hybridRiskFixedAmount);
@@ -284,6 +285,14 @@ export default function App() {
         instrumentDiagnostics: data.instrumentDiagnostics,
         microConservativeReadiness: data.microConservativeReadiness,
         adaptiveIntelligence: data.adaptiveIntelligence,
+        derivDiagnostics: data.derivDiagnostics || {
+          derivConfigured: data.derivConfigured,
+          derivConnected: data.derivConnected,
+          derivAuthValidated: data.derivAuthValidated ?? data.isAuthorized,
+          derivRuntimeSource: data.derivRuntimeSource,
+          derivInitializationErrors: data.derivInitializationErrors,
+          websocketConnected: data.websocketConnected,
+        },
       });
       setSubAlgorithms(filteredSubAlgorithms);
       setLogs(data.logs);
@@ -813,10 +822,19 @@ export default function App() {
               ENGINE AUTO-TRADE: {tradingEnabled ? "ACTIVE" : "PAUSED"}
             </span>
             <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold text-brand-gold">
-              <span className={`w-2 h-2 rounded-full ${isAuthorized ? "bg-emerald-400 animate-pulse" : "bg-red-500"}`}></span>
-              <span className={isAuthorized ? "text-brand-mint" : "text-red-400"}>
-                DERIV AUTH: {isAuthorized ? "AUTHORIZED" : "NOT AUTHORIZED"}
-              </span>
+              {(() => {
+                const derivDiag = probabilisticDiagnostics.derivDiagnostics || {};
+                const configured = Boolean(derivDiag.derivConfigured);
+                const connected = Boolean(derivDiag.derivConnected || derivDiag.websocketConnected);
+                const auth = Boolean(derivDiag.derivAuthValidated || isAuthorized);
+                const color = auth ? "bg-emerald-400 animate-pulse" : configured ? "bg-amber-300 animate-pulse" : "bg-red-500";
+                const textClass = auth ? "text-brand-mint" : configured ? "text-amber-300" : "text-red-400";
+                const label = auth ? "AUTHORIZED" : configured ? (connected ? "AUTHORIZING" : "ENV CONFIGURED") : "TOKEN MISSING";
+                return <>
+                  <span className={`w-2 h-2 rounded-full ${color}`}></span>
+                  <span className={textClass}>DERIV AUTH: {label}</span>
+                </>;
+              })()}
             </span>
           </div>
           <p className="text-brand-mint/65 text-sm mt-1 selection:bg-indigo-500">
@@ -2119,11 +2137,19 @@ export default function App() {
 
             <div className="p-3 bg-brand-slate/5 rounded border border-brand-slate/10 text-sm text-brand-slate/85 leading-relaxed font-sans">
               <span className="text-brand-slate font-bold font-mono text-sm block uppercase mb-1">Execution Status</span>
-              {isAuthorized ? (
-                <p>The engine is streaming live market data and waiting for Bollinger/RSI overextension confluence limits to place trades directly using your authorized credentials.</p>
-              ) : (
-                <p className="text-brand-slate/90 font-medium">Please specify a valid <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code> in your environment parameters to authorize actual live contracts and automatic risk limits.</p>
-              )}
+              {(() => {
+                const derivDiag = probabilisticDiagnostics.derivDiagnostics || {};
+                const configured = Boolean(derivDiag.derivConfigured);
+                const connected = Boolean(derivDiag.derivConnected || derivDiag.websocketConnected);
+                const auth = Boolean(derivDiag.derivAuthValidated || isAuthorized);
+                if (auth) {
+                  return <p>The backend has validated the server-side Deriv credential and is streaming live market data while waiting for approved governor/preflight conditions.</p>;
+                }
+                if (configured) {
+                  return <p className="text-amber-200/90 font-medium">Server-side <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code> is configured securely ({derivDiag.derivRuntimeSource || "ENV"}); awaiting Deriv websocket authorization{connected ? " response" : " reconnect"}. No raw token is required in the browser.</p>;
+                }
+                return <p className="text-brand-slate/90 font-medium">Backend diagnostics report no server-side <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code>. Configure it in the production server environment; never expose it to the frontend.</p>;
+              })()}
             </div>
           </div>
 
