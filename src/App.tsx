@@ -133,8 +133,17 @@ export default function App() {
   const [governorStatus, setGovernorStatus] = useState<string>("");
   const [governorDiagnostics, setGovernorDiagnostics] = useState<{
     approvals: number; vetoes: number; approvalRate: number | null; lastInsight: string;
-    perSymbol: Record<string, { confidence: number; expectedEdge: number; uncertainty: number; volatilityScore: number; regimeCompatibility: number } | null>;
+    perSymbol: Record<string, any | null>;
   } | null>(null);
+  const [probabilisticDiagnostics, setProbabilisticDiagnostics] = useState<{
+    uncertaintyState?: any;
+    portfolioHeat?: any;
+    equityCurve?: any;
+    opportunityDensity?: any;
+    executionHealth?: any;
+    portfolioRisk?: any;
+    instrumentDiagnostics?: Record<string, any>;
+  }>({});
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
   const [logs, setLogs] = useState<string[]>([]);
@@ -263,6 +272,15 @@ export default function App() {
       setGovernorFocusSymbol(ALLOWED_SYMBOLS.has(data.governorFocusSymbol) ? data.governorFocusSymbol : safeSymbol);
       setGovernorStatus(data.governorStatus || "GOVERNING: Active and regulating live sub-algorithms.");
       if (data.governor) setGovernorDiagnostics(data.governor);
+      setProbabilisticDiagnostics({
+        uncertaintyState: data.uncertaintyState,
+        portfolioHeat: data.portfolioHeat,
+        equityCurve: data.equityCurve,
+        opportunityDensity: data.opportunityDensity,
+        executionHealth: data.executionHealth,
+        portfolioRisk: data.portfolioRisk,
+        instrumentDiagnostics: data.instrumentDiagnostics,
+      });
       setSubAlgorithms(filteredSubAlgorithms);
       setLogs(data.logs);
       setServerConnected(true);
@@ -1089,6 +1107,110 @@ export default function App() {
                 );
               })}
             </div>
+          </div>
+        )}
+
+        {/* Probabilistic Portfolio Intelligence Dashboard */}
+        <div className="mb-4 grid grid-cols-1 xl:grid-cols-4 gap-3">
+          <div className="bg-[#0d1512]/80 border border-brand-teal/20 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Portfolio Heat</span>
+              <PieChart className="w-4 h-4 text-brand-teal" />
+            </div>
+            <div className="text-2xl font-mono font-black text-brand-peach">
+              {(((probabilisticDiagnostics.portfolioHeat?.correlationAdjustedHeat ?? probabilisticDiagnostics.portfolioHeat?.totalHeat ?? 0) * 100)).toFixed(1)}%
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-brand-mint/60">
+              <span>Raw {(Number(probabilisticDiagnostics.portfolioHeat?.totalHeat || 0) * 100).toFixed(1)}%</span>
+              <span>Max Conc {(Number(probabilisticDiagnostics.portfolioHeat?.maxConcentration || 0) * 100).toFixed(1)}%</span>
+              <span>Lev ×{Number(probabilisticDiagnostics.portfolioHeat?.adjustedLeverageScale || 1).toFixed(2)}</span>
+              <span className={probabilisticDiagnostics.portfolioHeat?.heatCapExceeded ? "text-red-400" : "text-brand-teal"}>
+                {probabilisticDiagnostics.portfolioHeat?.heatCapExceeded ? "Cap Breach" : "Inside Cap"}
+              </span>
+            </div>
+          </div>
+
+          <div className="bg-[#0d1512]/80 border border-indigo-400/20 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Equity Throttle</span>
+              <ShieldCheck className="w-4 h-4 text-indigo-400" />
+            </div>
+            <div className="text-lg font-mono font-black text-indigo-300 uppercase">
+              {String(probabilisticDiagnostics.equityCurve?.state || "NORMAL").replace(/_/g, " ")}
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-brand-mint/60">
+              <span>Lev ×{Number(probabilisticDiagnostics.equityCurve?.throttle?.leverageScale || 1).toFixed(2)}</span>
+              <span>Heat Cap {(Number(probabilisticDiagnostics.equityCurve?.throttle?.portfolioHeatCap || 0) * 100).toFixed(0)}%</span>
+              <span>Conf Min {(Number(probabilisticDiagnostics.equityCurve?.throttle?.confidenceThreshold || 0) * 100).toFixed(0)}%</span>
+              <span>Duration ×{Number(probabilisticDiagnostics.equityCurve?.throttle?.maxPositionDurationScale || 1).toFixed(2)}</span>
+            </div>
+          </div>
+
+          <div className="bg-[#0d1512]/80 border border-amber-400/20 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Uncertainty</span>
+              <AlertCircle className="w-4 h-4 text-amber-400" />
+            </div>
+            <div className="text-2xl font-mono font-black text-amber-300">
+              {(Number(probabilisticDiagnostics.uncertaintyState?.marketUncertainty || 0) * 100).toFixed(0)}%
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-brand-mint/60">
+              <span>Epistemic {(Number(probabilisticDiagnostics.uncertaintyState?.epistemicUncertainty || 0) * 100).toFixed(0)}%</span>
+              <span>Model {(Number(probabilisticDiagnostics.uncertaintyState?.modelConfidence || 0) * 100).toFixed(0)}%</span>
+              <span>Regime {(Number(probabilisticDiagnostics.uncertaintyState?.regimeStability || 0) * 100).toFixed(0)}%</span>
+              <span>Entropy {(Number(probabilisticDiagnostics.portfolioRisk?.entropyLevel || 0) * 100).toFixed(0)}%</span>
+            </div>
+          </div>
+
+          <div className="bg-[#0d1512]/80 border border-brand-slate/20 rounded-lg p-3 space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Opportunity Density</span>
+              <Activity className="w-4 h-4 text-brand-peach" />
+            </div>
+            <div className="text-2xl font-mono font-black text-brand-peach">
+              {(Number(probabilisticDiagnostics.opportunityDensity?.opportunityDensity || 0) * 100).toFixed(1)}%
+            </div>
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono text-brand-mint/60">
+              <span>Captured {probabilisticDiagnostics.opportunityDensity?.capturedHighQualityTrades ?? 0}</span>
+              <span>Total HQ {probabilisticDiagnostics.opportunityDensity?.totalHighQualityOpportunities ?? 0}</span>
+              <span>FP {probabilisticDiagnostics.opportunityDensity?.falsePositiveApprovals ?? 0}</span>
+              <span>Sharpe Δ {Number(probabilisticDiagnostics.opportunityDensity?.avgExpectedSharpeContribution || 0).toFixed(3)}</span>
+            </div>
+          </div>
+        </div>
+
+        {governorDiagnostics && (
+          <div className="mb-4 grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-2">
+            {Object.entries(governorDiagnostics.perSymbol).map(([sym, profile]) => {
+              const sp: any = profile;
+              const gd = sp?.governorDecision;
+              const rg = sp?.regimeState;
+              const sk = sp?.spikeHarvestState;
+              return (
+                <div key={`prob-${sym}`} className="bg-[#0d1512]/60 border border-brand-slate/20 rounded-lg p-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-mono font-black text-brand-peach">{sym}</span>
+                    <span className={`text-[10px] font-mono font-bold ${gd?.approved ? "text-brand-teal" : gd ? "text-red-400" : "text-brand-mint/40"}`}>
+                      {gd?.confidenceTier || "WARMING"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 gap-x-2 gap-y-1 text-[10px] font-mono text-brand-mint/60">
+                    <span>Persist {(Number(sp?.persistenceProbability || 0) * 100).toFixed(0)}%</span>
+                    <span>Conf {(Number(sp?.confidence || 0) * 100).toFixed(0)}%</span>
+                    <span>Trend {(Number(rg?.trendProbability || 0) * 100).toFixed(0)}%</span>
+                    <span>MR {(Number(rg?.meanReversionProbability || 0) * 100).toFixed(0)}%</span>
+                    <span>Trans {(Number(rg?.transitionProbability || 0) * 100).toFixed(0)}%</span>
+                    <span>Risk ${Number(gd?.allocatedRisk || 0).toFixed(2)}</span>
+                    {(sym === "CRASH500" || sym === "BOOM500") && (
+                      <>
+                        <span>Spike {(Number(sk?.spikeExhaustionProbability || 0) * 100).toFixed(0)}%</span>
+                        <span>Recov {(Number(sk?.recoveryProbability || 0) * 100).toFixed(0)}%</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
 

@@ -60,6 +60,9 @@ export interface ActivePosition {
   closeRequestedAt?: number;
   closeRequestedReason?: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
   maxTicksOverride?: number;
+  entrySignalProbability?: number;
+  entryExpectedEdge?: number;
+  entryExpectedSharpeImpact?: number;
 }
 
 export interface TradeRecord {
@@ -240,6 +243,9 @@ export interface PortfolioHeatState {
   maxConcentration: number;
   heatCapExceeded: boolean;
   adjustedLeverageScale: number;
+  correlationAdjustedHeat?: number;
+  marginalCandidateHeat?: number;
+  clusterCapExceeded?: Record<string, boolean>;
 }
 
 export interface OpportunityDensityMetrics {
@@ -255,6 +261,8 @@ export interface OpportunityDensityMetrics {
 export interface SpikeHarvestState {
   spikeDetected: boolean;
   spikeEpoch: number;
+  spikeDirection?: "UP" | "DOWN";
+  spikeMagnitudeAtr?: number;
   spikeExhaustionProbability: number;
   recoveryProbability: number;
   persistenceDecay: number;
@@ -435,6 +443,8 @@ export interface SubAlgorithm {
   // Phase 1 probabilistic fields
   regimeState?: RegimeState;
   lastSignalProbability?: ExtendedSignalProbability;
+  lastGovernorDecision?: GovernorDecision;
+  lastPersistenceProbability?: number;
   specialization?: "V75" | "V50" | "BOOM" | "CRASH";
   // Phase 2 state fields
   spikeHarvestState?: SpikeHarvestState;
