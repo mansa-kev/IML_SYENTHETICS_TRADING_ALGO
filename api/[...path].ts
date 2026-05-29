@@ -1,4 +1,4 @@
-import app from "../server";
+import app from "../dist/server.cjs";
 
 export default function handler(req: any, res: any) {
   if (typeof req.url === "string" && !req.url.startsWith("/api")) {
