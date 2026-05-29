@@ -20,6 +20,9 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
+export { app };
+export default app;
+
 const PORT = 3000;
 
 // ==========================================
@@ -7936,6 +7939,8 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error("[FATAL_SERVER_START]", err);
-});
+if (!process.env.VERCEL) {
+  startServer().catch(err => {
+    console.error("[FATAL_SERVER_START]", err);
+  });
+}
