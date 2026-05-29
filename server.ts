@@ -10,7 +10,7 @@ import fs from "fs";
 import { WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
-import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm, RegimeState, SignalProbability, ExtendedSignalProbability, ConfidenceTier, GovernorDecision, PortfolioRiskState, ExecutionHealth, LiveMetrics, TradeQuality, VolatilityForecast, DistributionStats, FeatureSnapshot, InstrumentStats, EquityCurveState, UncertaintyState, PortfolioHeatState, OpportunityDensityMetrics, SpikeHarvestState, EquityCurveThrottleConfig, AdaptiveIntelligenceState, LongHorizonMemoryState, RegimeEvolution, AnomalyState } from "./src/types/iml.js";
+import { MarketRegime, Tick, Candle, ActivePosition, TradeRecord, SessionStats, LearningParams, CircuitBreakerStats, BacktestResult, SubAlgorithm, RegimeState, SignalProbability, ExtendedSignalProbability, ConfidenceTier, GovernorDecision, PortfolioRiskState, ExecutionHealth, LiveMetrics, TradeQuality, VolatilityForecast, DistributionStats, FeatureSnapshot, InstrumentStats, EquityCurveState, UncertaintyState, PortfolioHeatState, OpportunityDensityMetrics, SpikeHarvestState, EquityCurveThrottleConfig, AdaptiveIntelligenceState, LongHorizonMemoryState, RegimeEvolution, AnomalyState, ExecutionStateModel, RegimeTransitionState, PathDependentRiskState, ConfidenceCalibration, ProbabilityCalibrationState, StrategyDecayState, DynamicCorrelationModel, EpistemicUncertaintyState, SurvivalEquityCurveState, AutonomousPortfolioState, EmpiricalCalibrationState, SelfHealingRiskState, AutonomousState, ExecutionForensics, ProbabilityCalibration, StrategyDriftState, LongHorizonPortfolioState, CapitalPreservationState, DeploymentReadiness, AdaptiveLayerValidationState } from "./src/types/iml.js";
 import { createClient } from "@supabase/supabase-js";
 import PDFDocument from "pdfkit";
 
@@ -19,6 +19,9 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
+
+export { app };
+export default app;
 
 const PORT = 3000;
 
@@ -75,6 +78,11 @@ type PendingDerivOrder = {
 };
 const pendingOrderQueue: PendingDerivOrder[] = [];
 let nextDerivRequestId = 1;
+
+function hasRecentPendingDuplicate(symbol: string, direction: "LONG" | "SHORT", windowMs = 15000): boolean {
+  const now = Date.now();
+  return pendingOrderQueue.some(order => order.symbol === symbol && order.direction === direction && now - order.requestedAt <= windowMs);
+}
 
 function inferDirectionFromContractType(type: string): "LONG" | "SHORT" {
   return type.includes("PUT") || type.includes("FALL") || type.includes("MULTDOWN") || type.includes("UNDER") ? "SHORT" : "LONG";
@@ -161,6 +169,55 @@ interface StrategyProposal {
     isReversalCandle?: boolean;
     signalProbability?: ExtendedSignalProbability;
   };
+}
+
+
+interface CanonicalExposureModel {
+  equity: number;
+  stake: number;
+  effectiveMultiplier: number;
+  stopDistancePct: number;
+  expectedLossPct: number;
+  expectedRewardPct: number;
+  maxLossAmount: number;
+  targetRewardAmount: number;
+  rewardToRisk: number;
+  exposurePct: number;
+  portfolioHeatContribution: number;
+}
+
+interface OrderEconomics extends CanonicalExposureModel {
+  stakeToReward: number;
+  approved: boolean;
+  rejectionReasons: string[];
+}
+
+type AccountRiskMode = "NANO" | "MICRO" | "SMALL" | "STANDARD";
+
+interface RiskBudgetCaps {
+  mode: AccountRiskMode;
+  maxRiskPct: number;
+  maxStakePct: number;
+  minimumRR: number;
+  maxStakeRewardRatio: number;
+  maxPositions: number;
+  maxMultiplier: number;
+  executionHealthThreshold: number;
+}
+
+interface PreflightContext {
+  symbol: string;
+  direction: "LONG" | "SHORT";
+  stake: number;
+  effectiveMultiplier: number;
+  stopLossDistance: number;
+  takeProfitDistance: number;
+  entryPrice: number;
+  governorAllocatedRisk: number;
+  accountRiskBudget: number;
+  symbolRiskBudget: number;
+  portfolioRemainingRisk: number;
+  executionAdjustedRisk: number;
 }
 
 let governorFocusSymbol = "R_25";
@@ -302,6 +359,160 @@ let adaptiveIntelligenceState: AdaptiveIntelligenceState = {
     synchronizationScore: 1,
     degradationProbability: 0.1,
   },
+  executionState: {
+    latencyScore: 0.7,
+    slippageScore: 0.8,
+    rejectionProbability: 0.02,
+    websocketHealth: 0.8,
+    quoteFreshness: 0.7,
+    synchronizationConfidence: 1,
+    executionReliability: 0.75,
+    degradationProbability: 0.1,
+    executionRiskMultiplier: 0.9,
+  },
+  transition: {
+    transitionProbability: 0.2,
+    confidenceDecay: 0.05,
+    instabilityScore: 0.2,
+    volatilityShockRisk: 0.1,
+    edgeReliabilityDecay: 0.05,
+    adaptiveRiskMultiplier: 0.9,
+  },
+  pathRisk: {
+    consecutiveLossPressure: 0,
+    volatilityClusterRisk: 0.1,
+    drawdownAcceleration: 0,
+    confidenceErosion: 0,
+    recoveryProbability: 1,
+    adaptiveDefensiveScale: 1,
+  },
+  confidenceCalibration: {
+    predictedSharpe: 0,
+    realizedSharpe: 0,
+    predictionError: 0,
+    confidenceBias: 0,
+    calibrationError: 0,
+    overconfidenceProbability: 0,
+  },
+  probabilityCalibration: {
+    predictedProbability: 0.5,
+    realizedFrequency: 0.5,
+    calibrationGap: 0,
+    brierScore: 0.25,
+    reliabilityScore: 0.5,
+  },
+  strategyDecay: {},
+  dynamicCorrelation: {
+    symbols: Object.keys(CORRELATION_PRIORS),
+    rollingCorrelationMatrix: [],
+    stressCorrelationMatrix: [],
+    correlationInstability: 0,
+    concentrationRisk: 0,
+    portfolioFragility: 0,
+  },
+  epistemic: {
+    dataQuality: 0.5,
+    modelAgreement: 0.5,
+    signalStability: 0.5,
+    informationDensity: 0.5,
+    uncertaintyScore: 0.5,
+    uncertaintyAdjustedRisk: 0.5,
+  },
+  survivalEquity: {
+    drawdownDepth: 0,
+    drawdownVelocity: 0,
+    recoverySlope: 0,
+    equityStability: 1,
+    survivalModeProbability: 0,
+    adaptiveAggressionScale: 1,
+  },
+  portfolioBrain: {
+    portfolioSharpe: 0,
+    portfolioSortino: 0,
+    portfolioHeat: 0,
+    correlationStress: 0,
+    survivabilityScore: 1,
+    capitalEfficiency: 0,
+    opportunityCost: 0,
+    adaptiveExposureScale: 1,
+  },
+  empiricalCalibration: {
+    predictedWinProbability: 0.5,
+    realizedWinRate: 0.5,
+    predictedSharpe: 0,
+    realizedSharpe: 0,
+    predictedExpectancy: 0,
+    realizedExpectancy: 0,
+    calibrationError: 0,
+    confidenceBias: 0,
+    predictionReliability: 0.5,
+  },
+  selfHealingRisk: {
+    adaptiveRiskScale: 1,
+    survivabilityPriority: 0,
+    degradationSeverity: 0,
+    defensiveModeProbability: 0,
+    recoveryConfidence: 1,
+    capitalProtectionBias: 0,
+  },
+  autonomousState: AutonomousState.NORMAL,
+  executionForensics: {
+    averageProposalLatency: 0,
+    latencyVariance: 0,
+    websocketStability: 1,
+    staleQuoteRate: 0,
+    executionMismatchRate: 0,
+    synchronizationConfidence: 1,
+    executionIntegrityScore: 1,
+  },
+  probabilityCalibrationV2: {
+    predictedProbability: 0.5,
+    realizedFrequency: 0.5,
+    brierScore: 0.25,
+    reliabilityCurveError: 0,
+    calibrationConfidence: 0.5,
+  },
+  strategyDrift: {},
+  longHorizonPortfolio: {
+    portfolioSharpe: 0,
+    portfolioSortino: 0,
+    capitalEfficiency: 0,
+    portfolioHeat: 0,
+    opportunityDensity: 0,
+    survivabilityScore: 1,
+    concentrationRisk: 0,
+    adaptiveExposureScale: 1,
+  },
+  capitalPreservation: {
+    drawdownDepth: 0,
+    drawdownVelocity: 0,
+    recoverySlope: 0,
+    survivalProbability: 1,
+    adaptiveAggressionScale: 1,
+    capitalProtectionPriority: 0,
+  },
+  deploymentReadiness: {
+    executionReady: false,
+    calibrationStable: false,
+    survivabilityAcceptable: false,
+    portfolioRiskAcceptable: false,
+    edgePersistenceHealthy: false,
+    uncertaintyAcceptable: false,
+    liveDeploymentApproved: false,
+    readinessScore: 0,
+  },
+  adaptiveLayerValidation: {
+    predictedVsRealizedError: 0,
+    riskReductionEffectiveness: 0,
+    drawdownReductionEffectiveness: 0,
+    calibrationQuality: 0.5,
+    sharpeImprovement: 0,
+    survivabilityImpact: 0,
+    falseDefensiveActivationRate: 0,
+    missedOpportunityCost: 0,
+    validatedInfluenceScale: 0.5,
+    sampleSize: 0,
+  },
   uncertainty: {
     epistemicUncertainty: 0.35,
     marketUncertainty: 0.40,
@@ -317,6 +528,13 @@ let adaptiveIntelligenceState: AdaptiveIntelligenceState = {
     worstCaseDrawdown: 0,
     correlatedLossRisk: 0,
     executionDegradationRisk: 0,
+    expectedTerminalDrawdown: 0,
+    recoveryDuration: 0,
+    ruinProbability: 0,
+    capitalExhaustionProbability: 0,
+    longHorizonSharpeP05: 0,
+    longHorizonSharpeP50: 0,
+    longHorizonSharpeP95: 0,
     lastRunEpoch: 0,
   },
   lastShadowComparison: "Awaiting live feature and trade samples.",
@@ -331,6 +549,525 @@ function normalizeRange(value: number, low: number, high: number): number {
   return clamp01((value - low) / (high - low));
 }
 
+
+type RiskTelemetryEvent = {
+  epoch: number;
+  sessionId: string;
+  category: string;
+  event: string;
+  payload: Record<string, unknown>;
+};
+
+const riskTelemetry: RiskTelemetryEvent[] = [];
+const proposalLatencySamples: number[] = [];
+const websocketEventSamples: { epochMs: number; event: "open" | "close" | "error" }[] = [];
+const staleQuoteSamples: number[] = [];
+const executionMismatchSamples: number[] = [];
+const rejectionTimestamps: number[] = [];
+
+function boundedPush<T>(arr: T[], value: T, limit = 500) {
+  arr.push(value);
+  if (arr.length > limit) arr.splice(0, arr.length - limit);
+}
+
+function emitRiskTelemetry(category: string, event: string, payload: Record<string, unknown> = {}) {
+  const entry: RiskTelemetryEvent = {
+    epoch: Math.floor(Date.now() / 1000),
+    sessionId: botSessionId,
+    category,
+    event,
+    payload,
+  };
+  riskTelemetry.push(entry);
+  if (riskTelemetry.length > 1000) riskTelemetry.splice(0, riskTelemetry.length - 1000);
+  logs.push(`[RISK_TELEMETRY] ${category}:${event} ${JSON.stringify(payload)}`);
+}
+
+function quantile(values: number[], q: number): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const idx = Math.min(sorted.length - 1, Math.max(0, Math.floor((sorted.length - 1) * q)));
+  return sorted[idx];
+}
+
+function correlation(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  if (n < 5) return 0;
+  const aa = a.slice(-n);
+  const bb = b.slice(-n);
+  const ma = mean(aa);
+  const mb = mean(bb);
+  const sa = stddev(aa);
+  const sb = stddev(bb);
+  if (sa === 0 || sb === 0) return 0;
+  return Math.max(-1, Math.min(1, (aa.reduce((sum, value, i) => sum + (value - ma) * (bb[i] - mb), 0) / n) / (sa * sb)));
+}
+
+function latestQuoteAgeSeconds(symbol?: string): number {
+  const symbols = symbol ? [symbol] : Object.keys(candleBuffers);
+  const now = Math.floor(Date.now() / 1000);
+  const latestEpoch = Math.max(0, ...symbols.map(sym => candleBuffers[sym]?.[candleBuffers[sym].length - 1]?.epoch || 0));
+  return latestEpoch > 0 ? Math.max(0, now - latestEpoch) : 999;
+}
+
+function computeExecutionStateModel(symbol?: string): ExecutionStateModel {
+  const pendingAges = pendingOrderQueue.map(order => (Date.now() - order.requestedAt) / 1000).filter(Number.isFinite);
+  const pendingLatencyPressure = pendingAges.length ? clamp01(mean(pendingAges) / 20) : 0;
+  const latencyScore = clamp01(1 - Math.max(executionHealth.fillLatency / 1.5, pendingLatencyPressure));
+  const slippageScore = clamp01(1 - Math.abs(executionHealth.slippageEstimate) / 2.0);
+  const rejectionProbability = clamp01(executionHealth.rejectionRate + pendingLatencyPressure * 0.15);
+  const websocketHealth = executionHealth.desyncDetected ? 0.20 : clamp01(1 - pendingLatencyPressure * 0.45);
+  const quoteFreshness = clamp01(1 - latestQuoteAgeSeconds(symbol) / 180);
+  const synchronizationConfidence = executionHealth.desyncDetected ? 0.15 : clamp01(0.65 * websocketHealth + 0.35 * quoteFreshness);
+  const executionReliability = clamp01(0.24 * latencyScore + 0.22 * slippageScore + 0.18 * (1 - rejectionProbability) + 0.18 * websocketHealth + 0.18 * synchronizationConfidence);
+  const degradationProbability = clamp01(1 - executionReliability);
+  const executionRiskMultiplier = parseFloat(Math.max(0.15, Math.min(1, executionReliability ** 1.35)).toFixed(4));
+  return {
+    latencyScore: parseFloat(latencyScore.toFixed(4)),
+    slippageScore: parseFloat(slippageScore.toFixed(4)),
+    rejectionProbability: parseFloat(rejectionProbability.toFixed(4)),
+    websocketHealth: parseFloat(websocketHealth.toFixed(4)),
+    quoteFreshness: parseFloat(quoteFreshness.toFixed(4)),
+    synchronizationConfidence: parseFloat(synchronizationConfidence.toFixed(4)),
+    executionReliability: parseFloat(executionReliability.toFixed(4)),
+    degradationProbability: parseFloat(degradationProbability.toFixed(4)),
+    executionRiskMultiplier,
+  };
+}
+
+function computeRegimeTransitionState(symbol?: string): RegimeTransitionState {
+  const states = (symbol ? [subAlgorithms[symbol]?.regimeState] : Object.values(subAlgorithms).map(s => s.regimeState)).filter(Boolean) as RegimeState[];
+  if (!states.length) {
+    return { transitionProbability: 0.25, confidenceDecay: 0.0625, instabilityScore: 0.25, volatilityShockRisk: 0.1, edgeReliabilityDecay: 0.0625, adaptiveRiskMultiplier: 0.85 };
+  }
+  const transitionProbability = clamp01(mean(states.map(s => s.transitionProbability)));
+  const entropy = clamp01(mean(states.map(s => s.entropyScore ?? s.transitionProbability)));
+  const shock = clamp01(mean(states.map(s => s.volatilityExpansionProbability)));
+  const confidenceDecay = clamp01(transitionProbability ** 1.7);
+  const instabilityScore = clamp01(0.50 * transitionProbability + 0.30 * entropy + 0.20 * shock);
+  const edgeReliabilityDecay = clamp01(0.60 * confidenceDecay + 0.40 * instabilityScore);
+  return {
+    transitionProbability: parseFloat(transitionProbability.toFixed(4)),
+    confidenceDecay: parseFloat(confidenceDecay.toFixed(4)),
+    instabilityScore: parseFloat(instabilityScore.toFixed(4)),
+    volatilityShockRisk: parseFloat(shock.toFixed(4)),
+    edgeReliabilityDecay: parseFloat(edgeReliabilityDecay.toFixed(4)),
+    adaptiveRiskMultiplier: parseFloat(Math.max(0.18, 1 - edgeReliabilityDecay * 0.85 - shock * 0.20).toFixed(4)),
+  };
+}
+
+function computePathDependentRiskState(): PathDependentRiskState {
+  const recent = completedTrades.slice(-40);
+  const recentPnl = recent.map(t => t.pnl);
+  const lossRun = Math.min(10, consecutiveLosses);
+  const consecutiveLossPressure = clamp01(lossRun / 5);
+  const negCluster = recent.length ? recent.filter(t => t.pnl < 0).length / recent.length : 0;
+  const volatilityClusterRisk = clamp01(stddev(recentPnl) / Math.max(1, Math.abs(mean(recentPnl)) + 1) * 0.30 + negCluster * 0.35 + portfolioHeatState.totalHeat * 0.25);
+  const recentSum = recentPnl.slice(-10).reduce((sum, value) => sum + value, 0);
+  const drawdownDepth = peakBalance > 0 ? Math.max(0, (peakBalance - balance) / peakBalance) : 0;
+  const drawdownAcceleration = clamp01(Math.max(0, -recentSum) / Math.max(1, balance) * 10 + drawdownDepth * 0.65);
+  const confidenceErosion = clamp01(0.45 * consecutiveLossPressure + 0.30 * drawdownAcceleration + 0.25 * volatilityClusterRisk);
+  const recoveryProbability = clamp01(1 - confidenceErosion * 0.85 - drawdownDepth * 1.2);
+  return {
+    consecutiveLossPressure: parseFloat(consecutiveLossPressure.toFixed(4)),
+    volatilityClusterRisk: parseFloat(volatilityClusterRisk.toFixed(4)),
+    drawdownAcceleration: parseFloat(drawdownAcceleration.toFixed(4)),
+    confidenceErosion: parseFloat(confidenceErosion.toFixed(4)),
+    recoveryProbability: parseFloat(recoveryProbability.toFixed(4)),
+    adaptiveDefensiveScale: parseFloat(Math.max(0.20, recoveryProbability).toFixed(4)),
+  };
+}
+
+function computeConfidenceCalibration(): ConfidenceCalibration {
+  const trades = completedTrades.slice(-120);
+  const predictedSharpeValues = trades.map(t => t.entryExpectedSharpeImpact ?? (t.entryExpectedEdge !== undefined ? (t.entryExpectedEdge - 0.5) * 2 : undefined)).filter((v): v is number => Number.isFinite(v));
+  const pnlValues = trades.map(t => t.pnl);
+  const realizedSharpe = pnlValues.length >= 10 ? mean(pnlValues) / (stddev(pnlValues) || 1) : 0;
+  const predictedSharpe = predictedSharpeValues.length ? mean(predictedSharpeValues) : 0;
+  const predictionError = predictedSharpe - realizedSharpe;
+  const predictedConfidence = mean(trades.map(t => t.entrySignalProbability ?? 0.5));
+  const realizedFrequency = trades.length ? trades.filter(t => t.pnl > 0).length / trades.length : 0.5;
+  const confidenceBias = predictedConfidence - realizedFrequency;
+  const calibrationError = Math.abs(confidenceBias) + Math.abs(predictionError) * 0.25;
+  return {
+    predictedSharpe: parseFloat(predictedSharpe.toFixed(4)),
+    realizedSharpe: parseFloat(realizedSharpe.toFixed(4)),
+    predictionError: parseFloat(predictionError.toFixed(4)),
+    confidenceBias: parseFloat(confidenceBias.toFixed(4)),
+    calibrationError: parseFloat(calibrationError.toFixed(4)),
+    overconfidenceProbability: parseFloat(clamp01(Math.max(0, confidenceBias) * 1.6 + Math.max(0, predictionError) * 0.25).toFixed(4)),
+  };
+}
+
+function computeProbabilityCalibration(): ProbabilityCalibrationState {
+  const trades = completedTrades.slice(-200).filter(t => t.entrySignalProbability !== undefined);
+  if (trades.length < 5) return { predictedProbability: 0.5, realizedFrequency: 0.5, calibrationGap: 0, brierScore: 0.25, reliabilityScore: 0.5 };
+  const predictedProbability = mean(trades.map(t => t.entrySignalProbability || 0.5));
+  const realizedFrequency = trades.filter(t => t.pnl > 0).length / trades.length;
+  const brierScore = mean(trades.map(t => ((t.entrySignalProbability || 0.5) - (t.pnl > 0 ? 1 : 0)) ** 2));
+  const calibrationGap = predictedProbability - realizedFrequency;
+  return {
+    predictedProbability: parseFloat(predictedProbability.toFixed(4)),
+    realizedFrequency: parseFloat(realizedFrequency.toFixed(4)),
+    calibrationGap: parseFloat(calibrationGap.toFixed(4)),
+    brierScore: parseFloat(brierScore.toFixed(4)),
+    reliabilityScore: parseFloat(clamp01(1 - brierScore * 2 - Math.abs(calibrationGap)).toFixed(4)),
+  };
+}
+
+function computeStrategyDecayState(symbol: string): StrategyDecayState {
+  const trades = completedTrades.filter(t => t.symbol === symbol).slice(-240);
+  const longHorizonExpectancy = mean(trades.map(t => t.pnl));
+  const split = Math.max(10, Math.floor(trades.length / 2));
+  const base = trades.slice(0, -split);
+  const recent = trades.slice(-split);
+  const baseExpectancy = mean(base.map(t => t.pnl));
+  const recentExpectancy = mean(recent.map(t => t.pnl));
+  const baseSharpe = base.length >= 10 ? mean(base.map(t => t.pnl)) / (stddev(base.map(t => t.pnl)) || 1) : 0;
+  const recentSharpe = recent.length >= 10 ? mean(recent.map(t => t.pnl)) / (stddev(recent.map(t => t.pnl)) || 1) : 0;
+  const expectancyDecayRate = clamp01(Math.max(0, baseExpectancy - recentExpectancy) / Math.max(1, Math.abs(baseExpectancy)));
+  const sharpeDecayRate = clamp01(Math.max(0, baseSharpe - recentSharpe) / Math.max(1, Math.abs(baseSharpe)));
+  const evolution = adaptiveIntelligenceState.regimeEvolution[symbol];
+  const structuralBreakProbability = clamp01((evolution?.structuralShiftProbability ?? 0) * 0.55 + expectancyDecayRate * 0.30 + sharpeDecayRate * 0.15);
+  return {
+    longHorizonExpectancy: parseFloat(longHorizonExpectancy.toFixed(4)),
+    expectancyDecayRate: parseFloat(expectancyDecayRate.toFixed(4)),
+    sharpeDecayRate: parseFloat(sharpeDecayRate.toFixed(4)),
+    edgePersistenceProbability: parseFloat(clamp01(1 - expectancyDecayRate * 0.55 - sharpeDecayRate * 0.35 - structuralBreakProbability * 0.25).toFixed(4)),
+    structuralBreakProbability: parseFloat(structuralBreakProbability.toFixed(4)),
+    decayConfidence: parseFloat(clamp01(trades.length / 120).toFixed(4)),
+  };
+}
+
+function computeDynamicCorrelationModel(): DynamicCorrelationModel {
+  const symbols = Object.keys(INSTRUMENTS);
+  const returnsBySymbol = symbols.map(symbol => {
+    const prices = (featureStore[symbol]?.map(f => f.price) || tickBuffers[symbol] || []).slice(-160);
+    const returns: number[] = [];
+    for (let i = 1; i < prices.length; i++) returns.push((prices[i] - prices[i - 1]) / Math.max(1e-9, Math.abs(prices[i - 1])));
+    return returns;
+  });
+  const rollingCorrelationMatrix = symbols.map((_, i) => symbols.map((__, j) => i === j ? 1 : parseFloat(correlation(returnsBySymbol[i], returnsBySymbol[j]).toFixed(4))));
+  const transition = adaptiveIntelligenceState.transition?.instabilityScore ?? 0;
+  const executionStress = adaptiveIntelligenceState.executionState?.degradationProbability ?? 0;
+  const stressLift = clamp01(transition * 0.35 + executionStress * 0.25 + (adaptiveIntelligenceState.pathRisk?.volatilityClusterRisk ?? 0) * 0.25);
+  const stressCorrelationMatrix = rollingCorrelationMatrix.map((row, i) => row.map((value, j) => i === j ? 1 : parseFloat(Math.min(0.95, Math.max(value, value + (1 - Math.abs(value)) * stressLift)).toFixed(4))));
+  const priors = symbols.map((s1, i) => symbols.map((s2, j) => CORRELATION_PRIORS[s1]?.[s2] ?? (i === j ? 1 : 0.35)));
+  const diffs = rollingCorrelationMatrix.flatMap((row, i) => row.map((value, j) => Math.abs(value - priors[i][j])));
+  const correlationInstability = clamp01(mean(diffs));
+  const concentrationRisk = clamp01(portfolioHeatState.maxConcentration || 0);
+  const portfolioFragility = clamp01(0.45 * correlationInstability + 0.35 * stressLift + 0.20 * concentrationRisk);
+  return {
+    symbols,
+    rollingCorrelationMatrix,
+    stressCorrelationMatrix,
+    correlationInstability: parseFloat(correlationInstability.toFixed(4)),
+    concentrationRisk: parseFloat(concentrationRisk.toFixed(4)),
+    portfolioFragility: parseFloat(portfolioFragility.toFixed(4)),
+  };
+}
+
+function getDynamicCorrelation(s1: string, s2: string): number {
+  const model = adaptiveIntelligenceState.dynamicCorrelation;
+  const i = model.symbols?.indexOf(s1) ?? -1;
+  const j = model.symbols?.indexOf(s2) ?? -1;
+  if (i >= 0 && j >= 0 && model.stressCorrelationMatrix?.[i]?.[j] !== undefined) return model.stressCorrelationMatrix[i][j];
+  return CORRELATION_PRIORS[s1]?.[s2] ?? CORRELATION_PRIORS[s2]?.[s1] ?? (s1 === s2 ? 1 : 0.35);
+}
+
+function computeEpistemicUncertaintyState(): EpistemicUncertaintyState {
+  const symbols = Object.keys(INSTRUMENTS);
+  const featureDepth = mean(symbols.map(symbol => Math.min(1, (featureStore[symbol]?.length || 0) / PHASE3_MIN_ANOMALY_FEATURES)));
+  const confidences = symbols.map(symbol => subAlgorithms[symbol]?.lastSignalProbability?.confidence).filter((v): v is number => Number.isFinite(v));
+  const signalStability = clamp01(1 - stddev(confidences));
+  const regimeConf = symbols.map(symbol => subAlgorithms[symbol]?.regimeState?.confidence).filter((v): v is number => Number.isFinite(v));
+  const modelAgreement = clamp01(mean(regimeConf) || 0.5);
+  const informationDensity = clamp01(0.5 * featureDepth + 0.5 * Math.min(1, completedTrades.length / 200));
+  const dataQuality = clamp01(0.65 * featureDepth + 0.35 * (adaptiveIntelligenceState.executionState?.quoteFreshness ?? 0.5));
+  const uncertaintyScore = clamp01(1 - (0.30 * dataQuality + 0.25 * modelAgreement + 0.25 * signalStability + 0.20 * informationDensity));
+  return {
+    dataQuality: parseFloat(dataQuality.toFixed(4)),
+    modelAgreement: parseFloat(modelAgreement.toFixed(4)),
+    signalStability: parseFloat(signalStability.toFixed(4)),
+    informationDensity: parseFloat(informationDensity.toFixed(4)),
+    uncertaintyScore: parseFloat(uncertaintyScore.toFixed(4)),
+    uncertaintyAdjustedRisk: parseFloat(Math.max(0.20, 1 - uncertaintyScore * 0.90).toFixed(4)),
+  };
+}
+
+function computeSurvivalEquityCurveState(): SurvivalEquityCurveState {
+  const drawdownDepth = peakBalance > 0 ? Math.max(0, (peakBalance - balance) / peakBalance) : 0;
+  const recent = completedTrades.slice(-30).map(t => t.pnl);
+  const drawdownVelocity = clamp01(Math.max(0, -mean(recent.slice(-10))) / Math.max(1, balance) * 25 + drawdownDepth * 0.35);
+  const recoverySlope = clamp01(Math.max(0, mean(recent.slice(-10))) / Math.max(1, balance) * 25);
+  const equityStability = clamp01(1 - drawdownDepth * 2.5 - drawdownVelocity * 0.75 - stddev(recent) / Math.max(1, balance) * 8);
+  const survivalModeProbability = clamp01(drawdownDepth * 2.2 + drawdownVelocity * 0.9 + (adaptiveIntelligenceState.monteCarlo?.ruinProbability ?? 0) * 0.8);
+  return {
+    drawdownDepth: parseFloat(drawdownDepth.toFixed(4)),
+    drawdownVelocity: parseFloat(drawdownVelocity.toFixed(4)),
+    recoverySlope: parseFloat(recoverySlope.toFixed(4)),
+    equityStability: parseFloat(equityStability.toFixed(4)),
+    survivalModeProbability: parseFloat(survivalModeProbability.toFixed(4)),
+    adaptiveAggressionScale: parseFloat(Math.max(0.18, 1 - survivalModeProbability * 0.85 - drawdownDepth * 0.45).toFixed(4)),
+  };
+}
+
+function computeAutonomousPortfolioState(portfolioRisk?: PortfolioRiskState): AutonomousPortfolioState {
+  const trades = completedTrades.slice(-200);
+  const pnls = trades.map(t => t.pnl);
+  const downside = pnls.filter(v => v < 0);
+  const portfolioSharpe = pnls.length >= 10 ? mean(pnls) / (stddev(pnls) || 1) : 0;
+  const portfolioSortino = pnls.length >= 10 ? mean(pnls) / (stddev(downside) || 1) : 0;
+  const heat = portfolioHeatState.correlationAdjustedHeat ?? portfolioHeatState.totalHeat ?? 0;
+  const correlationStress = adaptiveIntelligenceState.dynamicCorrelation?.portfolioFragility ?? 0;
+  const survivabilityScore = adaptiveIntelligenceState.monteCarlo?.survivabilityProbability ?? 1;
+  const riskUsed = activePositions.reduce((sum, p) => sum + Math.abs(p.stake), 0) || 1;
+  const capitalEfficiency = clamp01(Math.max(0, mean(pnls.slice(-50))) / riskUsed * 10 + Math.max(0, portfolioSharpe) * 0.25);
+  const opportunityCost = clamp01(opportunityDensityMetrics.falseNegativeRejections / Math.max(1, opportunityDensityMetrics.totalHighQualityOpportunities));
+  const fragility = Math.max(correlationStress, 1 - survivabilityScore, portfolioRisk?.entropyLevel ?? 0);
+  return {
+    portfolioSharpe: parseFloat(portfolioSharpe.toFixed(4)),
+    portfolioSortino: parseFloat(portfolioSortino.toFixed(4)),
+    portfolioHeat: parseFloat(heat.toFixed(4)),
+    correlationStress: parseFloat(correlationStress.toFixed(4)),
+    survivabilityScore: parseFloat(survivabilityScore.toFixed(4)),
+    capitalEfficiency: parseFloat(capitalEfficiency.toFixed(4)),
+    opportunityCost: parseFloat(opportunityCost.toFixed(4)),
+    adaptiveExposureScale: parseFloat(Math.max(0.18, 1 - fragility * 0.75 - Math.max(0, -portfolioSharpe) * 0.20).toFixed(4)),
+  };
+}
+
+
+function computeEmpiricalCalibrationState(): EmpiricalCalibrationState {
+  const trades = completedTrades.slice(-250);
+  const predictedWinProbability = mean(trades.map(t => t.entrySignalProbability ?? 0.5)) || 0.5;
+  const realizedWinRate = trades.length ? trades.filter(t => t.pnl > 0).length / trades.length : 0.5;
+  const predictedSharpe = mean(trades.map(t => t.entryExpectedSharpeImpact ?? (t.entryExpectedEdge !== undefined ? (t.entryExpectedEdge - 0.5) * 2 : 0)));
+  const pnls = trades.map(t => t.pnl);
+  const realizedSharpe = pnls.length >= 10 ? mean(pnls) / (stddev(pnls) || 1) : 0;
+  const predictedExpectancy = mean(trades.map(t => ((t.entryExpectedEdge ?? 0.5) - 0.5) * Math.max(1, t.stake || 1)));
+  const realizedExpectancy = mean(pnls);
+  const confidenceBias = predictedWinProbability - realizedWinRate;
+  const calibrationError = clamp01(Math.abs(confidenceBias) + Math.abs(predictedSharpe - realizedSharpe) * 0.18 + Math.abs(predictedExpectancy - realizedExpectancy) / Math.max(1, Math.abs(realizedExpectancy) + 1) * 0.20);
+  return {
+    predictedWinProbability: parseFloat(predictedWinProbability.toFixed(4)),
+    realizedWinRate: parseFloat(realizedWinRate.toFixed(4)),
+    predictedSharpe: parseFloat(predictedSharpe.toFixed(4)),
+    realizedSharpe: parseFloat(realizedSharpe.toFixed(4)),
+    predictedExpectancy: parseFloat(predictedExpectancy.toFixed(4)),
+    realizedExpectancy: parseFloat(realizedExpectancy.toFixed(4)),
+    calibrationError: parseFloat(calibrationError.toFixed(4)),
+    confidenceBias: parseFloat(confidenceBias.toFixed(4)),
+    predictionReliability: parseFloat(Math.max(0.10, 1 - calibrationError).toFixed(4)),
+  };
+}
+
+function computeExecutionForensics(): ExecutionForensics {
+  const now = Date.now();
+  const recentWs = websocketEventSamples.filter(e => now - e.epochMs <= 60 * 60 * 1000);
+  const disconnectEvents = recentWs.filter(e => e.event === "close" || e.event === "error").length;
+  const websocketStability = clamp01(1 - disconnectEvents / Math.max(1, recentWs.length || 1));
+  const quoteAges = Object.keys(INSTRUMENTS).map(symbol => latestQuoteAgeSeconds(symbol));
+  const staleQuoteRate = clamp01(quoteAges.filter(age => age > 90).length / Math.max(1, quoteAges.length));
+  const averageProposalLatency = mean(proposalLatencySamples);
+  const latencyVariance = stddev(proposalLatencySamples) ** 2;
+  const executionMismatchRate = clamp01(mean(executionMismatchSamples.slice(-200)) || 0);
+  const synchronizationConfidence = Math.min(adaptiveIntelligenceState.executionState?.synchronizationConfidence ?? 1, clamp01(1 - staleQuoteRate * 0.7 - executionMismatchRate * 0.6));
+  const latencyPenalty = clamp01((averageProposalLatency || 0) / 12 + latencyVariance / 120);
+  const executionIntegrityScore = clamp01(0.28 * websocketStability + 0.24 * synchronizationConfidence + 0.20 * (1 - staleQuoteRate) + 0.18 * (1 - executionMismatchRate) + 0.10 * (1 - latencyPenalty));
+  return {
+    averageProposalLatency: parseFloat((averageProposalLatency || 0).toFixed(4)),
+    latencyVariance: parseFloat(latencyVariance.toFixed(4)),
+    websocketStability: parseFloat(websocketStability.toFixed(4)),
+    staleQuoteRate: parseFloat(staleQuoteRate.toFixed(4)),
+    executionMismatchRate: parseFloat(executionMismatchRate.toFixed(4)),
+    synchronizationConfidence: parseFloat(synchronizationConfidence.toFixed(4)),
+    executionIntegrityScore: parseFloat(executionIntegrityScore.toFixed(4)),
+  };
+}
+
+function computeProbabilityCalibrationV2(): ProbabilityCalibration {
+  const trades = completedTrades.slice(-250).filter(t => t.entrySignalProbability !== undefined);
+  if (trades.length < 10) {
+    return { predictedProbability: 0.5, realizedFrequency: 0.5, brierScore: 0.25, reliabilityCurveError: 0, calibrationConfidence: clamp01(trades.length / 50) };
+  }
+  const predictedProbability = mean(trades.map(t => t.entrySignalProbability || 0.5));
+  const realizedFrequency = trades.filter(t => t.pnl > 0).length / trades.length;
+  const brierScore = mean(trades.map(t => ((t.entrySignalProbability || 0.5) - (t.pnl > 0 ? 1 : 0)) ** 2));
+  const buckets = [0, 0.2, 0.4, 0.6, 0.8].map(start => {
+    const bucketTrades = trades.filter(t => (t.entrySignalProbability || 0.5) >= start && (t.entrySignalProbability || 0.5) < start + 0.2);
+    if (!bucketTrades.length) return 0;
+    const pred = mean(bucketTrades.map(t => t.entrySignalProbability || 0.5));
+    const actual = bucketTrades.filter(t => t.pnl > 0).length / bucketTrades.length;
+    return Math.abs(pred - actual) * (bucketTrades.length / trades.length);
+  });
+  const reliabilityCurveError = buckets.reduce((sum, v) => sum + v, 0);
+  return {
+    predictedProbability: parseFloat(predictedProbability.toFixed(4)),
+    realizedFrequency: parseFloat(realizedFrequency.toFixed(4)),
+    brierScore: parseFloat(brierScore.toFixed(4)),
+    reliabilityCurveError: parseFloat(reliabilityCurveError.toFixed(4)),
+    calibrationConfidence: parseFloat(clamp01(1 - brierScore * 1.7 - reliabilityCurveError).toFixed(4)),
+  };
+}
+
+function computeStrategyDriftState(symbol: string): StrategyDriftState {
+  const decay = computeStrategyDecayState(symbol);
+  const trades = completedTrades.filter(t => t.symbol === symbol).slice(-240);
+  const recentConf = mean(trades.slice(-40).map(t => t.entrySignalProbability ?? 0.5));
+  const priorConf = mean(trades.slice(0, Math.max(0, trades.length - 40)).map(t => t.entrySignalProbability ?? 0.5));
+  const confidenceDecayRate = clamp01(Math.max(0, priorConf - recentConf));
+  return {
+    longHorizonSharpe: parseFloat((getOrCreateMemory(symbol).longTermSharpe || 0).toFixed(4)),
+    expectancyDecayRate: decay.expectancyDecayRate,
+    confidenceDecayRate: parseFloat(confidenceDecayRate.toFixed(4)),
+    structuralBreakProbability: decay.structuralBreakProbability,
+    edgePersistenceProbability: decay.edgePersistenceProbability,
+    adaptiveWeightScale: parseFloat(Math.max(0.10, decay.edgePersistenceProbability * (1 - confidenceDecayRate * 0.5)).toFixed(4)),
+  };
+}
+
+function computeCapitalPreservationState(): CapitalPreservationState {
+  const survivalEquity = computeSurvivalEquityCurveState();
+  const survivalProbability = adaptiveIntelligenceState.monteCarlo?.survivabilityProbability ?? 1;
+  const capitalProtectionPriority = clamp01((1 - survivalProbability) * 0.55 + survivalEquity.survivalModeProbability * 0.35 + survivalEquity.drawdownVelocity * 0.25);
+  return {
+    drawdownDepth: survivalEquity.drawdownDepth,
+    drawdownVelocity: survivalEquity.drawdownVelocity,
+    recoverySlope: survivalEquity.recoverySlope,
+    survivalProbability: parseFloat(survivalProbability.toFixed(4)),
+    adaptiveAggressionScale: parseFloat(Math.max(0.12, survivalEquity.adaptiveAggressionScale * (1 - capitalProtectionPriority * 0.45)).toFixed(4)),
+    capitalProtectionPriority: parseFloat(capitalProtectionPriority.toFixed(4)),
+  };
+}
+
+function computeSelfHealingRiskState(): SelfHealingRiskState {
+  const degradationSeverity = Math.max(
+    1 - (adaptiveIntelligenceState.executionForensics?.executionIntegrityScore ?? 1),
+    adaptiveIntelligenceState.empiricalCalibration?.calibrationError ?? 0,
+    adaptiveIntelligenceState.transition?.instabilityScore ?? 0,
+    adaptiveIntelligenceState.pathRisk?.confidenceErosion ?? 0,
+    adaptiveIntelligenceState.capitalPreservation?.capitalProtectionPriority ?? 0,
+    Math.max(0, ...Object.values(adaptiveIntelligenceState.strategyDrift || {}).map(s => s.structuralBreakProbability))
+  );
+  const recoveryConfidence = Math.min(adaptiveIntelligenceState.pathRisk?.recoveryProbability ?? 1, adaptiveIntelligenceState.capitalPreservation?.adaptiveAggressionScale ?? 1, adaptiveIntelligenceState.empiricalCalibration?.predictionReliability ?? 1);
+  const defensiveModeProbability = clamp01(degradationSeverity * 0.85 + (1 - recoveryConfidence) * 0.35);
+  const survivabilityPriority = clamp01((1 - (adaptiveIntelligenceState.monteCarlo?.survivabilityProbability ?? 1)) * 0.65 + defensiveModeProbability * 0.35);
+  return {
+    adaptiveRiskScale: parseFloat(Math.max(0.08, 1 - defensiveModeProbability * 0.75 - survivabilityPriority * 0.35).toFixed(4)),
+    survivabilityPriority: parseFloat(survivabilityPriority.toFixed(4)),
+    degradationSeverity: parseFloat(degradationSeverity.toFixed(4)),
+    defensiveModeProbability: parseFloat(defensiveModeProbability.toFixed(4)),
+    recoveryConfidence: parseFloat(recoveryConfidence.toFixed(4)),
+    capitalProtectionBias: parseFloat(Math.max(survivabilityPriority, adaptiveIntelligenceState.capitalPreservation?.capitalProtectionPriority ?? 0).toFixed(4)),
+  };
+}
+
+function computeLongHorizonPortfolioState(portfolio?: AutonomousPortfolioState): LongHorizonPortfolioState {
+  const p = portfolio ?? computeAutonomousPortfolioState(computePortfolioRiskState());
+  return {
+    portfolioSharpe: p.portfolioSharpe,
+    portfolioSortino: p.portfolioSortino,
+    capitalEfficiency: p.capitalEfficiency,
+    portfolioHeat: p.portfolioHeat,
+    opportunityDensity: opportunityDensityMetrics.opportunityDensity,
+    survivabilityScore: p.survivabilityScore,
+    concentrationRisk: adaptiveIntelligenceState.dynamicCorrelation?.concentrationRisk ?? portfolioHeatState.maxConcentration ?? 0,
+    adaptiveExposureScale: p.adaptiveExposureScale,
+  };
+}
+
+function computeAdaptiveLayerValidationState(): AdaptiveLayerValidationState {
+  const trades = completedTrades.slice(-250);
+  const defensiveEvents = riskTelemetry.filter(e => e.category === "adaptive_portfolio" || e.category === "shadow_live_validation").slice(-250);
+  const sampleSize = trades.length;
+  const predictedVsRealizedError = adaptiveIntelligenceState.empiricalCalibration?.calibrationError ?? 0;
+  const recent = trades.slice(-60).map(t => t.pnl);
+  const prior = trades.slice(Math.max(0, trades.length - 180), Math.max(0, trades.length - 60)).map(t => t.pnl);
+  const recentDrawdown = Math.max(0, -Math.min(0, recent.reduce((sum, p) => sum + p, 0))) / Math.max(1, balance);
+  const priorDrawdown = Math.max(0, -Math.min(0, prior.reduce((sum, p) => sum + p, 0))) / Math.max(1, balance);
+  const drawdownReductionEffectiveness = clamp01((priorDrawdown - recentDrawdown) * 8);
+  const recentSharpe = recent.length >= 10 ? mean(recent) / (stddev(recent) || 1) : 0;
+  const priorSharpe = prior.length >= 10 ? mean(prior) / (stddev(prior) || 1) : 0;
+  const sharpeImprovement = clamp01((recentSharpe - priorSharpe + 1) / 2);
+  const calibrationQuality = adaptiveIntelligenceState.empiricalCalibration?.predictionReliability ?? 0.5;
+  const survivabilityImpact = clamp01((adaptiveIntelligenceState.monteCarlo?.survivabilityProbability ?? 1) - (adaptiveIntelligenceState.monteCarlo?.ruinProbability ?? 0));
+  const falseDefensiveActivationRate = defensiveEvents.length ? defensiveEvents.filter(e => (e.payload?.defensiveRiskCut as number | undefined) !== undefined && Number(e.payload.defensiveRiskCut) < 0.30).length / defensiveEvents.length : 0;
+  const missedOpportunityCost = clamp01(opportunityDensityMetrics.falseNegativeRejections / Math.max(1, opportunityDensityMetrics.totalHighQualityOpportunities));
+  const riskReductionEffectiveness = clamp01(0.40 * drawdownReductionEffectiveness + 0.30 * survivabilityImpact + 0.30 * (1 - falseDefensiveActivationRate));
+  const validatedInfluenceScale = sampleSize < 50
+    ? 0.35
+    : clamp01(0.20 + 0.25 * calibrationQuality + 0.25 * riskReductionEffectiveness + 0.15 * sharpeImprovement + 0.15 * survivabilityImpact - missedOpportunityCost * 0.20);
+  return {
+    predictedVsRealizedError: parseFloat(predictedVsRealizedError.toFixed(4)),
+    riskReductionEffectiveness: parseFloat(riskReductionEffectiveness.toFixed(4)),
+    drawdownReductionEffectiveness: parseFloat(drawdownReductionEffectiveness.toFixed(4)),
+    calibrationQuality: parseFloat(calibrationQuality.toFixed(4)),
+    sharpeImprovement: parseFloat(sharpeImprovement.toFixed(4)),
+    survivabilityImpact: parseFloat(survivabilityImpact.toFixed(4)),
+    falseDefensiveActivationRate: parseFloat(falseDefensiveActivationRate.toFixed(4)),
+    missedOpportunityCost: parseFloat(missedOpportunityCost.toFixed(4)),
+    validatedInfluenceScale: parseFloat(Math.max(0.10, Math.min(1, validatedInfluenceScale)).toFixed(4)),
+    sampleSize,
+  };
+}
+
+function computeAutonomousState(): AutonomousState {
+  if (SHADOW_LIVE_VALIDATION) return AutonomousState.SHADOW_ONLY;
+  if ((adaptiveIntelligenceState.executionForensics?.executionIntegrityScore ?? 1) < 0.35 || (adaptiveIntelligenceState.executionState?.executionReliability ?? 1) < 0.30) return AutonomousState.EXECUTION_UNSAFE;
+  if ((adaptiveIntelligenceState.empiricalCalibration?.calibrationError ?? 0) > 0.55 || (adaptiveIntelligenceState.probabilityCalibrationV2?.calibrationConfidence ?? 1) < 0.25) return AutonomousState.CALIBRATION_UNSTABLE;
+  if ((adaptiveIntelligenceState.capitalPreservation?.capitalProtectionPriority ?? 0) > 0.70 || (adaptiveIntelligenceState.monteCarlo?.ruinProbability ?? 0) > 0.12) return AutonomousState.SURVIVAL;
+  const stress = Math.max(
+    adaptiveIntelligenceState.selfHealingRisk?.degradationSeverity ?? 0,
+    adaptiveIntelligenceState.transition?.instabilityScore ?? 0,
+    adaptiveIntelligenceState.pathRisk?.confidenceErosion ?? 0,
+    adaptiveIntelligenceState.dynamicCorrelation?.portfolioFragility ?? 0
+  );
+  if (stress > 0.55) return AutonomousState.DEFENSIVE;
+  if (stress > 0.32) return AutonomousState.CAUTIOUS;
+  return AutonomousState.NORMAL;
+}
+
+function autonomousStateRiskScale(state: AutonomousState): number {
+  switch (state) {
+    case AutonomousState.SHADOW_ONLY:
+      return 1;
+    case AutonomousState.EXECUTION_UNSAFE:
+      return 0;
+    case AutonomousState.CALIBRATION_UNSTABLE:
+      return 0.22;
+    case AutonomousState.SURVIVAL:
+      return 0.16;
+    case AutonomousState.DEFENSIVE:
+      return 0.38;
+    case AutonomousState.CAUTIOUS:
+      return 0.68;
+    default:
+      return 1;
+  }
+}
+
+function computeDeploymentReadiness(): DeploymentReadiness {
+  const executionReady = (adaptiveIntelligenceState.executionForensics?.executionIntegrityScore ?? 0) >= 0.70 && (adaptiveIntelligenceState.executionState?.executionReliability ?? 0) >= 0.65;
+  const calibrationStable = (adaptiveIntelligenceState.empiricalCalibration?.calibrationError ?? 1) <= 0.35 && (adaptiveIntelligenceState.probabilityCalibrationV2?.calibrationConfidence ?? 0) >= 0.50;
+  const survivabilityAcceptable = (adaptiveIntelligenceState.monteCarlo?.survivabilityProbability ?? 0) >= 0.82 && (adaptiveIntelligenceState.monteCarlo?.ruinProbability ?? 1) <= 0.08;
+  const portfolioRiskAcceptable = !portfolioHeatState.heatCapExceeded && (adaptiveIntelligenceState.dynamicCorrelation?.portfolioFragility ?? 1) <= 0.55;
+  const edgePersistenceHealthy = Math.min(1, ...Object.values(adaptiveIntelligenceState.strategyDrift || {}).map(d => d.edgePersistenceProbability || 1)) >= 0.35;
+  const uncertaintyAcceptable = (adaptiveIntelligenceState.epistemic?.uncertaintyScore ?? 1) <= 0.65;
+  const checks = [executionReady, calibrationStable, survivabilityAcceptable, portfolioRiskAcceptable, edgePersistenceHealthy, uncertaintyAcceptable];
+  const readinessScore = checks.filter(Boolean).length / checks.length;
+  return {
+    executionReady,
+    calibrationStable,
+    survivabilityAcceptable,
+    portfolioRiskAcceptable,
+    edgePersistenceHealthy,
+    uncertaintyAcceptable,
+    liveDeploymentApproved: checks.every(Boolean) && adaptiveIntelligenceState.autonomousState !== AutonomousState.SHADOW_ONLY && adaptiveIntelligenceState.autonomousState !== AutonomousState.EXECUTION_UNSAFE,
+    readinessScore: parseFloat(readinessScore.toFixed(4)),
+  };
+}
+
 function deriveExecutionQualityScore(): number {
   const latencyPenalty = clamp01(executionHealth.fillLatency / 1.2); // normalize vs 1.2s worst-case
   const slippagePenalty = clamp01(Math.abs(executionHealth.slippageEstimate) / 1.5);
@@ -338,6 +1075,157 @@ function deriveExecutionQualityScore(): number {
   const desyncPenalty = executionHealth.desyncDetected ? 0.25 : 0;
   const quality = 1 - clamp01(0.45 * latencyPenalty + 0.35 * slippagePenalty + 0.15 * rejectionPenalty + desyncPenalty);
   return parseFloat(Math.max(0.15, quality).toFixed(4));
+}
+
+
+function getAccountRiskMode(equity: number): AccountRiskMode {
+  if (equity < 25) return "NANO";
+  if (equity < 100) return "MICRO";
+  if (equity < 1000) return "SMALL";
+  return "STANDARD";
+}
+
+function getRiskBudgetCaps(equity: number): RiskBudgetCaps {
+  const mode = getAccountRiskMode(equity);
+  const presetRiskPct = riskPreset === "AGGRESSIVE" ? 0.0125 : riskPreset === "CONSERVATIVE" ? 0.0025 : 0.006;
+  if (mode === "NANO") {
+    return { mode, maxRiskPct: 0.0025, maxStakePct: 0.0125, minimumRR: 1.8, maxStakeRewardRatio: 1.0, maxPositions: 1, maxMultiplier: 40, executionHealthThreshold: 0.72 };
+  }
+  if (mode === "MICRO") {
+    return { mode, maxRiskPct: Math.min(0.005, presetRiskPct), maxStakePct: 0.02, minimumRR: 1.6, maxStakeRewardRatio: 1.25, maxPositions: 1, maxMultiplier: 40, executionHealthThreshold: 0.68 };
+  }
+  if (mode === "SMALL") {
+    return { mode, maxRiskPct: Math.min(0.008, presetRiskPct), maxStakePct: 0.025, minimumRR: 1.5, maxStakeRewardRatio: 1.75, maxPositions: 2, maxMultiplier: 100, executionHealthThreshold: 0.58 };
+  }
+  return { mode, maxRiskPct: presetRiskPct, maxStakePct: riskPreset === "AGGRESSIVE" ? 0.02 : 0.015, minimumRR: 1.35, maxStakeRewardRatio: 2.25, maxPositions: riskPreset === "AGGRESSIVE" ? 4 : 3, maxMultiplier: riskPreset === "AGGRESSIVE" ? 400 : 200, executionHealthThreshold: 0.50 };
+}
+
+function deriveEffectiveDerivMultiplier(requestedMultiplier?: number): number {
+  const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200;
+  const proposed = requestedMultiplier && DERIV_SUPPORTED_MULTIPLIERS.includes(requestedMultiplier) ? requestedMultiplier : fallbackMultiplier;
+  const caps = getRiskBudgetCaps(balance);
+  const capped = Math.min(proposed, caps.maxMultiplier);
+  return DERIV_SUPPORTED_MULTIPLIERS.filter(m => m <= capped).pop() ?? DERIV_SUPPORTED_MULTIPLIERS[0];
+}
+
+function computeRiskBudget(symbol: string, governorConfidenceScale = 1): { accountRiskBudget: number; symbolRiskBudget: number; portfolioRemainingRisk: number; executionHealthScale: number; riskBudget: number } {
+  const equity = Math.max(0, balance);
+  const caps = getRiskBudgetCaps(equity);
+  const baseRiskPct = caps.maxRiskPct;
+  const uncertaintyScale = clamp01(1 - Math.max(uncertaintyState.epistemicUncertainty, uncertaintyState.marketUncertainty) * 0.65);
+  const executionState = adaptiveIntelligenceState.executionState ?? computeExecutionStateModel(symbol);
+  const transitionState = adaptiveIntelligenceState.transition ?? computeRegimeTransitionState(symbol);
+  const pathRisk = adaptiveIntelligenceState.pathRisk ?? computePathDependentRiskState();
+  const epistemic = adaptiveIntelligenceState.epistemic ?? computeEpistemicUncertaintyState();
+  const calibrationRiskScale = Math.max(0.20, Math.min(1, adaptiveIntelligenceState.probabilityCalibration?.reliabilityScore ?? 0.75));
+  const executionHealthScale = Math.min(deriveExecutionQualityScore(), executionState.executionRiskMultiplier);
+  const portfolioSnapshot = computePortfolioHeatSnapshot();
+  const portfolioHeatScale = clamp01(Math.min(1, portfolioSnapshot.adjustedLeverageScale, adaptiveIntelligenceState.portfolioBrain?.adaptiveExposureScale ?? 1));
+  const drawdown = peakBalance > 0 ? Math.max(0, (peakBalance - equity) / peakBalance) : 0;
+  const drawdownScale = clamp01(1 - drawdown * 8);
+  const selfHealingScale = adaptiveIntelligenceState.selfHealingRisk?.adaptiveRiskScale ?? 1;
+  const validationScale = adaptiveIntelligenceState.adaptiveLayerValidation?.validatedInfluenceScale ?? 1;
+  const stateScale = autonomousStateRiskScale(adaptiveIntelligenceState.autonomousState ?? AutonomousState.NORMAL);
+  const riskBudget = equity * baseRiskPct * clamp01(governorConfidenceScale) * uncertaintyScale * executionHealthScale * portfolioHeatScale * drawdownScale * transitionState.adaptiveRiskMultiplier * pathRisk.adaptiveDefensiveScale * epistemic.uncertaintyAdjustedRisk * calibrationRiskScale * selfHealingScale * Math.max(0.10, validationScale) * stateScale;
+  const accountRiskBudget = equity * caps.maxRiskPct;
+  const symbolRiskBudget = accountRiskBudget * (symbol === "R_25" ? 1 : symbol === "R_75" ? 0.75 : 0.5);
+  const portfolioRemainingRisk = Math.max(0, (equityCurveThrottle.portfolioHeatCap - (portfolioSnapshot.correlationAdjustedHeat ?? portfolioSnapshot.totalHeat)) * equity);
+  return {
+    accountRiskBudget: parseFloat(accountRiskBudget.toFixed(2)),
+    symbolRiskBudget: parseFloat(symbolRiskBudget.toFixed(2)),
+    portfolioRemainingRisk: parseFloat(portfolioRemainingRisk.toFixed(2)),
+    executionHealthScale,
+    riskBudget: parseFloat(Math.max(0, riskBudget).toFixed(2)),
+  };
+}
+
+function assertFinalRiskAuthority(finalRisk: number, governorAllocatedRisk: number, context: string) {
+  if (finalRisk > governorAllocatedRisk + 0.0001) {
+    throw new Error(`[RISK_AUTHORITY_INVARIANT] ${context}: finalRisk $${finalRisk.toFixed(2)} exceeds governor allocation $${governorAllocatedRisk.toFixed(2)}`);
+  }
+}
+
+function buildCanonicalExposureModel(input: { equity: number; stake: number; effectiveMultiplier: number; stopLossDistance: number; takeProfitDistance: number; entryPrice: number; symbol: string; direction: "LONG" | "SHORT" }): CanonicalExposureModel {
+  const equity = Math.max(0, input.equity);
+  const stake = Math.max(0, input.stake);
+  const entryPrice = Math.max(1e-9, Math.abs(input.entryPrice));
+  const effectiveMultiplier = Math.max(1, input.effectiveMultiplier);
+  const stopDistancePct = Math.max(0, input.stopLossDistance / entryPrice);
+  const rewardDistancePct = Math.max(0, input.takeProfitDistance / entryPrice);
+  const expectedLossPct = Math.min(1, stopDistancePct * effectiveMultiplier);
+  const expectedRewardPct = rewardDistancePct * effectiveMultiplier;
+  const maxLossAmount = Math.min(stake, stake * expectedLossPct);
+  const targetRewardAmount = stake * expectedRewardPct;
+  const heatWithCandidate = computePortfolioHeatSnapshot({ symbol: input.symbol, stake, direction: input.direction });
+  const heatNow = computePortfolioHeatSnapshot();
+  return {
+    equity,
+    stake: parseFloat(stake.toFixed(2)),
+    effectiveMultiplier,
+    stopDistancePct: parseFloat(stopDistancePct.toFixed(6)),
+    expectedLossPct: parseFloat(expectedLossPct.toFixed(6)),
+    expectedRewardPct: parseFloat(expectedRewardPct.toFixed(6)),
+    maxLossAmount: parseFloat(maxLossAmount.toFixed(4)),
+    targetRewardAmount: parseFloat(targetRewardAmount.toFixed(4)),
+    rewardToRisk: parseFloat((targetRewardAmount / Math.max(1e-9, maxLossAmount)).toFixed(4)),
+    exposurePct: parseFloat((equity > 0 ? (stake * effectiveMultiplier) / equity : 0).toFixed(6)),
+    portfolioHeatContribution: parseFloat(Math.max(0, (heatWithCandidate.correlationAdjustedHeat ?? heatWithCandidate.totalHeat) - (heatNow.correlationAdjustedHeat ?? heatNow.totalHeat)).toFixed(6)),
+  };
+}
+
+function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
+  const caps = getRiskBudgetCaps(balance);
+  let stake = Math.max(0, context.stake);
+  const rejectionReasons: string[] = [];
+  const minRiskBudget = Math.max(0, Math.min(
+    context.governorAllocatedRisk,
+    context.accountRiskBudget,
+    context.symbolRiskBudget,
+    context.portfolioRemainingRisk,
+    context.executionAdjustedRisk
+  ));
+  assertFinalRiskAuthority(minRiskBudget, context.governorAllocatedRisk, `preflight:${context.symbol}`);
+
+  let model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
+  if (model.maxLossAmount > minRiskBudget && model.maxLossAmount > 0) {
+    const resizedStake = Math.floor((stake * (minRiskBudget / model.maxLossAmount)) * 100) / 100;
+    logs.push(`[ORDER_PREFLIGHT_RESIZE] ${context.symbol} stake reduced from $${stake.toFixed(2)} to $${resizedStake.toFixed(2)} so max loss cannot exceed final risk budget $${minRiskBudget.toFixed(2)}.`);
+    emitRiskTelemetry("order_preflight", "resize", { symbol: context.symbol, fromStake: stake, toStake: resizedStake, minRiskBudget, maxLoss: model.maxLossAmount });
+    stake = resizedStake;
+    model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
+  }
+
+  const heatSnapshot = computePortfolioHeatSnapshot({ symbol: context.symbol, stake, direction: context.direction });
+  const executionQuality = Math.min(deriveExecutionQualityScore(), adaptiveIntelligenceState.executionState?.executionReliability ?? 1);
+  const epistemicScore = adaptiveIntelligenceState.epistemic?.uncertaintyScore ?? 0;
+  if (model.maxLossAmount > balance * caps.maxRiskPct + 0.0001) rejectionReasons.push("max_loss_exceeds_account_risk_budget");
+  if (model.maxLossAmount > minRiskBudget + 0.0001) rejectionReasons.push("max_loss_exceeds_final_risk_authority");
+  if (model.targetRewardAmount < model.maxLossAmount * caps.minimumRR) rejectionReasons.push("target_reward_below_minimum_rr");
+  if (stake > balance * caps.maxStakePct + 0.0001) rejectionReasons.push("stake_exceeds_account_ceiling");
+  if (model.targetRewardAmount <= 0 || stake / model.targetRewardAmount > caps.maxStakeRewardRatio) rejectionReasons.push("stake_to_reward_exceeds_ceiling");
+  if (heatSnapshot.heatCapExceeded) rejectionReasons.push("portfolio_heat_exceeded");
+  if (executionQuality < caps.executionHealthThreshold) rejectionReasons.push("execution_health_below_threshold");
+  if ((adaptiveIntelligenceState.executionForensics?.executionIntegrityScore ?? 1) < 0.35) rejectionReasons.push("execution_integrity_below_live_threshold");
+  if ((adaptiveIntelligenceState.empiricalCalibration?.calibrationError ?? 0) > 0.70) rejectionReasons.push("calibration_error_above_live_threshold");
+  if (adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) rejectionReasons.push(`autonomous_state_${adaptiveIntelligenceState.autonomousState}`);
+  if (epistemicScore > 0.85) rejectionReasons.push("epistemic_uncertainty_above_live_threshold");
+  if (activePositions.length >= caps.maxPositions) rejectionReasons.push("account_position_limit_reached");
+  if ((caps.mode === "NANO" || caps.mode === "MICRO") && ["BOOM500", "CRASH500"].includes(context.symbol)) rejectionReasons.push("micro_account_boom_crash_disabled");
+  if ((caps.mode === "NANO" || caps.mode === "MICRO") && hybridRiskType === "FIXED") rejectionReasons.push("micro_account_fixed_risk_disabled");
+  if (context.effectiveMultiplier > caps.maxMultiplier) rejectionReasons.push("effective_multiplier_exceeds_account_cap");
+  if (stake < 0.35) rejectionReasons.push("resized_stake_below_deriv_minimum");
+  if (!Number.isFinite(model.maxLossAmount) || !Number.isFinite(model.targetRewardAmount)) rejectionReasons.push("invalid_order_economics");
+
+  const result = {
+    ...model,
+    stakeToReward: parseFloat((model.targetRewardAmount > 0 ? stake / model.targetRewardAmount : Number.POSITIVE_INFINITY).toFixed(4)),
+    approved: rejectionReasons.length === 0,
+    rejectionReasons,
+  };
+  if (!result.approved) {
+    emitRiskTelemetry("order_preflight", "reject", { symbol: context.symbol, reasons: rejectionReasons, maxLossAmount: result.maxLossAmount, targetRewardAmount: result.targetRewardAmount, exposurePct: result.exposurePct });
+  }
+  return result;
 }
 
 function computePortfolioHeatSnapshot(candidate?: { symbol: string; stake: number; direction: "LONG" | "SHORT" }): PortfolioHeatState {
@@ -366,17 +1254,19 @@ function computePortfolioHeatSnapshot(candidate?: { symbol: string; stake: numbe
   let variance = 0;
   for (const s1 of symbols) {
     for (const s2 of symbols) {
-      const corr = CORRELATION_PRIORS[s1]?.[s2] ?? CORRELATION_PRIORS[s2]?.[s1] ?? (s1 === s2 ? 1 : 0.35);
+      const corr = getDynamicCorrelation(s1, s2);
       variance += exposureBySymbol[s1] * exposureBySymbol[s2] * corr;
     }
   }
   const correlationAdjustedHeat = Math.sqrt(Math.max(0, variance));
 
+  const dynamicFragility = adaptiveIntelligenceState.dynamicCorrelation?.portfolioFragility ?? 0;
+  const executionContraction = adaptiveIntelligenceState.executionState?.executionRiskMultiplier ?? 1;
   const adjustedScale = Math.max(
-    0.2,
-    1 - Math.max(0, correlationAdjustedHeat - 0.25) * 1.15 - Math.max(0, maxConcentration - 0.35) * 0.8
+    0.12,
+    Math.min(1, executionContraction) * (1 - Math.max(0, correlationAdjustedHeat - 0.25) * 1.15 - Math.max(0, maxConcentration - 0.35) * 0.8 - dynamicFragility * 0.35)
   );
-  const heatCap = equityCurveThrottle.portfolioHeatCap;
+  const heatCap = equityCurveThrottle.portfolioHeatCap * Math.max(0.35, 1 - dynamicFragility * 0.55 - (adaptiveIntelligenceState.executionState?.degradationProbability ?? 0) * 0.25);
   return {
     totalHeat: parseFloat(totalHeat.toFixed(4)),
     correlatedClusterHeat,
@@ -401,6 +1291,13 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
   const dd = riskState.drawdownSeverity;
   const entropy = riskState.entropyLevel;
   const volatility = riskState.volatilityCluster;
+  const executionState = adaptiveIntelligenceState.executionState ?? computeExecutionStateModel();
+  const transitionState = adaptiveIntelligenceState.transition ?? computeRegimeTransitionState();
+  const pathRisk = adaptiveIntelligenceState.pathRisk ?? computePathDependentRiskState();
+  const survival = adaptiveIntelligenceState.survivalEquity ?? computeSurvivalEquityCurveState();
+  const defensiveScale = Math.min(executionState.executionRiskMultiplier, transitionState.adaptiveRiskMultiplier, pathRisk.adaptiveDefensiveScale, survival.adaptiveAggressionScale);
+  const thresholdPenalty = (1 - defensiveScale) * 0.16;
+  const heatContraction = Math.max(0.30, defensiveScale);
   let state: EquityCurveState = EquityCurveState.NORMAL;
   if (dd >= 0.12 || entropy >= 0.55) {
     state = EquityCurveState.HARD_DRAWDOWN;
@@ -416,47 +1313,47 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
     case EquityCurveState.EXPANSION:
       return {
         state,
-        leverageScale: 1.15,
-        confidenceThreshold: 0.42,
-        portfolioHeatCap: 0.7,
-        maxPositionDurationScale: 1.1,
-        tradeAggressiveness: 1.1,
+        leverageScale: parseFloat((1.15 * defensiveScale).toFixed(4)),
+        confidenceThreshold: parseFloat(Math.min(0.82, 0.42 + thresholdPenalty).toFixed(4)),
+        portfolioHeatCap: parseFloat((0.7 * heatContraction).toFixed(4)),
+        maxPositionDurationScale: parseFloat(Math.max(0.35, 1.1 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat(Math.min(1.1, 1.1 * defensiveScale).toFixed(4)),
       };
     case EquityCurveState.RECOVERY:
       return {
         state,
-        leverageScale: 0.95,
-        confidenceThreshold: 0.46,
-        portfolioHeatCap: 0.6,
-        maxPositionDurationScale: 0.95,
-        tradeAggressiveness: 0.95,
+        leverageScale: parseFloat((0.95 * defensiveScale).toFixed(4)),
+        confidenceThreshold: parseFloat(Math.min(0.82, 0.46 + thresholdPenalty).toFixed(4)),
+        portfolioHeatCap: parseFloat((0.6 * heatContraction).toFixed(4)),
+        maxPositionDurationScale: parseFloat(Math.max(0.35, 0.95 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat(Math.min(0.95, 0.95 * defensiveScale).toFixed(4)),
       };
     case EquityCurveState.SOFT_DRAWDOWN:
       return {
         state,
-        leverageScale: 0.75,
-        confidenceThreshold: 0.5,
-        portfolioHeatCap: 0.5,
-        maxPositionDurationScale: 0.8,
-        tradeAggressiveness: 0.75,
+        leverageScale: parseFloat((0.75 * defensiveScale).toFixed(4)),
+        confidenceThreshold: parseFloat(Math.min(0.82, 0.5 + thresholdPenalty).toFixed(4)),
+        portfolioHeatCap: parseFloat((0.5 * heatContraction).toFixed(4)),
+        maxPositionDurationScale: parseFloat(Math.max(0.35, 0.8 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat(Math.min(0.75, 0.75 * defensiveScale).toFixed(4)),
       };
     case EquityCurveState.HARD_DRAWDOWN:
       return {
         state,
-        leverageScale: 0.45,
-        confidenceThreshold: 0.58,
-        portfolioHeatCap: 0.35,
-        maxPositionDurationScale: 0.65,
-        tradeAggressiveness: 0.55,
+        leverageScale: parseFloat((0.45 * defensiveScale).toFixed(4)),
+        confidenceThreshold: parseFloat(Math.min(0.88, 0.58 + thresholdPenalty).toFixed(4)),
+        portfolioHeatCap: parseFloat((0.35 * heatContraction).toFixed(4)),
+        maxPositionDurationScale: parseFloat(Math.max(0.30, 0.65 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat(Math.min(0.55, 0.55 * defensiveScale).toFixed(4)),
       };
     default:
       return {
         state: EquityCurveState.NORMAL,
-        leverageScale: 1,
-        confidenceThreshold: 0.45,
-        portfolioHeatCap: 0.65,
-        maxPositionDurationScale: 1,
-        tradeAggressiveness: 1,
+        leverageScale: parseFloat((1 * defensiveScale).toFixed(4)),
+        confidenceThreshold: parseFloat(Math.min(0.82, 0.45 + thresholdPenalty).toFixed(4)),
+        portfolioHeatCap: parseFloat((0.65 * heatContraction).toFixed(4)),
+        maxPositionDurationScale: parseFloat(Math.max(0.35, 1 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat(Math.min(1, 1 * defensiveScale).toFixed(4)),
       };
   }
 }
@@ -1073,7 +1970,40 @@ async function loadStateFromSupabase() {
       if (loaded.hybridEarlyCutoffPct !== undefined) hybridEarlyCutoffPct = loaded.hybridEarlyCutoffPct;
       if (loaded.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = loaded.hybridGreeningTriggerPct;
       if (loaded.adaptiveIntelligenceState !== undefined) {
-        adaptiveIntelligenceState = { ...adaptiveIntelligenceState, ...loaded.adaptiveIntelligenceState };
+        const recoveredAdaptive = loaded.adaptiveIntelligenceState;
+        adaptiveIntelligenceState = {
+          ...adaptiveIntelligenceState,
+          ...recoveredAdaptive,
+          metaLearning: { ...adaptiveIntelligenceState.metaLearning, ...(recoveredAdaptive.metaLearning || {}) },
+          policy: { ...adaptiveIntelligenceState.policy, ...(recoveredAdaptive.policy || {}) },
+          ensemble: { ...adaptiveIntelligenceState.ensemble, ...(recoveredAdaptive.ensemble || {}) },
+          execution: { ...adaptiveIntelligenceState.execution, ...(recoveredAdaptive.execution || {}) },
+          executionState: { ...adaptiveIntelligenceState.executionState, ...(recoveredAdaptive.executionState || {}) },
+          transition: { ...adaptiveIntelligenceState.transition, ...(recoveredAdaptive.transition || {}) },
+          pathRisk: { ...adaptiveIntelligenceState.pathRisk, ...(recoveredAdaptive.pathRisk || {}) },
+          confidenceCalibration: { ...adaptiveIntelligenceState.confidenceCalibration, ...(recoveredAdaptive.confidenceCalibration || {}) },
+          probabilityCalibration: { ...adaptiveIntelligenceState.probabilityCalibration, ...(recoveredAdaptive.probabilityCalibration || {}) },
+          dynamicCorrelation: { ...adaptiveIntelligenceState.dynamicCorrelation, ...(recoveredAdaptive.dynamicCorrelation || {}) },
+          epistemic: { ...adaptiveIntelligenceState.epistemic, ...(recoveredAdaptive.epistemic || {}) },
+          survivalEquity: { ...adaptiveIntelligenceState.survivalEquity, ...(recoveredAdaptive.survivalEquity || {}) },
+          portfolioBrain: { ...adaptiveIntelligenceState.portfolioBrain, ...(recoveredAdaptive.portfolioBrain || {}) },
+          empiricalCalibration: { ...adaptiveIntelligenceState.empiricalCalibration, ...(recoveredAdaptive.empiricalCalibration || {}) },
+          selfHealingRisk: { ...adaptiveIntelligenceState.selfHealingRisk, ...(recoveredAdaptive.selfHealingRisk || {}) },
+          autonomousState: recoveredAdaptive.autonomousState || adaptiveIntelligenceState.autonomousState,
+          executionForensics: { ...adaptiveIntelligenceState.executionForensics, ...(recoveredAdaptive.executionForensics || {}) },
+          probabilityCalibrationV2: { ...adaptiveIntelligenceState.probabilityCalibrationV2, ...(recoveredAdaptive.probabilityCalibrationV2 || {}) },
+          longHorizonPortfolio: { ...adaptiveIntelligenceState.longHorizonPortfolio, ...(recoveredAdaptive.longHorizonPortfolio || {}) },
+          capitalPreservation: { ...adaptiveIntelligenceState.capitalPreservation, ...(recoveredAdaptive.capitalPreservation || {}) },
+          deploymentReadiness: { ...adaptiveIntelligenceState.deploymentReadiness, ...(recoveredAdaptive.deploymentReadiness || {}) },
+          adaptiveLayerValidation: { ...adaptiveIntelligenceState.adaptiveLayerValidation, ...(recoveredAdaptive.adaptiveLayerValidation || {}) },
+          uncertainty: { ...adaptiveIntelligenceState.uncertainty, ...(recoveredAdaptive.uncertainty || {}) },
+          monteCarlo: { ...adaptiveIntelligenceState.monteCarlo, ...(recoveredAdaptive.monteCarlo || {}) },
+          regimeEvolution: recoveredAdaptive.regimeEvolution || adaptiveIntelligenceState.regimeEvolution,
+          anomaly: recoveredAdaptive.anomaly || adaptiveIntelligenceState.anomaly,
+          longHorizonMemory: recoveredAdaptive.longHorizonMemory || adaptiveIntelligenceState.longHorizonMemory,
+          strategyDecay: recoveredAdaptive.strategyDecay || adaptiveIntelligenceState.strategyDecay,
+          strategyDrift: recoveredAdaptive.strategyDrift || adaptiveIntelligenceState.strategyDrift,
+        };
       }
       if (loaded.activePositions !== undefined) {
         const recoveredPositions = Array.isArray(loaded.activePositions) ? loaded.activePositions : [];
@@ -1177,8 +2107,21 @@ const INSTRUMENT_PRIORS: Record<string, { confidence: number; expectedEdge: numb
 // ==========================================
 // DERIV LIVE API WEB-SOCKET INTEGRATION BRIDGE
 // ==========================================
-const DERIV_APP_ID = process.env.DERIV_APP_ID || "1089"; // Default App ID
-const DERIV_API_TOKEN = process.env.DERIV_API_TOKEN || ""; // User API Token
+const DERIV_APP_ID = (process.env.DERIV_APP_ID || "1089").trim(); // Default App ID
+const DERIV_API_TOKEN = (process.env.DERIV_API_TOKEN || "").trim(); // User API Token (server-side only)
+type DerivRuntimeSource = "ENV" | "SUPABASE" | "MANUAL";
+const DERIV_RUNTIME_SOURCE: DerivRuntimeSource = DERIV_API_TOKEN ? "ENV" : "MANUAL";
+const SHADOW_LIVE_VALIDATION = process.env.IML_SHADOW_LIVE_VALIDATION === "true";
+const derivInitializationErrors: string[] = [];
+
+function recordDerivInitializationError(message: string) {
+  const safe = message.replace(DERIV_API_TOKEN, "[REDACTED_DERIV_TOKEN]");
+  derivInitializationErrors.push(safe);
+  if (derivInitializationErrors.length > 25) derivInitializationErrors.splice(0, derivInitializationErrors.length - 25);
+  logs.push(`[DERIV_DIAGNOSTIC] ${safe}`);
+}
+
+logs.push(`[DERIV_DIAGNOSTIC] Startup credential audit: appIdConfigured=${Boolean(DERIV_APP_ID)} tokenConfigured=${Boolean(DERIV_API_TOKEN)} runtimeSource=${DERIV_RUNTIME_SOURCE} shadowValidation=${SHADOW_LIVE_VALIDATION}.`);
 
 class DerivLiveBridge {
   private ws: WebSocket | null = null;
@@ -1187,20 +2130,50 @@ class DerivLiveBridge {
   private subscribedSymbols = new Set<string>();
 
   constructor() {
-    logs.push(`[DERIV_LIVE] 🔄 Initializing connection to wss://ws.derivws.com/websockets/v3...`);
+    logs.push(`[DERIV_LIVE] 🔄 Initializing connection to wss://ws.derivws.com/websockets/v3... tokenConfigured=${Boolean(DERIV_API_TOKEN)} source=${DERIV_RUNTIME_SOURCE}`);
+    this.connect();
+  }
+
+  public getWebsocketConnected(): boolean {
+    return Boolean(this.ws && this.ws.readyState === WebSocket.OPEN);
+  }
+
+  public getDerivDiagnostics() {
+    return {
+      derivConfigured: Boolean(DERIV_API_TOKEN),
+      derivConnected: this.getWebsocketConnected(),
+      derivAuthValidated: this.isAuthorized,
+      derivRuntimeSource: DERIV_RUNTIME_SOURCE,
+      derivInitializationErrors: [...derivInitializationErrors],
+      websocketConnected: this.getWebsocketConnected(),
+    };
+  }
+
+  public ensureConnected(reason = "runtime_check") {
+    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
+    logs.push(`[DERIV_LIVE] 🔄 Reconnect requested by ${reason}. tokenConfigured=${Boolean(DERIV_API_TOKEN)} source=${DERIV_RUNTIME_SOURCE}`);
     this.connect();
   }
 
   private connect() {
     try {
+      if (!DERIV_APP_ID) {
+        recordDerivInitializationError("DERIV_APP_ID is empty at runtime; falling back is disabled for explicit production diagnostics.");
+      }
+      if (!DERIV_API_TOKEN) {
+        recordDerivInitializationError("DERIV_API_TOKEN is not visible to the server runtime; live authorization cannot start.");
+      }
       this.ws = new WebSocket(`wss://ws.derivws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
       
       this.ws.on("open", () => {
+        boundedPush(websocketEventSamples, { epochMs: Date.now(), event: "open" });
         logs.push(`[DERIV_LIVE] 🟢 WebSocket connection established safely with Deriv servers (App ID: ${DERIV_APP_ID}).`);
         
         if (DERIV_API_TOKEN) {
+          logs.push(`[DERIV_LIVE] 🔐 Server-side DERIV_API_TOKEN detected from ${DERIV_RUNTIME_SOURCE}; beginning secure authorization handshake.`);
           this.authorizeUser();
         } else {
+          recordDerivInitializationError("DERIV_API_TOKEN not configured in server runtime. Price stream remains read-only.");
           logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Live trading is disabled. Price data stream active (read-only).`);
           this.requestHistoryForSymbols();
           Object.keys(INSTRUMENTS).forEach((symbol) => {
@@ -1214,15 +2187,20 @@ class DerivLiveBridge {
       });
 
       this.ws.on("close", () => {
+        boundedPush(websocketEventSamples, { epochMs: Date.now(), event: "close" });
         this.isAuthorized = false;
+        recordDerivInitializationError("Deriv WebSocket closed; authorization state cleared pending reconnect.");
         logs.push(`[DERIV_LIVE] 🔴 Connection closed. Retrying connection in 5 seconds...`);
         this.scheduleReconnect();
       });
 
       this.ws.on("error", (err) => {
+        boundedPush(websocketEventSamples, { epochMs: Date.now(), event: "error" });
+        recordDerivInitializationError(`Deriv WebSocket error: ${err.message}`);
         logs.push(`[DERIV_LIVE] ⚠️ WebSocket error encountered: ${err.message}`);
       });
     } catch (e: any) {
+      recordDerivInitializationError(`Failed to initiate Deriv WebSocket connection: ${e?.message || e}`);
       logs.push(`[DERIV_LIVE] ❌ Failed to initiate WebSocket connection: ${e?.message || e}`);
       this.scheduleReconnect();
     }
@@ -1239,11 +2217,12 @@ class DerivLiveBridge {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     
     if (DERIV_API_TOKEN) {
-      logs.push(`[DERIV_LIVE] 🔑 Sending secure API Token authentication handshake payload...`);
+      logs.push(`[DERIV_LIVE] 🔑 Sending secure API Token authentication handshake payload from ${DERIV_RUNTIME_SOURCE} runtime source...`);
       this.ws.send(JSON.stringify({
         authorize: DERIV_API_TOKEN
       }));
     } else {
+      recordDerivInitializationError("authorizeUser called without DERIV_API_TOKEN in server runtime.");
       logs.push(`[DERIV_LIVE] ❌ DERIV_API_TOKEN not set. Trading is fully disabled until a valid token is provided.`);
     }
   }
@@ -1317,7 +2296,14 @@ class DerivLiveBridge {
         );
         if (pendingIndex !== -1) {
           const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
+          boundedPush(rejectionTimestamps, Date.now());
           logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry.`);
+        }
+        if (msg.msg_type === "authorize" || msg.error?.code === "InvalidToken") {
+          this.isAuthorized = false;
+          recordDerivInitializationError(`Deriv authorization failed: ${msg.error.message || msg.error.code || "unknown_error"}`);
+        } else {
+          recordDerivInitializationError(`Deriv API warning (${msg.msg_type}): ${msg.error.message || msg.error.code || "unknown_error"}`);
         }
         logs.push(`[DERIV_LIVE_ERROR] 🔴 Deriv returned warning: ${msg.error.message} (${msg.msg_type})`);
         return;
@@ -1331,7 +2317,7 @@ class DerivLiveBridge {
         peakBalance = Math.max(peakBalance, balance);
         const accountType = auth.is_virtual ? "DEMO PAPER" : "REAL LIVE";
         
-        logs.push(`[DERIV_LIVE] 🏆 Authentication Succeeded! Account Type: [${accountType}] (${auth.email})`);
+        logs.push(`[DERIV_LIVE] 🏆 Authentication Succeeded! Account Type: [${accountType}] (${auth.email}) | source=${DERIV_RUNTIME_SOURCE}`);
         logs.push(`[DERIV_LIVE] Live account balance updated to: $${balance.toFixed(2)} ${auth.currency || "USD"}`);
 
         // Subscribe to real-time balance updates
@@ -1498,6 +2484,7 @@ class DerivLiveBridge {
         const internalSymbol = this.getInternalSymbolCode(tick.symbol);
         const price = parseFloat(tick.quote);
         const epoch = parseInt(tick.epoch);
+        boundedPush(staleQuoteSamples, Math.floor(Date.now() / 1000) - epoch > 90 ? 1 : 0);
 
         if (internalSymbol && tickBuffers[internalSymbol]) {
           const prices = tickBuffers[internalSymbol];
@@ -1527,6 +2514,8 @@ class DerivLiveBridge {
         );
         if (pendingIndex !== -1) {
           const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
+          boundedPush(proposalLatencySamples, (Date.now() - pending.requestedAt) / 1000);
+          boundedPush(executionMismatchSamples, 0);
           pending.position.id = derivContractId;
           if (!activePositions.some((p) => p.id === derivContractId)) {
             activePositions.push(pending.position);
@@ -1534,6 +2523,7 @@ class DerivLiveBridge {
           logs.push(`[DERIV_LIVE_TRADE] 🔗 Local position ${pending.localId} → Deriv contract #${derivContractId} linked. Live position promoted from pending registry.`);
           this.ws?.send(JSON.stringify({ proposal_open_contract: 1, contract_id: Number(derivContractId), subscribe: 1 }));
         } else {
+          boundedPush(executionMismatchSamples, 1);
           logs.push(`[DERIV_LIVE_TRADE] ⚠️ Buy confirmation for Deriv contract #${derivContractId} arrived with no pending local registry match. Awaiting proposal_open_contract sync.`);
         }
       }
@@ -1593,16 +2583,18 @@ class DerivLiveBridge {
   }
 
   // Sends the real order contract proposal directly to your Live / Demo account!
-  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number, requestId?: number, localId?: string) {
+  public placeRealContractProposal(symbol: string, direction: "LONG" | "SHORT", stake: number, multiplier?: number, stopLossAmount?: number, takeProfitAmount?: number, requestId?: number, localId?: string, orderEconomics?: OrderEconomics) {
     if (!this.isAuthorized || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return false;
     }
 
+    if (!orderEconomics?.approved) {
+      logs.push(`[ORDER_PREFLIGHT_BLOCKED] Refusing live Deriv dispatch for ${symbol}: final order economics preflight was not approved (${orderEconomics?.rejectionReasons?.join(",") || "missing_preflight"}).`);
+      return false;
+    }
     const derivSymbol = this.getDerivSymbolCode(symbol);
     const effMode = getEffectiveTradeType();
-    const supportedMultipliers = DERIV_SUPPORTED_MULTIPLIERS;
-    const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200;
-    const finalMultiplier = multiplier && supportedMultipliers.includes(multiplier) ? multiplier : fallbackMultiplier;
+    const finalMultiplier = orderEconomics.effectiveMultiplier;
     if (effMode === "HYBRID_LINEAR" && multiplier === undefined) {
       logs.push(`[DERIV_LIVE_TRADE] ℹ️ HYBRID_LINEAR signal routed through supported Deriv multiplier contract x${finalMultiplier}.`);
     }
@@ -1632,6 +2624,7 @@ class DerivLiveBridge {
     }
 
     this.ws.send(JSON.stringify(proposal));
+    emitRiskTelemetry("execution_forensics", "proposal_submitted", { symbol, direction, stake, requestId, localId, multiplier: finalMultiplier, maxLoss: orderEconomics.maxLossAmount });
     logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
     return true;
   }
@@ -2452,6 +3445,18 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     adxVal, atrVal, isDivergent, isReversalCandle, regimeState, sub.hurstVal || 0.5, conviction, sub.lastPersistenceProbability ?? 0.5
   );
   sub.lastSignalProbability = signalProfile;
+  const executionState = computeExecutionStateModel(symbol);
+  const transitionState = computeRegimeTransitionState(symbol);
+  const pathRisk = computePathDependentRiskState();
+  const confidenceCalibration = computeConfidenceCalibration();
+  const probabilityCalibration = computeProbabilityCalibration();
+  const epistemicState = computeEpistemicUncertaintyState();
+  adaptiveIntelligenceState.executionState = executionState;
+  adaptiveIntelligenceState.transition = transitionState;
+  adaptiveIntelligenceState.pathRisk = pathRisk;
+  adaptiveIntelligenceState.confidenceCalibration = confidenceCalibration;
+  adaptiveIntelligenceState.probabilityCalibration = probabilityCalibration;
+  adaptiveIntelligenceState.epistemic = epistemicState;
 
   const prior = INSTRUMENT_PRIORS[symbol] || { confidence: 0.5, expectedEdge: 0.45, sharpe: 0.5 };
   const recentWeight = Math.min(1, (sub.totalTrades || 0) / 40);
@@ -2472,8 +3477,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     regimeStability: parseFloat((uncertaintyState.regimeStability * 0.6 + instantUncertainty.regimeStability * 0.4).toFixed(4)),
   };
 
-  const uncertaintyAdjustedEdge = parseFloat((blendedEdge * blendedConfidence * uncertaintyState.regimeStability).toFixed(4));
-  const executionAdjustedEdge = parseFloat((uncertaintyAdjustedEdge * signalProfile.executionQuality).toFixed(4));
+  const uncertaintyAdjustedEdge = parseFloat((blendedEdge * blendedConfidence * uncertaintyState.regimeStability * epistemicState.uncertaintyAdjustedRisk).toFixed(4));
+  const executionAdjustedEdge = parseFloat((uncertaintyAdjustedEdge * Math.min(signalProfile.executionQuality, executionState.executionRiskMultiplier)).toFixed(4));
 
   const isTrendRegime = regimeState.trendProbability > 0.40;
   const isMRRegime = regimeState.meanReversionProbability > 0.40;
@@ -2482,7 +3487,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (isTransition) transitionPenalty = 0.30 + (regimeState.transitionProbability - 0.35) * 0.45;
   else if (isTrendRegime && executionAdjustedEdge < 0.35) transitionPenalty = 0.18;
   else if (isMRRegime && sub.hurstVal && sub.hurstVal > 0.60) transitionPenalty = 0.16;
-  transitionPenalty = Math.min(0.45, Math.max(0, transitionPenalty));
+  transitionPenalty += transitionState.instabilityScore * 0.28 + transitionState.confidenceDecay * 0.20;
+  transitionPenalty = Math.min(0.70, Math.max(0, transitionPenalty));
 
   let correlationPenalty = 0;
   const sameDirection = activePositions.filter(p => p.direction === direction).length;
@@ -2510,7 +3516,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   let executionPenalty = 0;
   if (portfolioRisk.drawdownSeverity > 0.02) executionPenalty = 0.10 + portfolioRisk.drawdownSeverity * 1.8;
   if (signalProfile.executionQuality < 0.55) executionPenalty += (0.55 - signalProfile.executionQuality) * 0.6;
-  executionPenalty = Math.min(0.40, executionPenalty);
+  executionPenalty += executionState.degradationProbability * 0.45 + Math.max(0, 0.70 - executionState.executionReliability) * 0.35;
+  executionPenalty = Math.min(0.65, executionPenalty);
 
   const candidateHeat = computePortfolioHeatSnapshot({ symbol, stake, direction });
   const heatPenalty = Math.max(0, candidateHeat.totalHeat - equityCurveThrottle.portfolioHeatCap);
@@ -2521,14 +3528,17 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     : Math.min(0.30, adaptiveIntelligenceState.policy.uncertaintyPenalty + (symbolAnomaly?.recommendedRiskReduction ?? 0) * 0.35);
 
   const baseConfidence = Math.min(1, blendedConfidence * (0.7 + 0.3 * executionAdjustedEdge));
-  const totalPenalty = Math.min(0.85, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty);
-  const finalConfidence = parseFloat(Math.max(0.05, baseConfidence * (1 - totalPenalty)).toFixed(4));
+  const calibrationPenalty = confidenceCalibration.overconfidenceProbability * 0.22 + Math.max(0, 1 - probabilityCalibration.reliabilityScore) * 0.18;
+  const epistemicPenalty = epistemicState.uncertaintyScore * 0.22;
+  const pathPenalty = pathRisk.confidenceErosion * 0.25;
+  const totalPenalty = Math.min(0.92, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty + calibrationPenalty + epistemicPenalty + pathPenalty);
+  const finalConfidence = parseFloat(Math.max(0.03, baseConfidence * (1 - totalPenalty)).toFixed(4));
 
   let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
   if (finalConfidence >= Math.max(0.6, equityCurveThrottle.confidenceThreshold + 0.15) && executionAdjustedEdge >= 0.45) confidenceTier = ConfidenceTier.HIGH;
   else if (finalConfidence >= Math.max(0.48, equityCurveThrottle.confidenceThreshold + 0.05)) confidenceTier = ConfidenceTier.MEDIUM;
   else if (finalConfidence >= equityCurveThrottle.confidenceThreshold) confidenceTier = ConfidenceTier.LOW;
-  if (signalProfile.uncertainty > 0.85 || transitionPenalty > 0.45 || heatPenalty > 0.35) confidenceTier = ConfidenceTier.REJECT;
+  if (signalProfile.uncertainty > 0.85 || transitionPenalty > 0.45 || heatPenalty > 0.35 || executionState.executionReliability < 0.30 || epistemicState.uncertaintyScore > 0.82 || adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) confidenceTier = ConfidenceTier.REJECT;
 
   const rejectionReasons: string[] = [];
   if (confidenceTier === ConfidenceTier.REJECT) {
@@ -2539,6 +3549,9 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     if (volatilityPenalty > 0.35) rejectionReasons.push("volatility_cluster");
     if (executionPenalty > 0.3) rejectionReasons.push("execution_drawdown");
     if (heatPenalty > 0.25) rejectionReasons.push("portfolio_heat");
+    if (executionState.executionReliability < 0.30) rejectionReasons.push("execution_reliability_collapse");
+    if (epistemicState.uncertaintyScore > 0.82) rejectionReasons.push("epistemic_uncertainty_extreme");
+    if (adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) rejectionReasons.push(`autonomous_state_${adaptiveIntelligenceState.autonomousState}`);
   }
 
   const tierScale = confidenceTier === ConfidenceTier.HIGH ? 1
@@ -2549,6 +3562,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   let adjustedRisk = stake * equityCurveThrottle.tradeAggressiveness * finalConfidence * tierScale;
   adjustedRisk *= candidateHeat.adjustedLeverageScale;
   adjustedRisk *= equityCurveThrottle.leverageScale;
+  adjustedRisk *= executionState.executionRiskMultiplier * transitionState.adaptiveRiskMultiplier * pathRisk.adaptiveDefensiveScale * epistemicState.uncertaintyAdjustedRisk * Math.max(0.20, probabilityCalibration.reliabilityScore);
+  adjustedRisk *= (adaptiveIntelligenceState.selfHealingRisk?.adaptiveRiskScale ?? 1) * Math.max(0.10, adaptiveIntelligenceState.adaptiveLayerValidation?.validatedInfluenceScale ?? 1) * autonomousStateRiskScale(adaptiveIntelligenceState.autonomousState ?? AutonomousState.NORMAL);
   if (heatPenalty > 0) {
     adjustedRisk *= Math.max(0.25, 1 - heatPenalty * 1.6);
   }
@@ -2564,10 +3579,25 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     (executionAdjustedEdge - 0.45) * 1.6 - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65 - adaptiveDefensivePenalty * 0.5
   )).toFixed(4));
 
-  const approved = confidenceTier !== ConfidenceTier.REJECT && adjustedRisk > 0;
-  const riskFloorBase = confidenceTier === ConfidenceTier.HIGH ? 0.35 : confidenceTier === ConfidenceTier.MEDIUM ? 0.20 : confidenceTier === ConfidenceTier.LOW ? 0.08 : 0;
-  const riskFloor = parseFloat((riskFloorBase * equityCurveThrottle.tradeAggressiveness).toFixed(2));
-  const finalRisk = approved ? Math.max(riskFloor, adjustedRisk) : 0;
+  const riskBudgets = computeRiskBudget(symbol, finalConfidence);
+  const governorAllocatedRisk = adjustedRisk;
+  const accountRiskBudget = riskBudgets.accountRiskBudget;
+  const symbolRiskBudget = riskBudgets.symbolRiskBudget;
+  const portfolioRemainingRisk = riskBudgets.portfolioRemainingRisk;
+  const executionAdjustedRisk = parseFloat((governorAllocatedRisk * riskBudgets.executionHealthScale).toFixed(2));
+  const finalRisk = confidenceTier !== ConfidenceTier.REJECT ? parseFloat(Math.max(0, Math.min(
+    governorAllocatedRisk,
+    accountRiskBudget,
+    symbolRiskBudget,
+    portfolioRemainingRisk,
+    executionAdjustedRisk,
+    riskBudgets.riskBudget
+  )).toFixed(2)) : 0;
+  assertFinalRiskAuthority(finalRisk, governorAllocatedRisk, `governor:${symbol}`);
+  const approved = confidenceTier !== ConfidenceTier.REJECT && finalRisk > 0;
+  if (confidenceTier !== ConfidenceTier.REJECT && finalRisk <= 0) {
+    rejectionReasons.push("risk_budget_exhausted");
+  }
 
   if (signalProfile.expectedEdge >= 0.45 && blendedConfidence >= equityCurveThrottle.confidenceThreshold) {
     opportunityDensityMetrics.totalHighQualityOpportunities += 1;
@@ -2813,38 +3843,98 @@ function computeMonteCarloEvolutionState() {
   }
   const trades = completedTrades.slice(-300);
   const portfolioRisk = computePortfolioRiskState();
-  if (trades.length < 30) {
-    return { scenarios: 0, survivabilityProbability: 1, worstCaseDrawdown: 0, correlatedLossRisk: portfolioRisk.totalExposure, executionDegradationRisk: adaptiveIntelligenceState.execution.degradationProbability, lastRunEpoch: nowEpoch };
-  }
+  const emptyResult = {
+    scenarios: 0,
+    survivabilityProbability: 1,
+    worstCaseDrawdown: 0,
+    correlatedLossRisk: portfolioRisk.totalExposure,
+    executionDegradationRisk: adaptiveIntelligenceState.executionState?.degradationProbability ?? adaptiveIntelligenceState.execution.degradationProbability,
+    expectedTerminalDrawdown: 0,
+    recoveryDuration: 0,
+    ruinProbability: 0,
+    capitalExhaustionProbability: 0,
+    longHorizonSharpeP05: 0,
+    longHorizonSharpeP50: 0,
+    longHorizonSharpeP95: 0,
+    lastRunEpoch: nowEpoch,
+  };
+  if (trades.length < 30) return emptyResult;
+
   const pnls = trades.map(t => t.pnl);
-  const pnlStd = stddev(pnls) || 1;
-  const avgLoss = Math.abs(mean(pnls.filter(p => p < 0))) || pnlStd;
-  const scenarios = 250;
+  const losses = pnls.filter(p => p < 0).map(Math.abs);
+  const avgLoss = mean(losses) || stddev(pnls) || 1;
+  const lossQ90 = quantile(losses, 0.90) || avgLoss;
+  const orderedPnls = [...pnls].sort((a, b) => a - b);
+  const scenarios = 125;
+  const horizon = 60;
+  const terminalDrawdowns: number[] = [];
+  const sharpes: number[] = [];
   let survivals = 0;
-  let worstDrawdown = 0;
+  let worstCaseDrawdown = 0;
+  let ruinHits = 0;
+  let exhaustionHits = 0;
   let correlatedLossHits = 0;
-  for (let i = 0; i < scenarios; i++) {
-    let equity = balance || 10000;
+  let recoveryDurationTotal = 0;
+  const executionStress = adaptiveIntelligenceState.executionState?.degradationProbability ?? adaptiveIntelligenceState.execution.degradationProbability;
+  const transitionStress = adaptiveIntelligenceState.transition?.instabilityScore ?? portfolioRisk.entropyLevel;
+  const decayStress = Math.max(0, ...Object.values(adaptiveIntelligenceState.strategyDecay || {}).map(d => d.structuralBreakProbability));
+  const correlationStress = adaptiveIntelligenceState.dynamicCorrelation?.portfolioFragility ?? portfolioRisk.volatilityCluster;
+
+  for (let scenario = 0; scenario < scenarios; scenario++) {
+    let equity = Math.max(1, balance);
     let peak = equity;
-    let dd = 0;
-    for (let j = 0; j < 40; j++) {
-      const sample = pnls[Math.floor(Math.random() * pnls.length)] || 0;
-      const shock = Math.random() < 0.08 ? -avgLoss * (1.5 + Math.random() * 2.5) : 0;
-      const corrShock = Math.random() < portfolioRisk.volatilityCluster * 0.08 ? -avgLoss * 1.8 : 0;
-      if (corrShock < 0) correlatedLossHits++;
-      equity += sample + shock + corrShock;
+    let maxDd = 0;
+    let underwater = 0;
+    let longestUnderwater = 0;
+    const scenarioPnls: number[] = [];
+    const stressRank = scenario / Math.max(1, scenarios - 1);
+    for (let step = 0; step < horizon; step++) {
+      const baseIndex = (scenario * 17 + step * 31) % orderedPnls.length;
+      let sampledPnl = orderedPnls[baseIndex];
+      const clusterPhase = ((scenario + step) % 11) / 10;
+      if (clusterPhase < portfolioRisk.volatilityCluster || stressRank > 0.72) {
+        sampledPnl = Math.min(sampledPnl, -lossQ90);
+      }
+      const shockStack =
+        (correlationStress > 0.35 && (step + scenario) % 13 === 0 ? lossQ90 * (1 + correlationStress) : 0) +
+        (executionStress > 0.35 && (step * 3 + scenario) % 17 === 0 ? avgLoss * (1 + executionStress) : 0) +
+        (transitionStress > 0.35 && (step * 5 + scenario) % 19 === 0 ? avgLoss * (1 + transitionStress) : 0) +
+        (decayStress > 0.35 && step > horizon / 2 ? avgLoss * decayStress * 0.35 : 0);
+      if (shockStack > 0) correlatedLossHits++;
+      const pathPnl = sampledPnl - shockStack;
+      scenarioPnls.push(pathPnl);
+      equity += pathPnl;
       peak = Math.max(peak, equity);
-      dd = Math.max(dd, (peak - equity) / Math.max(peak, 1));
+      const dd = (peak - equity) / Math.max(peak, 1);
+      maxDd = Math.max(maxDd, dd);
+      if (dd > 0.01) {
+        underwater++;
+        longestUnderwater = Math.max(longestUnderwater, underwater);
+      } else {
+        underwater = 0;
+      }
+      if (equity <= balance * 0.65) ruinHits++;
+      if (equity <= balance * 0.25) exhaustionHits++;
     }
-    worstDrawdown = Math.max(worstDrawdown, dd);
-    if (dd < 0.12) survivals++;
+    terminalDrawdowns.push(maxDd);
+    worstCaseDrawdown = Math.max(worstCaseDrawdown, maxDd);
+    if (maxDd < 0.18 && equity > balance * 0.75) survivals++;
+    recoveryDurationTotal += longestUnderwater;
+    sharpes.push(mean(scenarioPnls) / (stddev(scenarioPnls) || 1));
   }
   return {
     scenarios,
     survivabilityProbability: parseFloat((survivals / scenarios).toFixed(4)),
-    worstCaseDrawdown: parseFloat(worstDrawdown.toFixed(4)),
-    correlatedLossRisk: parseFloat(clamp01(correlatedLossHits / (scenarios * 40)).toFixed(4)),
-    executionDegradationRisk: adaptiveIntelligenceState.execution.degradationProbability,
+    worstCaseDrawdown: parseFloat(worstCaseDrawdown.toFixed(4)),
+    correlatedLossRisk: parseFloat(clamp01(correlatedLossHits / (scenarios * horizon)).toFixed(4)),
+    executionDegradationRisk: parseFloat(executionStress.toFixed(4)),
+    expectedTerminalDrawdown: parseFloat(mean(terminalDrawdowns).toFixed(4)),
+    recoveryDuration: parseFloat((recoveryDurationTotal / scenarios).toFixed(2)),
+    ruinProbability: parseFloat(clamp01(ruinHits / (scenarios * horizon)).toFixed(4)),
+    capitalExhaustionProbability: parseFloat(clamp01(exhaustionHits / (scenarios * horizon)).toFixed(4)),
+    longHorizonSharpeP05: parseFloat(quantile(sharpes, 0.05).toFixed(4)),
+    longHorizonSharpeP50: parseFloat(quantile(sharpes, 0.50).toFixed(4)),
+    longHorizonSharpeP95: parseFloat(quantile(sharpes, 0.95).toFixed(4)),
     lastRunEpoch: nowEpoch,
   };
 }
@@ -2854,6 +3944,15 @@ function updateAdaptiveIntelligence(reason = "scheduled_shadow_update") {
   const totalTrades = completedTrades.length;
   const portfolioRisk = computePortfolioRiskState();
   adaptiveIntelligenceState.execution = computeExecutionHealthScore();
+  adaptiveIntelligenceState.executionState = computeExecutionStateModel();
+  adaptiveIntelligenceState.transition = computeRegimeTransitionState();
+  adaptiveIntelligenceState.pathRisk = computePathDependentRiskState();
+  adaptiveIntelligenceState.confidenceCalibration = computeConfidenceCalibration();
+  adaptiveIntelligenceState.probabilityCalibration = computeProbabilityCalibration();
+  adaptiveIntelligenceState.empiricalCalibration = computeEmpiricalCalibrationState();
+  adaptiveIntelligenceState.probabilityCalibrationV2 = computeProbabilityCalibrationV2();
+  adaptiveIntelligenceState.executionForensics = computeExecutionForensics();
+  adaptiveIntelligenceState.epistemic = computeEpistemicUncertaintyState();
   const strategyWeights: Record<string, number> = {};
   const regimePerformance: Record<string, number> = {};
   let weightedSharpe = 0;
@@ -2873,18 +3972,33 @@ function updateAdaptiveIntelligence(reason = "scheduled_shadow_update") {
     }
     adaptiveIntelligenceState.regimeEvolution[symbol] = computeRegimeEvolution(symbol);
     adaptiveIntelligenceState.anomaly[symbol] = computeAnomalyState(symbol, adaptiveIntelligenceState.regimeEvolution[symbol]);
+    adaptiveIntelligenceState.strategyDecay[symbol] = computeStrategyDecayState(symbol);
+    adaptiveIntelligenceState.strategyDrift[symbol] = computeStrategyDriftState(symbol);
+    const decayScale = Math.min(adaptiveIntelligenceState.strategyDecay[symbol].edgePersistenceProbability, adaptiveIntelligenceState.strategyDrift[symbol].adaptiveWeightScale);
+    strategyWeights[symbol] = parseFloat((strategyWeights[symbol] * Math.max(0.10, decayScale)).toFixed(4));
     weightedSharpe += strategyWeights[symbol] * conservativeSharpe;
     confidenceMass += sampleConfidence;
   }
   const weightSum = Object.values(strategyWeights).reduce((sum, value) => sum + value, 0) || 1;
   Object.keys(strategyWeights).forEach(symbol => { strategyWeights[symbol] = parseFloat((strategyWeights[symbol] / weightSum).toFixed(4)); });
+  adaptiveIntelligenceState.dynamicCorrelation = computeDynamicCorrelationModel();
+  adaptiveIntelligenceState.survivalEquity = computeSurvivalEquityCurveState();
+  adaptiveIntelligenceState.monteCarlo = computeMonteCarloEvolutionState();
+  adaptiveIntelligenceState.portfolioBrain = computeAutonomousPortfolioState(portfolioRisk);
+  adaptiveIntelligenceState.longHorizonPortfolio = computeLongHorizonPortfolioState(adaptiveIntelligenceState.portfolioBrain);
+  adaptiveIntelligenceState.capitalPreservation = computeCapitalPreservationState();
+  adaptiveIntelligenceState.adaptiveLayerValidation = computeAdaptiveLayerValidationState();
+  adaptiveIntelligenceState.selfHealingRisk = computeSelfHealingRiskState();
+  adaptiveIntelligenceState.autonomousState = computeAutonomousState();
+  adaptiveIntelligenceState.deploymentReadiness = computeDeploymentReadiness();
   const maxAnomaly = Math.max(0, ...Object.values(adaptiveIntelligenceState.anomaly).map(a => a.anomalyProbability));
+  const maxDecay = Math.max(0, ...Object.values(adaptiveIntelligenceState.strategyDecay).map(d => d.structuralBreakProbability));
   const adaptationConfidence = parseFloat(clamp01(confidenceMass / symbols.length).toFixed(4));
   adaptiveIntelligenceState.metaLearning = {
     strategyWeights,
     regimePerformance,
-    executionHealthScore: parseFloat((1 - adaptiveIntelligenceState.execution.degradationProbability).toFixed(4)),
-    uncertaintyScore: parseFloat(clamp01(uncertaintyState.epistemicUncertainty * 0.35 + uncertaintyState.marketUncertainty * 0.45 + maxAnomaly * 0.20).toFixed(4)),
+    executionHealthScore: parseFloat(adaptiveIntelligenceState.executionState.executionReliability.toFixed(4)),
+    uncertaintyScore: parseFloat(clamp01(uncertaintyState.epistemicUncertainty * 0.25 + uncertaintyState.marketUncertainty * 0.30 + adaptiveIntelligenceState.epistemic.uncertaintyScore * 0.25 + maxAnomaly * 0.12 + maxDecay * 0.08).toFixed(4)),
     adaptationConfidence,
     sampleSize: totalTrades,
     lastUpdatedEpoch: Math.floor(Date.now() / 1000),
@@ -2899,12 +4013,24 @@ function updateAdaptiveIntelligence(reason = "scheduled_shadow_update") {
     expectedPortfolioSharpeImpact: parseFloat(weightedSharpe.toFixed(4)),
   };
   const policyConfidence = clamp01((totalTrades - PHASE3_MIN_POLICY_SAMPLE) / 250);
-  const defensiveRiskCut = Math.max(maxAnomaly * 0.45, adaptiveIntelligenceState.execution.degradationProbability * 0.35, portfolioRisk.entropyLevel * 0.25);
+  const defensiveRiskCut = Math.max(
+    maxAnomaly * 0.45,
+    adaptiveIntelligenceState.executionState.degradationProbability * 0.45,
+    portfolioRisk.entropyLevel * 0.25,
+    adaptiveIntelligenceState.transition.instabilityScore * 0.35,
+    adaptiveIntelligenceState.pathRisk.confidenceErosion * 0.35,
+    adaptiveIntelligenceState.confidenceCalibration.overconfidenceProbability * 0.30,
+    adaptiveIntelligenceState.dynamicCorrelation.portfolioFragility * 0.30,
+    maxDecay * 0.30,
+    adaptiveIntelligenceState.survivalEquity.survivalModeProbability * 0.50,
+    adaptiveIntelligenceState.selfHealingRisk.degradationSeverity * 0.45,
+    (1 - adaptiveIntelligenceState.adaptiveLayerValidation.validatedInfluenceScale) * 0.25
+  );
   adaptiveIntelligenceState.policy = {
-    riskMultiplier: parseFloat((policyConfidence > 0 ? Math.max(0.55, 1 - defensiveRiskCut) : 1).toFixed(4)),
-    exitAdjustment: parseFloat(Math.max(0.75, 1 - maxAnomaly * 0.25).toFixed(4)),
-    tradeFrequencyAdjustment: parseFloat(Math.max(0.45, 1 - maxAnomaly * 0.50 - adaptiveIntelligenceState.execution.degradationProbability * 0.35).toFixed(4)),
-    confidenceAdjustment: parseFloat((maxAnomaly * 0.12 + uncertaintyState.marketUncertainty * 0.08).toFixed(4)),
+    riskMultiplier: parseFloat((policyConfidence > 0 ? Math.max(0.20, 1 - defensiveRiskCut) : Math.min(1, adaptiveIntelligenceState.executionState.executionRiskMultiplier)).toFixed(4)),
+    exitAdjustment: parseFloat(Math.max(0.55, 1 - maxAnomaly * 0.25 - adaptiveIntelligenceState.transition.instabilityScore * 0.20).toFixed(4)),
+    tradeFrequencyAdjustment: parseFloat(Math.max(0.25, 1 - maxAnomaly * 0.50 - adaptiveIntelligenceState.executionState.degradationProbability * 0.45 - adaptiveIntelligenceState.pathRisk.confidenceErosion * 0.35).toFixed(4)),
+    confidenceAdjustment: parseFloat((maxAnomaly * 0.12 + uncertaintyState.marketUncertainty * 0.08 + adaptiveIntelligenceState.confidenceCalibration.overconfidenceProbability * 0.10 + adaptiveIntelligenceState.transition.confidenceDecay * 0.10).toFixed(4)),
     uncertaintyPenalty: parseFloat((adaptiveIntelligenceState.metaLearning.uncertaintyScore * 0.25).toFixed(4)),
     sampleSize: totalTrades,
     policyConfidence: parseFloat(policyConfidence.toFixed(4)),
@@ -2916,8 +4042,19 @@ function updateAdaptiveIntelligence(reason = "scheduled_shadow_update") {
     distributionConfidence: parseFloat(clamp01(1 - mean(Object.values(adaptiveIntelligenceState.anomaly).map(a => a.anomalyProbability))).toFixed(4)),
     modelStability: parseFloat(clamp01(1 - adaptiveIntelligenceState.metaLearning.uncertaintyScore).toFixed(4)),
   };
-  adaptiveIntelligenceState.monteCarlo = computeMonteCarloEvolutionState();
-  adaptiveIntelligenceState.lastShadowComparison = `Mode=${adaptiveIntelligenceState.mode}; policyRisk=${adaptiveIntelligenceState.policy.riskMultiplier.toFixed(2)}; maxAnomaly=${maxAnomaly.toFixed(2)}; survivability=${adaptiveIntelligenceState.monteCarlo.survivabilityProbability.toFixed(2)}.`;
+  adaptiveIntelligenceState.portfolioBrain = computeAutonomousPortfolioState(portfolioRisk);
+  adaptiveIntelligenceState.longHorizonPortfolio = computeLongHorizonPortfolioState(adaptiveIntelligenceState.portfolioBrain);
+  adaptiveIntelligenceState.deploymentReadiness = computeDeploymentReadiness();
+  adaptiveIntelligenceState.lastShadowComparison = `State=${adaptiveIntelligenceState.autonomousState}; Mode=${adaptiveIntelligenceState.mode}; policyRisk=${adaptiveIntelligenceState.policy.riskMultiplier.toFixed(2)}; maxAnomaly=${maxAnomaly.toFixed(2)}; decay=${maxDecay.toFixed(2)}; validation=${adaptiveIntelligenceState.adaptiveLayerValidation.validatedInfluenceScale.toFixed(2)}; executionIntegrity=${adaptiveIntelligenceState.executionForensics.executionIntegrityScore.toFixed(2)}; survivability=${adaptiveIntelligenceState.monteCarlo.survivabilityProbability.toFixed(2)}.`;
+  if (defensiveRiskCut > 0.45 || adaptiveIntelligenceState.survivalEquity.survivalModeProbability > 0.35) {
+    emitRiskTelemetry("adaptive_portfolio", "defensive_posture", {
+      defensiveRiskCut: parseFloat(defensiveRiskCut.toFixed(4)),
+      executionReliability: adaptiveIntelligenceState.executionState.executionReliability,
+      transitionInstability: adaptiveIntelligenceState.transition.instabilityScore,
+      pathConfidenceErosion: adaptiveIntelligenceState.pathRisk.confidenceErosion,
+      survivability: adaptiveIntelligenceState.monteCarlo.survivabilityProbability,
+    });
+  }
 }
 
 function computeAdaptiveExitParams(regimeState: RegimeState, hurstVal: number): { stopMultiplier: number; tpMultiplier: number; maxTicks: number; useTrailing: boolean } {
@@ -3304,6 +4441,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
     }
 
+    if (tickEffMode === "MULTIPLIER") {
+      const cappedMultiplier = deriveEffectiveDerivMultiplier(chosenMultiplier);
+      if (cappedMultiplier < chosenMultiplier) {
+        logs.push(`[LEVERAGE_CAP] ${symbol} multiplier reduced from x${chosenMultiplier} to x${cappedMultiplier} by account risk mode ceiling.`);
+        chosenMultiplier = cappedMultiplier;
+      }
+    }
+
     const stopLoss = direction === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance);
     const takeProfit = direction === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance);
 
@@ -3346,23 +4491,55 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
+    const effectiveMultiplier = deriveEffectiveDerivMultiplier(position.multiplier);
+    const budgets = computeRiskBudget(symbol, auditRes.finalConfidence);
+    const orderEconomics = preflightOrderEconomics({
+      symbol,
+      direction,
+      stake,
+      effectiveMultiplier,
+      stopLossDistance,
+      takeProfitDistance,
+      entryPrice: currentPrice,
+      governorAllocatedRisk: auditRes.allocatedRisk,
+      accountRiskBudget: budgets.accountRiskBudget,
+      symbolRiskBudget: budgets.symbolRiskBudget,
+      portfolioRemainingRisk: budgets.portfolioRemainingRisk,
+      executionAdjustedRisk: parseFloat((auditRes.allocatedRisk * budgets.executionHealthScale).toFixed(2)),
+    });
+    if (!orderEconomics.approved) {
+      logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${direction} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
+      return;
+    }
+    stake = orderEconomics.stake;
+    position.stake = stake;
+    if (position.multiplier !== undefined) position.multiplier = orderEconomics.effectiveMultiplier;
+    if (position.isHybridLinear) {
+      position.targetRiskAmount = orderEconomics.maxLossAmount;
+      position.hybridPositionSize = orderEconomics.maxLossAmount / Math.max(1e-9, stopLossDistance);
+    }
+    if (SHADOW_LIVE_VALIDATION) {
+      emitRiskTelemetry("shadow_live_validation", "order_suppressed", { symbol, direction, stake, maxLossAmount: orderEconomics.maxLossAmount, targetRewardAmount: orderEconomics.targetRewardAmount, governorRisk: auditRes.allocatedRisk });
+      logs.push(`[SHADOW_LIVE_VALIDATION] ${symbol} ${direction} passed real governor/preflight logic but live dispatch is suppressed while shadow validation is active.`);
+      return;
+    }
     // Live authorization and successful order dispatch are both required to track this position
     if (!liveBridgeInstance.getIsAuthorized()) {
       logs.push(`[ORDER_BLOCKED] Live authorization required. Trade rejected — set DERIV_API_TOKEN to enable live trading.`);
       return;
     }
-    // Compute server-side SL/TP dollar amounts for Deriv limit orders
-    const slAmount = parseFloat(Math.min(
-      (stopLossDistance / currentPrice) * stake * (position.multiplier || 40),
-      stake  // can never lose more than the stake
-    ).toFixed(3));
-    const tpAmount = parseFloat(
-      ((takeProfitDistance / currentPrice) * stake * (position.multiplier || 40)).toFixed(3)
-    );
+    // Compute server-side SL/TP dollar amounts for Deriv limit orders from the approved canonical economics
+    const slAmount = parseFloat(orderEconomics.maxLossAmount.toFixed(3));
+    const tpAmount = parseFloat(orderEconomics.targetRewardAmount.toFixed(3));
     // Register in pending queue BEFORE dispatch so the buy confirmation can link the contract_id
+    if (hasRecentPendingDuplicate(symbol, direction)) {
+      emitRiskTelemetry("operational_resilience", "duplicate_order_suppressed", { symbol, direction, localId: positionId });
+      logs.push(`[ORDER_DUPLICATE_SUPPRESSED] ${symbol} ${direction} has a recent pending order; suppressing duplicate live exposure request.`);
+      return;
+    }
     const requestId = nextDerivRequestId++;
     pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction, position, requestedAt: Date.now() });
-    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount, requestId, positionId);
+    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
       const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
@@ -3526,6 +4703,14 @@ function executeProposal(
     }
   }
 
+  if (effMode === "MULTIPLIER") {
+    const cappedMultiplier = deriveEffectiveDerivMultiplier(chosenMultiplier);
+    if (cappedMultiplier < chosenMultiplier) {
+      logs.push(`[LEVERAGE_CAP] ${symbol} manual multiplier reduced from x${chosenMultiplier} to x${cappedMultiplier} by account risk mode ceiling.`);
+      chosenMultiplier = cappedMultiplier;
+    }
+  }
+
   const stopLoss = direction === "LONG" ? (entryPrice - stopLossDistance) : (entryPrice + stopLossDistance);
   const takeProfit = direction === "LONG" ? (entryPrice + takeProfitDistance) : (entryPrice - takeProfitDistance);
 
@@ -3561,23 +4746,56 @@ function executeProposal(
     hybridPositionSize: effMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
   };
 
+  const effectiveMultiplier = deriveEffectiveDerivMultiplier(position.multiplier);
+  const budgets = computeRiskBudget(symbol, 0.5);
+  const manualGovernorRisk = Math.min(stake, budgets.riskBudget, budgets.accountRiskBudget, budgets.symbolRiskBudget);
+  const orderEconomics = preflightOrderEconomics({
+    symbol,
+    direction,
+    stake,
+    effectiveMultiplier,
+    stopLossDistance,
+    takeProfitDistance,
+    entryPrice,
+    governorAllocatedRisk: manualGovernorRisk,
+    accountRiskBudget: budgets.accountRiskBudget,
+    symbolRiskBudget: budgets.symbolRiskBudget,
+    portfolioRemainingRisk: budgets.portfolioRemainingRisk,
+    executionAdjustedRisk: parseFloat((manualGovernorRisk * budgets.executionHealthScale).toFixed(2)),
+  });
+  if (!orderEconomics.approved) {
+    logs.push(`[ORDER_PREFLIGHT_REJECT] Manual ${symbol} ${direction} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)}.`);
+    return;
+  }
+  stake = orderEconomics.stake;
+  position.stake = stake;
+  if (position.multiplier !== undefined) position.multiplier = orderEconomics.effectiveMultiplier;
+  if (position.isHybridLinear) {
+    position.targetRiskAmount = orderEconomics.maxLossAmount;
+    position.hybridPositionSize = orderEconomics.maxLossAmount / Math.max(1e-9, stopLossDistance);
+  }
+  if (SHADOW_LIVE_VALIDATION) {
+    emitRiskTelemetry("shadow_live_validation", "manual_order_suppressed", { symbol, direction, stake, maxLossAmount: orderEconomics.maxLossAmount, targetRewardAmount: orderEconomics.targetRewardAmount });
+    logs.push(`[SHADOW_LIVE_VALIDATION] Manual ${symbol} ${direction} passed real preflight logic but live dispatch is suppressed while shadow validation is active.`);
+    return;
+  }
   // Live authorization and successful order dispatch are both required to track this position
   if (!liveBridgeInstance.getIsAuthorized()) {
     logs.push(`[ORDER_BLOCKED] Live authorization required. Manual trade rejected — set DERIV_API_TOKEN.`);
     return;
   }
   // Compute server-side SL/TP dollar amounts for Deriv limit orders (same as automated engine)
-  const manualSlAmount = parseFloat(Math.min(
-    (stopLossDistance / entryPrice) * stake * (position.multiplier || 40),
-    stake
-  ).toFixed(3));
-  const manualTpAmount = parseFloat(
-    ((takeProfitDistance / entryPrice) * stake * (position.multiplier || 40)).toFixed(3)
-  );
+  const manualSlAmount = parseFloat(orderEconomics.maxLossAmount.toFixed(3));
+  const manualTpAmount = parseFloat(orderEconomics.targetRewardAmount.toFixed(3));
   // Register in pending queue BEFORE dispatch so buy confirmation can link the contract_id
+  if (hasRecentPendingDuplicate(symbol, direction)) {
+    emitRiskTelemetry("operational_resilience", "manual_duplicate_order_suppressed", { symbol, direction, localId: id });
+    logs.push(`[ORDER_DUPLICATE_SUPPRESSED] Manual ${symbol} ${direction} has a recent pending order; suppressing duplicate live exposure request.`);
+    return;
+  }
   const requestId = nextDerivRequestId++;
   pendingOrderQueue.push({ requestId, localId: id, symbol, direction, position, requestedAt: Date.now() });
-  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount, requestId, id);
+  const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount, requestId, id, orderEconomics);
   if (!liveOrderPlaced) {
     const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
     if (pendingIndex !== -1) pendingOrderQueue.splice(pendingIndex, 1);
@@ -3949,6 +5167,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     derivedSharpeContribution: parseFloat((finalPnl / Math.max(1, Math.abs(pos.stake))).toFixed(4)),
     entrySignalProbability: pos.entrySignalProbability,
     entryExpectedEdge: pos.entryExpectedEdge,
+    entryExpectedSharpeImpact: pos.entryExpectedSharpeImpact,
   };
 
   const latencySample = Math.abs((epoch - (pos.closeRequestedAt || pos.entryEpoch)) || 1);
@@ -6185,6 +7404,7 @@ app.get("/api/logs/export", async (req, res) => {
 
 // Server State Endpoint
 app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringify({ R_25: subAlgorithms.R_25.cooldownUntil, epoch: Math.floor(Date.now()/1000) }));
+  liveBridgeInstance.ensureConnected("api_state_readiness");
   updateCircuitBreakerCooldown();
   const currentRegime = detectRegime(selectedSymbol);
   const symbolPrices = tickBuffers[selectedSymbol] || [];
@@ -6207,6 +7427,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const portfolioRisk = computePortfolioRiskState();
   const instrumentDiagnostics = Object.fromEntries(Object.keys(INSTRUMENTS).map(sym => [sym, computeInstrumentStats(sym)]));
   const realCapitalSnapshot = buildRealCapitalReportSnapshot();
+  const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
 
   res.json({
     symbol: selectedSymbol,
@@ -6221,6 +7442,13 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     sessionOpenPnl: openPnl,
     estimatedSessionEquity,
     isAuthorized: liveBridgeInstance.getIsAuthorized(),
+    derivDiagnostics,
+    derivConfigured: derivDiagnostics.derivConfigured,
+    derivConnected: derivDiagnostics.derivConnected,
+    derivAuthValidated: derivDiagnostics.derivAuthValidated,
+    derivRuntimeSource: derivDiagnostics.derivRuntimeSource,
+    derivInitializationErrors: derivDiagnostics.derivInitializationErrors,
+    websocketConnected: derivDiagnostics.websocketConnected,
     tradingEnabled,
     tradingMode,
     riskPreset,
@@ -6279,6 +7507,8 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       readinessReasons: realCapitalSnapshot.readinessReasons,
     },
     adaptiveIntelligence: adaptiveIntelligenceState,
+    riskTelemetry: riskTelemetry.slice(-250),
+    shadowLiveValidation: SHADOW_LIVE_VALIDATION,
     subAlgorithms,
     stats: {
       totalTrades: total,
@@ -6373,10 +7603,25 @@ app.post("/api/config", (req, res) => {
 
   if (enabled !== undefined) {
     if (enabled && sessionBlocked) {
-      return res.status(403).json({ error: "Manual intervention required: 3% live equity loss limit reached. Please review risk and reset the session." });
+      return res.json({
+        success: false,
+        blocked: true,
+        tradingEnabled,
+        error: "Manual intervention required: 3% live equity loss limit reached. Please review risk and reset the session.",
+      });
     }
     if (enabled && !liveBridgeInstance.getIsAuthorized()) {
-      return res.status(403).json({ error: "Live Deriv authorization required to enable trading. Set DERIV_API_TOKEN." });
+      liveBridgeInstance.ensureConnected("config_enable_trading");
+      const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+      return res.json({
+        success: false,
+        blocked: true,
+        tradingEnabled: false,
+        error: derivDiagnostics.derivConfigured
+          ? "Live Deriv authorization is still pending or failed. Backend token is configured; check derivDiagnostics for websocket/auth status."
+          : "Live Deriv authorization required. Configure DERIV_API_TOKEN in the server runtime.",
+        derivDiagnostics,
+      });
     }
     tradingEnabled = enabled;
     if (enabled) {
@@ -6412,7 +7657,14 @@ app.post("/api/config", (req, res) => {
     logs.push(`[IML_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
 
-  res.json({ success: true, message: "Configuration updated" });
+  res.json({
+    success: true,
+    message: "Configuration updated",
+    tradingEnabled,
+    tradingMode,
+    riskPreset,
+    selectedSymbol,
+  });
 });
 
 // Get Ticks for active Chart drawing
@@ -6430,7 +7682,14 @@ app.get("/api/ticks", (req, res) => {
 // Manual Force Trade Placement (Live Authorized Mode only)
 app.post("/api/trade", (req, res) => {
   if (!liveBridgeInstance.getIsAuthorized()) {
-    return res.status(403).json({ error: "Live Deriv authorization required. Set DERIV_API_TOKEN to place trades." });
+    liveBridgeInstance.ensureConnected("manual_trade_request");
+    const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+    return res.status(403).json({
+      error: derivDiagnostics.derivConfigured
+        ? "Live Deriv authorization is still pending or failed. Backend token is configured; check derivDiagnostics for websocket/auth status."
+        : "Live Deriv authorization required. Configure DERIV_API_TOKEN in the server runtime.",
+      derivDiagnostics,
+    });
   }
   const { direction } = req.body;
   if (!direction || (direction !== "LONG" && direction !== "SHORT")) {
@@ -6519,8 +7778,10 @@ app.post("/api/force-report", (req, res) => {
 
 // Report summary endpoint
 app.get("/api/report-summary", (req, res) => {
+  liveBridgeInstance.ensureConnected("report_summary_readiness");
   const snapshot = buildRealCapitalReportSnapshot();
-  res.json((globalThis as any).lastReportSummary || {
+  const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+  const baseSummary = (globalThis as any).lastReportSummary || {
     summary: "No PDF report generated yet. Real-capital audit snapshot is available.",
     pdfUrl: null,
     milestones: [],
@@ -6534,6 +7795,11 @@ app.get("/api/report-summary", (req, res) => {
       recommendedMaxStake: snapshot.stakingAudit.recommendedMaxStake,
       readinessReasons: snapshot.readinessReasons,
     }
+  };
+  res.json({
+    ...baseSummary,
+    derivDiagnostics,
+    deploymentReadiness: adaptiveIntelligenceState.deploymentReadiness,
   });
 });
 
@@ -6688,6 +7954,8 @@ async function startServer() {
   });
 }
 
-startServer().catch(err => {
-  console.error("[FATAL_SERVER_START]", err);
-});
+if (!process.env.VERCEL) {
+  startServer().catch(err => {
+    console.error("[FATAL_SERVER_START]", err);
+  });
+}

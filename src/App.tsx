@@ -67,6 +67,9 @@ export default function App() {
   const [idealStrategy, setIdealStrategy] = useState<string>("mean_reversion");
   const [tradingMode, setTradingMode] = useState<"MULTIPLIER" | "HYBRID_LINEAR" | "AUTO">("AUTO");
   const [isAuthorized, setIsAuthorized] = useState<boolean>(false);
+  const [configUpdating, setConfigUpdating] = useState<boolean>(false);
+  const [configNotice, setConfigNotice] = useState<string>("");
+  const [configError, setConfigError] = useState<string>("");
 
   // Infinity Markets Lab Hybrid Risk Engine (IML-HRE) configs:
   const [hybridRiskType, setHybridRiskType] = useState<"FIXED" | "PERCENT">("FIXED");
@@ -145,6 +148,7 @@ export default function App() {
     instrumentDiagnostics?: Record<string, any>;
     microConservativeReadiness?: any;
     adaptiveIntelligence?: any;
+    derivDiagnostics?: any;
   }>({});
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
@@ -226,7 +230,7 @@ export default function App() {
       setSymbolName(safeMeta?.name || data.symbolName || "Volatility 25 (1s)");
       setIdealStrategy(safeMeta?.idealStrategy || data.idealStrategy || "mean_reversion");
       setTradingMode(data.tradingMode);
-      setIsAuthorized(data.isAuthorized);
+      setIsAuthorized(Boolean(data.derivAuthValidated ?? data.isAuthorized));
 
       if (data.hybridRiskType !== undefined) setHybridRiskType(data.hybridRiskType);
       if (data.hybridRiskFixedAmount !== undefined) setHybridRiskFixedAmount(data.hybridRiskFixedAmount);
@@ -284,6 +288,14 @@ export default function App() {
         instrumentDiagnostics: data.instrumentDiagnostics,
         microConservativeReadiness: data.microConservativeReadiness,
         adaptiveIntelligence: data.adaptiveIntelligence,
+        derivDiagnostics: data.derivDiagnostics || {
+          derivConfigured: data.derivConfigured,
+          derivConnected: data.derivConnected,
+          derivAuthValidated: data.derivAuthValidated ?? data.isAuthorized,
+          derivRuntimeSource: data.derivRuntimeSource,
+          derivInitializationErrors: data.derivInitializationErrors,
+          websocketConnected: data.websocketConnected,
+        },
       });
       setSubAlgorithms(filteredSubAlgorithms);
       setLogs(data.logs);
@@ -323,15 +335,45 @@ export default function App() {
 
   // Adjust config on backend
   const updateBackendConfig = async (payload: Record<string, any>) => {
+    setConfigUpdating(true);
+    setConfigError("");
+    setConfigNotice("");
+
+    if (payload.risk) setRiskPreset(payload.risk);
+    if (payload.mode) setTradingMode(payload.mode);
+
     try {
-      await fetch("/api/config", {
+      const response = await fetch("/api/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload)
       });
-      fetchState();
+      const contentType = response.headers.get("content-type") || "";
+      const data = contentType.includes("application/json") ? await response.json() : { error: await response.text() };
+
+      if (!response.ok || data.success === false) {
+        const message = data.error || `Configuration request failed with HTTP ${response.status}`;
+        setConfigError(message);
+        if (payload.enabled !== undefined) setTradingEnabled(Boolean(data.tradingEnabled));
+        if (data.derivDiagnostics) {
+          setProbabilisticDiagnostics(prev => ({ ...prev, derivDiagnostics: data.derivDiagnostics }));
+        }
+        await fetchState();
+        return data;
+      }
+
+      if (payload.enabled !== undefined) setTradingEnabled(Boolean(data.tradingEnabled ?? payload.enabled));
+      if (data.tradingMode) setTradingMode(data.tradingMode);
+      if (data.riskPreset) setRiskPreset(data.riskPreset);
+      setConfigNotice(data.message || "Configuration updated");
+      await fetchState();
+      return data;
     } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown configuration error";
+      setConfigError(`Failed to update system config: ${message}`);
       console.error("Failed to update system config:", err);
+    } finally {
+      setConfigUpdating(false);
     }
   };
 
@@ -813,10 +855,19 @@ export default function App() {
               ENGINE AUTO-TRADE: {tradingEnabled ? "ACTIVE" : "PAUSED"}
             </span>
             <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold text-brand-gold">
-              <span className={`w-2 h-2 rounded-full ${isAuthorized ? "bg-emerald-400 animate-pulse" : "bg-red-500"}`}></span>
-              <span className={isAuthorized ? "text-brand-mint" : "text-red-400"}>
-                DERIV AUTH: {isAuthorized ? "AUTHORIZED" : "NOT AUTHORIZED"}
-              </span>
+              {(() => {
+                const derivDiag = probabilisticDiagnostics.derivDiagnostics || {};
+                const configured = Boolean(derivDiag.derivConfigured);
+                const connected = Boolean(derivDiag.derivConnected || derivDiag.websocketConnected);
+                const auth = Boolean(derivDiag.derivAuthValidated || isAuthorized);
+                const color = auth ? "bg-emerald-400 animate-pulse" : configured ? "bg-amber-300 animate-pulse" : "bg-red-500";
+                const textClass = auth ? "text-brand-mint" : configured ? "text-amber-300" : "text-red-400";
+                const label = auth ? "AUTHORIZED" : configured ? (connected ? "AUTHORIZING" : "ENV CONFIGURED") : "TOKEN MISSING";
+                return <>
+                  <span className={`w-2 h-2 rounded-full ${color}`}></span>
+                  <span className={textClass}>DERIV AUTH: {label}</span>
+                </>;
+              })()}
             </span>
           </div>
           <p className="text-brand-mint/65 text-sm mt-1 selection:bg-indigo-500">
@@ -833,6 +884,7 @@ export default function App() {
               <button
                 key={risk}
                 onClick={() => updateBackendConfig({ risk })}
+                disabled={configUpdating}
                 className={`px-3 py-1 font-mono transition rounded text-sm ${riskPreset === risk ? "bg-brand-teal text-brand-mint font-bold" : "text-brand-mint/50 hover:text-brand-mint"}`}
               >
                 {risk}
@@ -844,7 +896,8 @@ export default function App() {
           <select
             value={tradingMode}
             onChange={(e) => updateBackendConfig({ mode: e.target.value })}
-            className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 text-sm py-1.5 font-mono outline-soft"
+            disabled={configUpdating}
+            className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 text-sm py-1.5 font-mono outline-soft disabled:opacity-60 disabled:cursor-wait"
           >
             <option value="AUTO">AUTO: Algo Adaptive</option>
             <option value="HYBRID_LINEAR">HYBRID: Linear (Risk R Sizing)</option>
@@ -854,9 +907,12 @@ export default function App() {
           {/* Toggle Engine trading State */}
           <button
             onClick={() => updateBackendConfig({ enabled: !tradingEnabled })}
-            className={`flex items-center gap-1.5 px-4 py-1.5 rounded text-sm font-semibold cursor-pointer transition ${tradingEnabled ? "bg-red-650 hover:bg-red-700 text-white" : "bg-brand-gold hover:bg-brand-gold/90 text-brand-slate font-bold"}`}
+            disabled={configUpdating}
+            className={`flex items-center gap-1.5 px-4 py-1.5 rounded text-sm font-semibold cursor-pointer transition disabled:opacity-60 disabled:cursor-wait ${tradingEnabled ? "bg-red-650 hover:bg-red-700 text-white" : "bg-brand-gold hover:bg-brand-gold/90 text-brand-slate font-bold"}`}
           >
-            {tradingEnabled ? (
+            {configUpdating ? (
+              <>SYNCING...</>
+            ) : tradingEnabled ? (
               <>
                 <Square className="w-3.5 h-3.5 fill-current" /> Pause trading
               </>
@@ -866,6 +922,12 @@ export default function App() {
               </>
             )}
           </button>
+
+          {(configError || configNotice) && (
+            <div className={`basis-full rounded border px-3 py-2 text-xs font-mono ${configError ? "border-amber-400/40 bg-amber-950/30 text-amber-200" : "border-emerald-400/30 bg-emerald-950/20 text-emerald-200"}`}>
+              {configError || configNotice}
+            </div>
+          )}
 
           {/* Operational metrics reset */}
           <button
@@ -2119,11 +2181,19 @@ export default function App() {
 
             <div className="p-3 bg-brand-slate/5 rounded border border-brand-slate/10 text-sm text-brand-slate/85 leading-relaxed font-sans">
               <span className="text-brand-slate font-bold font-mono text-sm block uppercase mb-1">Execution Status</span>
-              {isAuthorized ? (
-                <p>The engine is streaming live market data and waiting for Bollinger/RSI overextension confluence limits to place trades directly using your authorized credentials.</p>
-              ) : (
-                <p className="text-brand-slate/90 font-medium">Please specify a valid <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code> in your environment parameters to authorize actual live contracts and automatic risk limits.</p>
-              )}
+              {(() => {
+                const derivDiag = probabilisticDiagnostics.derivDiagnostics || {};
+                const configured = Boolean(derivDiag.derivConfigured);
+                const connected = Boolean(derivDiag.derivConnected || derivDiag.websocketConnected);
+                const auth = Boolean(derivDiag.derivAuthValidated || isAuthorized);
+                if (auth) {
+                  return <p>The backend has validated the server-side Deriv credential and is streaming live market data while waiting for approved governor/preflight conditions.</p>;
+                }
+                if (configured) {
+                  return <p className="text-amber-200/90 font-medium">Server-side <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code> is configured securely ({derivDiag.derivRuntimeSource || "ENV"}); awaiting Deriv websocket authorization{connected ? " response" : " reconnect"}. No raw token is required in the browser.</p>;
+                }
+                return <p className="text-brand-slate/90 font-medium">Backend diagnostics report no server-side <code className="bg-brand-slate/10 border border-brand-slate/20 px-1 py-0.5 rounded font-bold text-brand-slate">DERIV_API_TOKEN</code>. Configure it in the production server environment; never expose it to the frontend.</p>;
+              })()}
             </div>
           </div>
 

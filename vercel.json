@@ -1,0 +1,77 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/config.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/state.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/report-summary.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/ml-export.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/resume-session.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/ticks.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/trade.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/close-position.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/analyze.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/force-report.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/real-capital-report.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/reset.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/logs/export.ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    },
+    "api/[...path].ts": {
+      "maxDuration": 60,
+      "includeFiles": "dist/server.cjs"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}
