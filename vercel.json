@@ -1,0 +1,35 @@
+{
+  "version": 2,
+  "buildCommand": "npm run build",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/index.ts": {
+      "maxDuration": 60
+    },
+    "api/config.ts": {
+      "maxDuration": 60
+    },
+    "api/state.ts": {
+      "maxDuration": 60
+    },
+    "api/report-summary.ts": {
+      "maxDuration": 60
+    },
+    "api/[path].ts": {
+      "maxDuration": 60
+    },
+    "api/[...path].ts": {
+      "maxDuration": 60
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ]
+}

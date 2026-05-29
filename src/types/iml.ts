@@ -92,6 +92,7 @@ export interface TradeRecord {
   derivedSharpeContribution?: number;
   entrySignalProbability?: number;
   entryExpectedEdge?: number;
+  entryExpectedSharpeImpact?: number;
 }
 
 export interface SessionStats {
@@ -235,6 +236,26 @@ export interface UncertaintyState {
   marketUncertainty: number;
   modelConfidence: number;
   regimeStability: number;
+}
+
+export interface CanonicalExposureModel {
+  equity: number;
+  stake: number;
+  effectiveMultiplier: number;
+  stopDistancePct: number;
+  expectedLossPct: number;
+  expectedRewardPct: number;
+  maxLossAmount: number;
+  targetRewardAmount: number;
+  rewardToRisk: number;
+  exposurePct: number;
+  portfolioHeatContribution: number;
+}
+
+export interface OrderEconomics extends CanonicalExposureModel {
+  stakeToReward: number;
+  approved: boolean;
+  rejectionReasons: string[];
 }
 
 export interface PortfolioHeatState {
@@ -411,6 +432,203 @@ export interface ExecutionHealthScore {
   degradationProbability: number;
 }
 
+export interface ExecutionStateModel {
+  latencyScore: number;
+  slippageScore: number;
+  rejectionProbability: number;
+  websocketHealth: number;
+  quoteFreshness: number;
+  synchronizationConfidence: number;
+  executionReliability: number;
+  degradationProbability: number;
+  executionRiskMultiplier: number;
+}
+
+export interface RegimeTransitionState {
+  transitionProbability: number;
+  confidenceDecay: number;
+  instabilityScore: number;
+  volatilityShockRisk: number;
+  edgeReliabilityDecay: number;
+  adaptiveRiskMultiplier: number;
+}
+
+export interface PathDependentRiskState {
+  consecutiveLossPressure: number;
+  volatilityClusterRisk: number;
+  drawdownAcceleration: number;
+  confidenceErosion: number;
+  recoveryProbability: number;
+  adaptiveDefensiveScale: number;
+}
+
+export interface ConfidenceCalibration {
+  predictedSharpe: number;
+  realizedSharpe: number;
+  predictionError: number;
+  confidenceBias: number;
+  calibrationError: number;
+  overconfidenceProbability: number;
+}
+
+export interface ProbabilityCalibrationState {
+  predictedProbability: number;
+  realizedFrequency: number;
+  calibrationGap: number;
+  brierScore: number;
+  reliabilityScore: number;
+}
+
+export interface StrategyDecayState {
+  longHorizonExpectancy: number;
+  expectancyDecayRate: number;
+  sharpeDecayRate: number;
+  edgePersistenceProbability: number;
+  structuralBreakProbability: number;
+  decayConfidence: number;
+}
+
+export interface DynamicCorrelationModel {
+  symbols: string[];
+  rollingCorrelationMatrix: number[][];
+  stressCorrelationMatrix: number[][];
+  correlationInstability: number;
+  concentrationRisk: number;
+  portfolioFragility: number;
+}
+
+export interface EpistemicUncertaintyState {
+  dataQuality: number;
+  modelAgreement: number;
+  signalStability: number;
+  informationDensity: number;
+  uncertaintyScore: number;
+  uncertaintyAdjustedRisk: number;
+}
+
+export interface SurvivalEquityCurveState {
+  drawdownDepth: number;
+  drawdownVelocity: number;
+  recoverySlope: number;
+  equityStability: number;
+  survivalModeProbability: number;
+  adaptiveAggressionScale: number;
+}
+
+export interface AutonomousPortfolioState {
+  portfolioSharpe: number;
+  portfolioSortino: number;
+  portfolioHeat: number;
+  correlationStress: number;
+  survivabilityScore: number;
+  capitalEfficiency: number;
+  opportunityCost: number;
+  adaptiveExposureScale: number;
+}
+
+export interface EmpiricalCalibrationState {
+  predictedWinProbability: number;
+  realizedWinRate: number;
+  predictedSharpe: number;
+  realizedSharpe: number;
+  predictedExpectancy: number;
+  realizedExpectancy: number;
+  calibrationError: number;
+  confidenceBias: number;
+  predictionReliability: number;
+}
+
+export interface SelfHealingRiskState {
+  adaptiveRiskScale: number;
+  survivabilityPriority: number;
+  degradationSeverity: number;
+  defensiveModeProbability: number;
+  recoveryConfidence: number;
+  capitalProtectionBias: number;
+}
+
+export enum AutonomousState {
+  NORMAL = "NORMAL",
+  CAUTIOUS = "CAUTIOUS",
+  DEFENSIVE = "DEFENSIVE",
+  SURVIVAL = "SURVIVAL",
+  SHADOW_ONLY = "SHADOW_ONLY",
+  EXECUTION_UNSAFE = "EXECUTION_UNSAFE",
+  CALIBRATION_UNSTABLE = "CALIBRATION_UNSTABLE",
+}
+
+export interface ExecutionForensics {
+  averageProposalLatency: number;
+  latencyVariance: number;
+  websocketStability: number;
+  staleQuoteRate: number;
+  executionMismatchRate: number;
+  synchronizationConfidence: number;
+  executionIntegrityScore: number;
+}
+
+export interface ProbabilityCalibration {
+  predictedProbability: number;
+  realizedFrequency: number;
+  brierScore: number;
+  reliabilityCurveError: number;
+  calibrationConfidence: number;
+}
+
+export interface StrategyDriftState {
+  longHorizonSharpe: number;
+  expectancyDecayRate: number;
+  confidenceDecayRate: number;
+  structuralBreakProbability: number;
+  edgePersistenceProbability: number;
+  adaptiveWeightScale: number;
+}
+
+export interface LongHorizonPortfolioState {
+  portfolioSharpe: number;
+  portfolioSortino: number;
+  capitalEfficiency: number;
+  portfolioHeat: number;
+  opportunityDensity: number;
+  survivabilityScore: number;
+  concentrationRisk: number;
+  adaptiveExposureScale: number;
+}
+
+export interface CapitalPreservationState {
+  drawdownDepth: number;
+  drawdownVelocity: number;
+  recoverySlope: number;
+  survivalProbability: number;
+  adaptiveAggressionScale: number;
+  capitalProtectionPriority: number;
+}
+
+export interface DeploymentReadiness {
+  executionReady: boolean;
+  calibrationStable: boolean;
+  survivabilityAcceptable: boolean;
+  portfolioRiskAcceptable: boolean;
+  edgePersistenceHealthy: boolean;
+  uncertaintyAcceptable: boolean;
+  liveDeploymentApproved: boolean;
+  readinessScore: number;
+}
+
+export interface AdaptiveLayerValidationState {
+  predictedVsRealizedError: number;
+  riskReductionEffectiveness: number;
+  drawdownReductionEffectiveness: number;
+  calibrationQuality: number;
+  sharpeImprovement: number;
+  survivabilityImpact: number;
+  falseDefensiveActivationRate: number;
+  missedOpportunityCost: number;
+  validatedInfluenceScale: number;
+  sampleSize: number;
+}
+
+
 export interface AdaptiveUncertaintyState extends UncertaintyState {
   recommendedRiskAdjustment: number;
   distributionConfidence: number;
@@ -423,6 +641,13 @@ export interface MonteCarloEvolutionState {
   worstCaseDrawdown: number;
   correlatedLossRisk: number;
   executionDegradationRisk: number;
+  expectedTerminalDrawdown: number;
+  recoveryDuration: number;
+  ruinProbability: number;
+  capitalExhaustionProbability: number;
+  longHorizonSharpeP05: number;
+  longHorizonSharpeP50: number;
+  longHorizonSharpeP95: number;
   lastRunEpoch: number;
 }
 
@@ -435,6 +660,26 @@ export interface AdaptiveIntelligenceState {
   anomaly: Record<string, AnomalyState>;
   longHorizonMemory: Record<string, LongHorizonMemoryState>;
   execution: ExecutionHealthScore;
+  executionState: ExecutionStateModel;
+  transition: RegimeTransitionState;
+  pathRisk: PathDependentRiskState;
+  confidenceCalibration: ConfidenceCalibration;
+  probabilityCalibration: ProbabilityCalibrationState;
+  strategyDecay: Record<string, StrategyDecayState>;
+  dynamicCorrelation: DynamicCorrelationModel;
+  epistemic: EpistemicUncertaintyState;
+  survivalEquity: SurvivalEquityCurveState;
+  portfolioBrain: AutonomousPortfolioState;
+  empiricalCalibration: EmpiricalCalibrationState;
+  selfHealingRisk: SelfHealingRiskState;
+  autonomousState: AutonomousState;
+  executionForensics: ExecutionForensics;
+  probabilityCalibrationV2: ProbabilityCalibration;
+  strategyDrift: Record<string, StrategyDriftState>;
+  longHorizonPortfolio: LongHorizonPortfolioState;
+  capitalPreservation: CapitalPreservationState;
+  deploymentReadiness: DeploymentReadiness;
+  adaptiveLayerValidation: AdaptiveLayerValidationState;
   uncertainty: AdaptiveUncertaintyState;
   monteCarlo: MonteCarloEvolutionState;
   lastShadowComparison: string;
