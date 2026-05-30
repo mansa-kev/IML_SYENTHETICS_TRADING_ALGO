@@ -65,7 +65,10 @@ let currentParams: LearningParams = {
 };
 
 const defaultParams: LearningParams = { ...currentParams };
-const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
+const DERIV_SUPPORTED_MULTIPLIERS = [100, 150, 200, 300, 400];
+const DERIV_MIN_STAKE_USD = parseFloat(process.env.DERIV_MIN_STAKE_USD || "1.00");
+const MIN_EXECUTABLE_RISK_USD = parseFloat(process.env.IML_MIN_EXECUTABLE_RISK_USD || "1.00");
+const LIVE_TREND_MIN_CONFIDENCE = parseFloat(process.env.IML_LIVE_TREND_MIN_CONFIDENCE || "0.40");
 
 // Trend-mode parameters
 const TREND_SHORT_EMA = 50;   // short EMA length (ticks)
@@ -271,6 +274,9 @@ interface PreflightContext {
   stopLossDistance: number;
   takeProfitDistance: number;
   entryPrice: number;
+  riskModel?: "PRICE_DISTANCE" | "DOLLAR_LIMIT";
+  dollarRiskLimit?: number;
+  rewardRatio?: number;
   governorAllocatedRisk: number;
   accountRiskBudget: number;
   symbolRiskBudget: number;
@@ -1147,19 +1153,19 @@ function getRiskBudgetCaps(equity: number): RiskBudgetCaps {
   const mode = getAccountRiskMode(equity);
   const presetRiskPct = riskPreset === "AGGRESSIVE" ? 0.0125 : riskPreset === "CONSERVATIVE" ? 0.0025 : 0.006;
   if (mode === "NANO") {
-    return { mode, maxRiskPct: 0.0025, maxStakePct: 0.0125, minimumRR: 1.8, maxStakeRewardRatio: 1.0, maxPositions: 1, maxMultiplier: 40, executionHealthThreshold: 0.72 };
+    return { mode, maxRiskPct: 0.02, maxStakePct: 0.02, minimumRR: 1.8, maxStakeRewardRatio: 3.0, maxPositions: 1, maxMultiplier: 100, executionHealthThreshold: 0.72 };
   }
   if (mode === "MICRO") {
-    return { mode, maxRiskPct: Math.min(0.005, presetRiskPct), maxStakePct: 0.02, minimumRR: 1.6, maxStakeRewardRatio: 1.25, maxPositions: 1, maxMultiplier: 40, executionHealthThreshold: 0.68 };
+    return { mode, maxRiskPct: 0.02, maxStakePct: 0.02, minimumRR: 1.6, maxStakeRewardRatio: 3.0, maxPositions: 1, maxMultiplier: 100, executionHealthThreshold: 0.68 };
   }
   if (mode === "SMALL") {
-    return { mode, maxRiskPct: Math.min(0.008, presetRiskPct), maxStakePct: 0.025, minimumRR: 1.5, maxStakeRewardRatio: 1.75, maxPositions: 2, maxMultiplier: 100, executionHealthThreshold: 0.58 };
+    return { mode, maxRiskPct: riskPreset === "CONSERVATIVE" ? 0.01 : Math.min(0.02, Math.max(0.0125, presetRiskPct)), maxStakePct: 0.03, minimumRR: 1.5, maxStakeRewardRatio: 3.5, maxPositions: 2, maxMultiplier: 100, executionHealthThreshold: 0.58 };
   }
-  return { mode, maxRiskPct: presetRiskPct, maxStakePct: riskPreset === "AGGRESSIVE" ? 0.02 : 0.015, minimumRR: 1.35, maxStakeRewardRatio: 2.25, maxPositions: riskPreset === "AGGRESSIVE" ? 4 : 3, maxMultiplier: riskPreset === "AGGRESSIVE" ? 400 : 200, executionHealthThreshold: 0.50 };
+  return { mode, maxRiskPct: presetRiskPct, maxStakePct: riskPreset === "AGGRESSIVE" ? 0.02 : 0.015, minimumRR: 1.35, maxStakeRewardRatio: 4.0, maxPositions: riskPreset === "AGGRESSIVE" ? 4 : 3, maxMultiplier: riskPreset === "AGGRESSIVE" ? 400 : 200, executionHealthThreshold: 0.50 };
 }
 
 function deriveEffectiveDerivMultiplier(requestedMultiplier?: number): number {
-  const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200;
+  const fallbackMultiplier = riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200;
   const proposed = requestedMultiplier && DERIV_SUPPORTED_MULTIPLIERS.includes(requestedMultiplier) ? requestedMultiplier : fallbackMultiplier;
   const caps = getRiskBudgetCaps(balance);
   const capped = Math.min(proposed, caps.maxMultiplier);
@@ -1203,17 +1209,34 @@ function assertFinalRiskAuthority(finalRisk: number, governorAllocatedRisk: numb
   }
 }
 
-function buildCanonicalExposureModel(input: { equity: number; stake: number; effectiveMultiplier: number; stopLossDistance: number; takeProfitDistance: number; entryPrice: number; symbol: string; direction: "LONG" | "SHORT" }): CanonicalExposureModel {
+function shouldUseMinimumExecutableRiskFloor(proposal: StrategyProposal, finalConfidence: number, signalProfile: ExtendedSignalProbability, portfolioRisk: PortfolioRiskState): boolean {
+  if (proposal.effMode !== "HYBRID_LINEAR") return false;
+  if (proposal.strategy === "MEAN_REVERSION") return false;
+  if (finalConfidence < LIVE_TREND_MIN_CONFIDENCE) return false;
+  if (signalProfile.expectedEdge < 0.60) return false;
+  if (signalProfile.uncertainty > 0.65) return false;
+  if (portfolioRisk.drawdownSeverity > 0.01) return false;
+  if (activePositions.length > 0) return false;
+  return true;
+}
+
+function buildCanonicalExposureModel(input: { equity: number; stake: number; effectiveMultiplier: number; stopLossDistance: number; takeProfitDistance: number; entryPrice: number; symbol: string; direction: "LONG" | "SHORT"; riskModel?: "PRICE_DISTANCE" | "DOLLAR_LIMIT"; dollarRiskLimit?: number; rewardRatio?: number }): CanonicalExposureModel {
   const equity = Math.max(0, input.equity);
   const stake = Math.max(0, input.stake);
   const entryPrice = Math.max(1e-9, Math.abs(input.entryPrice));
   const effectiveMultiplier = Math.max(1, input.effectiveMultiplier);
   const stopDistancePct = Math.max(0, input.stopLossDistance / entryPrice);
   const rewardDistancePct = Math.max(0, input.takeProfitDistance / entryPrice);
-  const expectedLossPct = Math.min(1, stopDistancePct * effectiveMultiplier);
-  const expectedRewardPct = rewardDistancePct * effectiveMultiplier;
-  const maxLossAmount = Math.min(stake, stake * expectedLossPct);
-  const targetRewardAmount = stake * expectedRewardPct;
+  let expectedLossPct = Math.min(1, stopDistancePct * effectiveMultiplier);
+  let expectedRewardPct = rewardDistancePct * effectiveMultiplier;
+  let maxLossAmount = Math.min(stake, stake * expectedLossPct);
+  let targetRewardAmount = stake * expectedRewardPct;
+  if (input.riskModel === "DOLLAR_LIMIT") {
+    maxLossAmount = Math.min(stake, Math.max(0, input.dollarRiskLimit ?? 0));
+    targetRewardAmount = maxLossAmount * Math.max(0, input.rewardRatio ?? 0);
+    expectedLossPct = stake > 0 ? maxLossAmount / stake : 0;
+    expectedRewardPct = stake > 0 ? targetRewardAmount / stake : 0;
+  }
   const heatWithCandidate = computePortfolioHeatSnapshot({ symbol: input.symbol, stake, direction: input.direction });
   const heatNow = computePortfolioHeatSnapshot();
   return {
@@ -1271,7 +1294,7 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   if ((caps.mode === "NANO" || caps.mode === "MICRO") && ["BOOM500", "CRASH500"].includes(context.symbol)) rejectionReasons.push("micro_account_boom_crash_disabled");
   if ((caps.mode === "NANO" || caps.mode === "MICRO") && hybridRiskType === "FIXED") rejectionReasons.push("micro_account_fixed_risk_disabled");
   if (context.effectiveMultiplier > caps.maxMultiplier) rejectionReasons.push("effective_multiplier_exceeds_account_cap");
-  if (stake < 0.35) rejectionReasons.push("resized_stake_below_deriv_minimum");
+  if (stake < DERIV_MIN_STAKE_USD) rejectionReasons.push("resized_stake_below_deriv_minimum");
   if (!Number.isFinite(model.maxLossAmount) || !Number.isFinite(model.targetRewardAmount)) rejectionReasons.push("invalid_order_economics");
 
   const result = {
@@ -3770,18 +3793,23 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   )).toFixed(4));
 
   const riskBudgets = computeRiskBudget(symbol, finalConfidence);
-  const governorAllocatedRisk = adjustedRisk;
+  const useMinimumRiskFloor = confidenceTier !== ConfidenceTier.REJECT && shouldUseMinimumExecutableRiskFloor(proposal, finalConfidence, signalProfile, portfolioRisk);
+  let governorAllocatedRisk = adjustedRisk;
+  if (useMinimumRiskFloor && governorAllocatedRisk < MIN_EXECUTABLE_RISK_USD) {
+    governorAllocatedRisk = MIN_EXECUTABLE_RISK_USD;
+  }
   const accountRiskBudget = riskBudgets.accountRiskBudget;
   const symbolRiskBudget = riskBudgets.symbolRiskBudget;
   const portfolioRemainingRisk = riskBudgets.portfolioRemainingRisk;
   const executionAdjustedRisk = parseFloat((governorAllocatedRisk * riskBudgets.executionHealthScale).toFixed(2));
+  const adaptiveRiskBudget = useMinimumRiskFloor ? Number.POSITIVE_INFINITY : riskBudgets.riskBudget;
   const finalRisk = confidenceTier !== ConfidenceTier.REJECT ? parseFloat(Math.max(0, Math.min(
     governorAllocatedRisk,
     accountRiskBudget,
     symbolRiskBudget,
     portfolioRemainingRisk,
     executionAdjustedRisk,
-    riskBudgets.riskBudget
+    adaptiveRiskBudget
   )).toFixed(2)) : 0;
   assertFinalRiskAuthority(finalRisk, governorAllocatedRisk, `governor:${symbol}`);
   const approved = confidenceTier !== ConfidenceTier.REJECT && finalRisk > 0;
@@ -4706,12 +4734,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
     if (tickEffMode === "HYBRID_LINEAR") {
       const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
-      targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
+      targetRisk = parseFloat(Math.max(0, Math.min(calculatedRisk, auditRes.allocatedRisk, balance * 0.1)).toFixed(2));
       if (selectedTakeProfit === undefined) {
         takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
       }
-      stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
-      logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
+      stake = parseFloat(Math.max(DERIV_MIN_STAKE_USD, Math.min(Math.max(targetRisk, DERIV_MIN_STAKE_USD), balance * 0.1)).toFixed(2));
+      logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Stake=$${stake} reconciled to Governor risk ceiling.`);
     } else if (tickEffMode === "MULTIPLIER") {
       const targetLossPct = sub.targetLossPct || 0.15; // default 15% max risk on stake
       const slPct = stopLossDistance / currentPrice;
@@ -4814,11 +4842,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       stopLossDistance,
       takeProfitDistance,
       entryPrice: currentPrice,
+      riskModel: tickEffMode === "HYBRID_LINEAR" ? "DOLLAR_LIMIT" : "PRICE_DISTANCE",
+      dollarRiskLimit: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
+      rewardRatio: tickEffMode === "HYBRID_LINEAR" ? hybridRewardRatio : undefined,
       governorAllocatedRisk: auditRes.allocatedRisk,
       accountRiskBudget: budgets.accountRiskBudget,
       symbolRiskBudget: budgets.symbolRiskBudget,
       portfolioRemainingRisk: budgets.portfolioRemainingRisk,
-      executionAdjustedRisk: parseFloat((auditRes.allocatedRisk * budgets.executionHealthScale).toFixed(2)),
+      executionAdjustedRisk: auditRes.allocatedRisk,
     });
     if (!orderEconomics.approved) {
       logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${proposalDirection} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
@@ -4980,8 +5011,8 @@ function executeProposal(
     const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
     targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
     takeProfitDistance = stopLossDistance * hybridRewardRatio;
-    stake = parseFloat(Math.max(0.35, Math.min(targetRisk * 2.0, balance * 0.1)).toFixed(2));
-    logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
+    stake = parseFloat(Math.max(DERIV_MIN_STAKE_USD, Math.min(targetRisk, balance * 0.1)).toFixed(2));
+    logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Stake=$${stake}`);
   } else if (effMode === "MULTIPLIER") {
     const slPct = stopLossDistance / entryPrice;
     const desiredMultiplier = targetLossPct / slPct;
@@ -5063,6 +5094,12 @@ function executeProposal(
   const effectiveMultiplier = deriveEffectiveDerivMultiplier(position.multiplier);
   const budgets = computeRiskBudget(symbol, 0.5);
   const manualGovernorRisk = Math.min(stake, budgets.riskBudget, budgets.accountRiskBudget, budgets.symbolRiskBudget);
+  if (effMode === "HYBRID_LINEAR") {
+    targetRisk = parseFloat(Math.max(0, Math.min(targetRisk, manualGovernorRisk)).toFixed(2));
+    stake = parseFloat(Math.max(DERIV_MIN_STAKE_USD, Math.min(Math.max(targetRisk, DERIV_MIN_STAKE_USD), balance * 0.1)).toFixed(2));
+    position.stake = stake;
+    position.targetRiskAmount = targetRisk;
+  }
   const orderEconomics = preflightOrderEconomics({
     symbol,
     direction,
@@ -5071,11 +5108,14 @@ function executeProposal(
     stopLossDistance,
     takeProfitDistance,
     entryPrice,
+    riskModel: effMode === "HYBRID_LINEAR" ? "DOLLAR_LIMIT" : "PRICE_DISTANCE",
+    dollarRiskLimit: effMode === "HYBRID_LINEAR" ? targetRisk : undefined,
+    rewardRatio: effMode === "HYBRID_LINEAR" ? hybridRewardRatio : undefined,
     governorAllocatedRisk: manualGovernorRisk,
     accountRiskBudget: budgets.accountRiskBudget,
     symbolRiskBudget: budgets.symbolRiskBudget,
     portfolioRemainingRisk: budgets.portfolioRemainingRisk,
-    executionAdjustedRisk: parseFloat((manualGovernorRisk * budgets.executionHealthScale).toFixed(2)),
+    executionAdjustedRisk: manualGovernorRisk,
   });
   if (!orderEconomics.approved) {
     logs.push(`[ORDER_PREFLIGHT_REJECT] Manual ${symbol} ${direction} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)}.`);
@@ -5639,7 +5679,7 @@ function getMicroConservativeProfile(accountBalance = MICRO_CONSERVATIVE_REFEREN
 }
 
 function estimatePositionEconomics(position: ActivePosition) {
-  const effectiveMultiplier = position.multiplier ?? (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 40 : 200);
+  const effectiveMultiplier = position.multiplier ?? (riskPreset === "AGGRESSIVE" ? 400 : riskPreset === "CONSERVATIVE" ? 100 : 200);
   const stopDistance = Math.abs(position.entryPrice - position.stopLoss);
   const targetDistance = Math.abs(position.takeProfit - position.entryPrice);
   const expectedLossPct = position.entryPrice > 0 ? (stopDistance / position.entryPrice) * effectiveMultiplier : 0;
