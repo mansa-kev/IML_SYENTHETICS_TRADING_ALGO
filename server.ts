@@ -185,9 +185,12 @@ const candleBuffers: Record<string, Candle[]> = {
 // ==========================================
 // CENTRAL GOVERNOR & DUAL-TIER TRADING ENGINES (AGENTIC UPGRADE)
 // ==========================================
+type StrategyKind = "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
+
 interface StrategyProposal {
   symbol: string;
   direction: "LONG" | "SHORT";
+  strategy: StrategyKind;
   score: number;
   stake: number;
   effMode: "MULTIPLIER" | "HYBRID_LINEAR";
@@ -203,7 +206,27 @@ interface StrategyProposal {
     isDivergent?: boolean;
     isReversalCandle?: boolean;
     signalProbability?: ExtendedSignalProbability;
+    trendDir?: number;
+    emaSeparation?: number;
+    postSpikeRr?: number;
+    spikeRecoveryProbability?: number;
+    spikeExhaustionProbability?: number;
   };
+}
+
+const proposalCooldownUntil: Record<string, number> = {};
+
+function proposalCooldownKey(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT"): string {
+  return `${symbol}:${strategy}:${direction}`;
+}
+
+function isProposalCoolingDown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT"): boolean {
+  return Date.now() < (proposalCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] || 0);
+}
+
+function startProposalCooldown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT") {
+  const cooldownMs = strategy === "POST_SPIKE_HARVEST" ? 30000 : strategy === "TREND_EMA" ? 12000 : 8000;
+  proposalCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] = Date.now() + cooldownMs;
 }
 
 
@@ -3522,6 +3545,63 @@ function computeSignalProbability(symbol: string, direction: "LONG" | "SHORT", r
   };
 }
 
+function computeTrendSignalProbability(symbol: string, direction: "LONG" | "SHORT", currentPrice: number, adx: number, atr: number, regimeState: RegimeState, conviction: number, persistenceProbability = 0.5): ExtendedSignalProbability {
+  const prices = tickBuffers[symbol] || [];
+  const shortEma = ema(prices, TREND_SHORT_EMA);
+  const longEma = ema(prices, TREND_LONG_EMA);
+  const trendDir = shortEma != null && longEma != null ? (shortEma > longEma ? 1 : shortEma < longEma ? -1 : 0) : 0;
+  const aligned = (direction === "LONG" && trendDir > 0) || (direction === "SHORT" && trendDir < 0);
+  const emaSeparation = shortEma != null && longEma != null && currentPrice > 0 ? Math.abs(shortEma - longEma) / currentPrice : 0;
+  const adxScore = normalizeRange(adx, TREND_MIN_ADX, 65);
+  const separationScore = normalizeRange(emaSeparation, 0.00005, 0.0018);
+  const regimeTrendScore = clamp01(regimeState.trendProbability);
+  const transitionDrag = clamp01(regimeState.transitionProbability);
+  const volRatio = atr / Math.max(1e-9, currentPrice * 0.005);
+  const volatilityScore = clamp01(1 - Math.abs(volRatio - 1) * 0.35);
+  const expectedEdge = aligned
+    ? clamp01(0.42 + 0.18 * adxScore + 0.16 * separationScore + 0.14 * persistenceProbability + 0.10 * regimeTrendScore - 0.08 * transitionDrag)
+    : 0.15;
+  const confidence = aligned
+    ? clamp01(0.46 + 0.18 * conviction + 0.15 * adxScore + 0.12 * separationScore + 0.12 * regimeTrendScore + 0.10 * persistenceProbability - 0.08 * transitionDrag)
+    : 0.18;
+  const uncertainty = clamp01(0.52 - 0.18 * adxScore - 0.12 * separationScore - 0.10 * regimeState.confidence + 0.20 * transitionDrag);
+  return {
+    expectedEdge: parseFloat(expectedEdge.toFixed(4)),
+    confidence: parseFloat(Math.max(0.1, confidence).toFixed(4)),
+    uncertainty: parseFloat(uncertainty.toFixed(4)),
+    regimeCompatibility: parseFloat(clamp01(0.45 + 0.35 * regimeTrendScore + 0.15 * persistenceProbability - 0.15 * transitionDrag).toFixed(4)),
+    volatilityScore: parseFloat(Math.max(0.1, volatilityScore).toFixed(4)),
+    tailRisk: parseFloat(clamp01(0.12 + 0.18 * transitionDrag + (adx > 70 ? 0.08 : 0)).toFixed(4)),
+    expectedHoldingTime: 90,
+    expectedRR: 2.5,
+    executionSensitivity: 0.32,
+    executionQuality: deriveExecutionQualityScore(),
+  };
+}
+
+function computePostSpikeSignalProbability(symbol: string, setup: { rewardToRisk: number }, spikeState: SpikeHarvestState, regimeState: RegimeState, conviction: number): ExtendedSignalProbability {
+  const rrScore = normalizeRange(setup.rewardToRisk, POST_SPIKE_MIN_RR, 4.5);
+  const recoveryScore = clamp01(spikeState.recoveryProbability || 0);
+  const exhaustionScore = clamp01(spikeState.spikeExhaustionProbability || 0);
+  const timingScore = 1 - Math.abs((spikeState.postSpikeTicksElapsed || 0) - 15) / 10;
+  const transitionDrag = clamp01(regimeState.transitionProbability);
+  const expectedEdge = clamp01(0.46 + 0.18 * rrScore + 0.16 * recoveryScore + 0.14 * exhaustionScore + 0.08 * clamp01(timingScore) - 0.08 * transitionDrag);
+  const confidence = clamp01(0.48 + 0.12 * conviction + 0.16 * rrScore + 0.14 * recoveryScore + 0.14 * exhaustionScore + 0.08 * clamp01(timingScore) - 0.10 * transitionDrag);
+  const uncertainty = clamp01(0.46 - 0.14 * recoveryScore - 0.12 * exhaustionScore - 0.10 * rrScore + 0.18 * transitionDrag);
+  return {
+    expectedEdge: parseFloat(expectedEdge.toFixed(4)),
+    confidence: parseFloat(Math.max(0.1, confidence).toFixed(4)),
+    uncertainty: parseFloat(uncertainty.toFixed(4)),
+    regimeCompatibility: parseFloat(clamp01(0.50 + 0.20 * recoveryScore + 0.20 * exhaustionScore - 0.12 * transitionDrag).toFixed(4)),
+    volatilityScore: parseFloat(clamp01(0.50 + 0.25 * recoveryScore + 0.15 * rrScore).toFixed(4)),
+    tailRisk: parseFloat(clamp01(0.16 + 0.18 * transitionDrag - 0.08 * exhaustionScore).toFixed(4)),
+    expectedHoldingTime: 35,
+    expectedRR: parseFloat(setup.rewardToRisk.toFixed(2)),
+    executionSensitivity: 0.48,
+    executionQuality: deriveExecutionQualityScore(),
+  };
+}
+
 function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const { symbol, direction, score, stake, conviction } = proposal;
   const sub = subAlgorithms[symbol];
@@ -3558,7 +3638,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   adaptiveIntelligenceState.epistemic = epistemicState;
 
   const prior = INSTRUMENT_PRIORS[symbol] || { confidence: 0.5, expectedEdge: 0.45, sharpe: 0.5 };
-  const recentWeight = Math.min(1, (sub.totalTrades || 0) / 40);
+  const strategySignalFloor = proposal.strategy === "MEAN_REVERSION" ? 0 : proposal.strategy === "TREND_EMA" ? 0.72 : 0.78;
+  const recentWeight = Math.max(strategySignalFloor, Math.min(1, (sub.totalTrades || 0) / 40));
   const baselineWeight = 1 - recentWeight;
   const blendedConfidence = parseFloat((signalProfile.confidence * recentWeight + prior.confidence * baselineWeight).toFixed(4));
   const blendedEdge = parseFloat((signalProfile.expectedEdge * recentWeight + prior.expectedEdge * baselineWeight).toFixed(4));
@@ -3586,6 +3667,11 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (isTransition) transitionPenalty = 0.30 + (regimeState.transitionProbability - 0.35) * 0.45;
   else if (isTrendRegime && executionAdjustedEdge < 0.35) transitionPenalty = 0.18;
   else if (isMRRegime && sub.hurstVal && sub.hurstVal > 0.60) transitionPenalty = 0.16;
+  if (proposal.strategy === "TREND_EMA" && signalProfile.expectedEdge >= 0.50 && adxVal >= TREND_MIN_ADX) {
+    transitionPenalty *= 0.45;
+  } else if (proposal.strategy === "POST_SPIKE_HARVEST" && signalProfile.expectedRR >= POST_SPIKE_MIN_RR) {
+    transitionPenalty *= 0.60;
+  }
   transitionPenalty += transitionState.instabilityScore * 0.28 + transitionState.confidenceDecay * 0.20;
   transitionPenalty = Math.min(0.70, Math.max(0, transitionPenalty));
 
@@ -3632,16 +3718,21 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const pathPenalty = pathRisk.confidenceErosion * 0.25;
   const totalPenalty = Math.min(0.92, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty + calibrationPenalty + epistemicPenalty + pathPenalty);
   const finalConfidence = parseFloat(Math.max(0.03, baseConfidence * (1 - totalPenalty)).toFixed(4));
+  const strategyConfidenceFloor = proposal.strategy === "MEAN_REVERSION"
+    ? equityCurveThrottle.confidenceThreshold
+    : proposal.strategy === "TREND_EMA"
+      ? Math.max(0.30, equityCurveThrottle.confidenceThreshold - 0.15)
+      : Math.max(0.34, equityCurveThrottle.confidenceThreshold - 0.12);
 
   let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
-  if (finalConfidence >= Math.max(0.6, equityCurveThrottle.confidenceThreshold + 0.15) && executionAdjustedEdge >= 0.45) confidenceTier = ConfidenceTier.HIGH;
-  else if (finalConfidence >= Math.max(0.48, equityCurveThrottle.confidenceThreshold + 0.05)) confidenceTier = ConfidenceTier.MEDIUM;
-  else if (finalConfidence >= equityCurveThrottle.confidenceThreshold) confidenceTier = ConfidenceTier.LOW;
+  if (finalConfidence >= Math.max(0.6, strategyConfidenceFloor + 0.15) && executionAdjustedEdge >= 0.45) confidenceTier = ConfidenceTier.HIGH;
+  else if (finalConfidence >= Math.max(0.48, strategyConfidenceFloor + 0.05)) confidenceTier = ConfidenceTier.MEDIUM;
+  else if (finalConfidence >= strategyConfidenceFloor) confidenceTier = ConfidenceTier.LOW;
   if (signalProfile.uncertainty > 0.85 || transitionPenalty > 0.45 || heatPenalty > 0.35 || executionState.executionReliability < 0.30 || epistemicState.uncertaintyScore > 0.82 || adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) confidenceTier = ConfidenceTier.REJECT;
 
   const rejectionReasons: string[] = [];
   if (confidenceTier === ConfidenceTier.REJECT) {
-    if (finalConfidence < equityCurveThrottle.confidenceThreshold) rejectionReasons.push("low_confidence");
+    if (finalConfidence < strategyConfidenceFloor) rejectionReasons.push("low_confidence");
     if (signalProfile.uncertainty > 0.75) rejectionReasons.push("extreme_uncertainty");
     if (transitionPenalty > 0.4) rejectionReasons.push("regime_transition");
     if (correlationPenalty > 0.35) rejectionReasons.push("correlation_cluster");
@@ -4410,6 +4501,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   type TickSignalCandidate = {
     isTrend: boolean;
     isPostSpike: boolean;
+    strategy: StrategyKind;
     direction: "LONG" | "SHORT";
     score: number;
     conviction: number;
@@ -4417,12 +4509,15 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     reason: string;
     stopLoss?: number;
     takeProfit?: number;
+    postSpikeRr?: number;
   };
   const signalCandidates: TickSignalCandidate[] = [];
   if (postSpikeSetup) {
-    signalCandidates.push({
+    const postSpikeDirection = postSpikeSetup.direction;
+    if (!isProposalCoolingDown(symbol, "POST_SPIKE_HARVEST", postSpikeDirection)) signalCandidates.push({
       isTrend: false,
       isPostSpike: true,
+      strategy: "POST_SPIKE_HARVEST",
       direction: postSpikeSetup.direction,
       score: 5,
       conviction: 0.82,
@@ -4434,13 +4529,16 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       reason: postSpikeSetup.reason,
       stopLoss: postSpikeSetup.stopLoss,
       takeProfit: postSpikeSetup.takeProfit,
+      postSpikeRr: postSpikeSetup.rewardToRisk,
     });
   }
   if (trendSignalActive) {
-    signalCandidates.push({
+    const trendDirection = trendDir > 0 ? "LONG" : "SHORT";
+    if (!isProposalCoolingDown(symbol, "TREND_EMA", trendDirection)) signalCandidates.push({
       isTrend: true,
       isPostSpike: false,
-      direction: trendDir > 0 ? "LONG" : "SHORT",
+      strategy: "TREND_EMA",
+      direction: trendDirection,
       score: 5,
       conviction: 0.80,
       conditions: [trendReason],
@@ -4449,9 +4547,10 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   }
   const meanReversionScore = Math.round(signalStrength * 10);
   if (signalStrength >= minActivation) {
-    signalCandidates.push({
+    if (!isProposalCoolingDown(symbol, "MEAN_REVERSION", direction)) signalCandidates.push({
       isTrend: false,
       isPostSpike: false,
+      strategy: "MEAN_REVERSION",
       direction,
       score: meanReversionScore,
       conviction: sub.convictionScore !== undefined ? sub.convictionScore : 1.0,
@@ -4473,6 +4572,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let selectedConditions = conditionsList;
     let isTrendProposal = false;
     let isPostSpikeProposal = false;
+    let selectedStrategy: StrategyKind = "MEAN_REVERSION";
     let selectedStopLoss: number | undefined;
     let selectedTakeProfit: number | undefined;
     let auditRes: GovernorDecision | null = null;
@@ -4484,6 +4584,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       selectedConditions = candidate.conditions;
       isTrendProposal = candidate.isTrend;
       isPostSpikeProposal = candidate.isPostSpike;
+      selectedStrategy = candidate.strategy;
       selectedStopLoss = candidate.stopLoss;
       selectedTakeProfit = candidate.takeProfit;
 
@@ -4532,9 +4633,17 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       // ----------------------------------------------------
       // AGENTIC GOVERNOR SCAN (AUDIT VETTING)
       // ----------------------------------------------------
+      const strategySignalProbability = candidate.strategy === "TREND_EMA"
+        ? computeTrendSignalProbability(symbol, proposalDirection, currentPrice, adx, atr, regimeState, proposalConviction, persistenceProbability)
+        : candidate.strategy === "POST_SPIKE_HARVEST" && spikeState
+          ? computePostSpikeSignalProbability(symbol, { rewardToRisk: candidate.postSpikeRr || POST_SPIKE_MIN_RR }, spikeState, regimeState, proposalConviction)
+          : undefined;
+      const shortEma = candidate.strategy === "TREND_EMA" ? ema(prices, TREND_SHORT_EMA) : null;
+      const longEma = candidate.strategy === "TREND_EMA" ? ema(prices, TREND_LONG_EMA) : null;
       const proposal: StrategyProposal = {
         symbol,
         direction: proposalDirection,
+        strategy: candidate.strategy,
         score,
         stake,
         effMode: tickEffMode as any,
@@ -4549,12 +4658,19 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
           price: currentPrice,
           isDivergent: proposalDirection === "LONG" ? checkDivergence(prices, dRsiArr, "BULLISH") : checkDivergence(prices, dRsiArr, "BEARISH"),
           isReversalCandle: checkReversalCandle(candles),
+          signalProbability: strategySignalProbability,
+          trendDir: candidate.strategy === "TREND_EMA" ? trendDir : undefined,
+          emaSeparation: shortEma != null && longEma != null && currentPrice > 0 ? Math.abs(shortEma - longEma) / currentPrice : undefined,
+          postSpikeRr: candidate.postSpikeRr,
+          spikeRecoveryProbability: candidate.strategy === "POST_SPIKE_HARVEST" ? spikeState?.recoveryProbability : undefined,
+          spikeExhaustionProbability: candidate.strategy === "POST_SPIKE_HARVEST" ? spikeState?.spikeExhaustionProbability : undefined,
         }
       };
 
       const candidateAudit = scrutinizeProposal(proposal);
       if (!candidateAudit.approved) {
         logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : isPostSpikeProposal ? "POST_SPIKE " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
+        startProposalCooldown(symbol, candidate.strategy, proposalDirection);
         continue;
       }
       auditRes = candidateAudit;
@@ -4706,6 +4822,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     });
     if (!orderEconomics.approved) {
       logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${proposalDirection} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
+      startProposalCooldown(symbol, selectedStrategy, proposalDirection);
       return;
     }
     stake = orderEconomics.stake;
