@@ -35,6 +35,8 @@ const MAX_RISK_PER_TRADE = 5.00;   // Maximum $5.00 risk per trade
 const MAX_STAKE_PER_TRADE = 10.00; // Hard cap on stake
 const DERIV_MIN_STAKE = 1.00;      // Deriv platform minimum
 const MIN_CONFIDENCE_THRESHOLD = 0.28; // Was likely 0.32 or higher — lowered to 28%
+const MAX_SINGLE_PENALTY = 0.12;
+const MAX_TOTAL_PENALTY = 0.40;
 let tradingEnabled = false;
 let selectedSymbol = "R_75"; // Volatility 75 high-frequency focus
 let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
@@ -4051,8 +4053,43 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const calibrationPenalty = confidenceCalibration.overconfidenceProbability * 0.22 + Math.max(0, 1 - probabilityCalibration.reliabilityScore) * 0.18;
   const epistemicPenalty = epistemicState.uncertaintyScore * 0.22;
   const pathPenalty = pathRisk.confidenceErosion * 0.25;
-  const totalPenalty = Math.min(0.92, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty + calibrationPenalty + epistemicPenalty + pathPenalty);
+  const cappedTransitionPenalty = Math.min(transitionPenalty, MAX_SINGLE_PENALTY);
+  const cappedCorrelationPenalty = Math.min(correlationPenalty, MAX_SINGLE_PENALTY);
+  const cappedVolatilityPenalty = Math.min(volatilityPenalty, MAX_SINGLE_PENALTY);
+  const cappedUncertaintyPenalty = Math.min(uncertaintyPenalty, MAX_SINGLE_PENALTY);
+  const cappedExecutionPenalty = Math.min(executionPenalty, MAX_SINGLE_PENALTY);
+  const cappedHeatPenalty = Math.min(heatPenalty * 0.9, MAX_SINGLE_PENALTY);
+  const cappedAdaptiveDefensivePenalty = Math.min(adaptiveDefensivePenalty, MAX_SINGLE_PENALTY);
+  const cappedCalibrationPenalty = Math.min(calibrationPenalty, MAX_SINGLE_PENALTY);
+  const cappedEpistemicPenalty = Math.min(epistemicPenalty, MAX_SINGLE_PENALTY);
+  const cappedPathPenalty = Math.min(pathPenalty, MAX_SINGLE_PENALTY);
+  const rawTotalPenalty = cappedTransitionPenalty + cappedCorrelationPenalty + cappedVolatilityPenalty + cappedUncertaintyPenalty + cappedExecutionPenalty + cappedHeatPenalty + cappedAdaptiveDefensivePenalty + cappedCalibrationPenalty + cappedEpistemicPenalty + cappedPathPenalty;
+  const totalPenalty = Math.min(rawTotalPenalty, MAX_TOTAL_PENALTY);
   const finalConfidence = parseFloat(Math.max(0.03, baseConfidence * (1 - totalPenalty)).toFixed(4));
+  console.log("[GOVERNOR_CONFIDENCE_BREAKDOWN]", {
+    symbol,
+    direction,
+    rawConfidence: signalProfile.confidence,
+    blendedConfidence,
+    executionAdjustedEdge,
+    baseConfidence,
+    penalties: {
+      transitionPenalty: cappedTransitionPenalty,
+      correlationPenalty: cappedCorrelationPenalty,
+      volatilityPenalty: cappedVolatilityPenalty,
+      uncertaintyPenalty: cappedUncertaintyPenalty,
+      executionPenalty: cappedExecutionPenalty,
+      heatPenalty: cappedHeatPenalty,
+      adaptiveDefensivePenalty: cappedAdaptiveDefensivePenalty,
+      calibrationPenalty: cappedCalibrationPenalty,
+      epistemicPenalty: cappedEpistemicPenalty,
+      pathPenalty: cappedPathPenalty,
+      totalPenalty,
+    },
+    finalConfidence,
+    threshold: MIN_CONFIDENCE_THRESHOLD,
+    verdict: finalConfidence >= MIN_CONFIDENCE_THRESHOLD ? "APPROVE" : "REJECT",
+  });
   const strategyConfidenceFloor = MIN_CONFIDENCE_THRESHOLD;
 
   let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
@@ -4160,18 +4197,26 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     approved,
     confidenceTier,
     finalConfidence,
+    rawConfidence: parseFloat(signalProfile.confidence.toFixed(4)),
+    blendedConfidence,
+    baseConfidence: parseFloat(baseConfidence.toFixed(4)),
+    totalPenalty: parseFloat(totalPenalty.toFixed(4)),
+    calibrationPenalty: parseFloat(calibrationPenalty.toFixed(4)),
+    epistemicPenalty: parseFloat(epistemicPenalty.toFixed(4)),
+    pathPenalty: parseFloat(pathPenalty.toFixed(4)),
     allocatedRisk,
     adjustedLeverage: parseFloat((equityCurveThrottle.leverageScale * candidateHeat.adjustedLeverageScale).toFixed(4)),
     expectedEdge: blendedEdge,
     uncertaintyAdjustedEdge,
     executionAdjustedEdge,
     expectedSharpeImpact,
-    correlationPenalty: parseFloat(correlationPenalty.toFixed(3)),
-    volatilityPenalty: parseFloat(volatilityPenalty.toFixed(3)),
-    executionPenalty: parseFloat(executionPenalty.toFixed(3)),
-    uncertaintyPenalty: parseFloat(uncertaintyPenalty.toFixed(3)),
-    transitionPenalty: parseFloat(transitionPenalty.toFixed(3)),
-    heatPenalty: parseFloat(heatPenalty.toFixed(3)),
+    correlationPenalty: parseFloat(cappedCorrelationPenalty.toFixed(3)),
+    volatilityPenalty: parseFloat(cappedVolatilityPenalty.toFixed(3)),
+    executionPenalty: parseFloat(cappedExecutionPenalty.toFixed(3)),
+    uncertaintyPenalty: parseFloat(cappedUncertaintyPenalty.toFixed(3)),
+    transitionPenalty: parseFloat(cappedTransitionPenalty.toFixed(3)),
+    heatPenalty: parseFloat(cappedHeatPenalty.toFixed(3)),
+    adaptiveDefensivePenalty: parseFloat(cappedAdaptiveDefensivePenalty.toFixed(3)),
     equityCurveState,
     rejectionReasons: rejectionReasons.length ? rejectionReasons : undefined,
   };
@@ -5037,6 +5082,25 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       addProposalEvidence(evidence);
       if (!candidateAudit.approved) {
         console.log(`[VETO_DIAG] symbol=${symbol} conf=${candidateAudit.finalConfidence.toFixed(3)} threshold=${MIN_CONFIDENCE_THRESHOLD} gap=${(MIN_CONFIDENCE_THRESHOLD - candidateAudit.finalConfidence).toFixed(3)}`);
+        console.log(`[GOVERNOR_VETO] ${symbol} ${proposalDirection} REJECTED`, {
+          finalConfidence: candidateAudit.finalConfidence.toFixed(4),
+          threshold: MIN_CONFIDENCE_THRESHOLD,
+          baseConfidence: (candidateAudit.baseConfidence ?? 0).toFixed(4),
+          totalPenalty: (candidateAudit.totalPenalty ?? 0).toFixed(4),
+          penalties: {
+            transition: candidateAudit.transitionPenalty.toFixed(3),
+            correlation: candidateAudit.correlationPenalty.toFixed(3),
+            volatility: candidateAudit.volatilityPenalty.toFixed(3),
+            uncertainty: candidateAudit.uncertaintyPenalty.toFixed(3),
+            execution: candidateAudit.executionPenalty.toFixed(3),
+            heat: candidateAudit.heatPenalty.toFixed(3),
+            adaptiveDefensive: (candidateAudit.adaptiveDefensivePenalty ?? 0).toFixed(3),
+            calibration: (candidateAudit.calibrationPenalty ?? 0).toFixed(3),
+            epistemic: (candidateAudit.epistemicPenalty ?? 0).toFixed(3),
+            path: (candidateAudit.pathPenalty ?? 0).toFixed(3),
+          },
+          reasons: (candidateAudit.rejectionReasons || []).join(","),
+        });
         logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : isPostSpikeProposal ? "POST_SPIKE " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
         startProposalCooldown(symbol, candidate.strategy, proposalDirection);
         continue;

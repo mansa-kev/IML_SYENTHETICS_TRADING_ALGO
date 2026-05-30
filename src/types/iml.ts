@@ -309,6 +309,13 @@ export interface GovernorDecision {
   approved: boolean;
   confidenceTier: ConfidenceTier;
   finalConfidence: number;
+  rawConfidence?: number;
+  blendedConfidence?: number;
+  baseConfidence?: number;
+  totalPenalty?: number;
+  calibrationPenalty?: number;
+  epistemicPenalty?: number;
+  pathPenalty?: number;
   allocatedRisk: number;
   adjustedLeverage: number;
   expectedEdge: number;
@@ -321,6 +328,7 @@ export interface GovernorDecision {
   uncertaintyPenalty: number;
   transitionPenalty: number;
   heatPenalty: number;
+  adaptiveDefensivePenalty?: number;
   equityCurveState: EquityCurveState;
   rejectionReasons?: string[];
 }
