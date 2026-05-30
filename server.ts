@@ -34,6 +34,7 @@ const MIN_RISK_PER_TRADE = 2.50;   // Minimum $2.50 risk per trade
 const MAX_RISK_PER_TRADE = 5.00;   // Maximum $5.00 risk per trade
 const MAX_STAKE_PER_TRADE = 10.00; // Hard cap on stake
 const DERIV_MIN_STAKE = 1.00;      // Deriv platform minimum
+const DERIV_ROUTED_MULTIPLIER_MAX_STAKE = 2.25;
 const MIN_CONFIDENCE_THRESHOLD = 0.28; // Was likely 0.32 or higher — lowered to 28%
 const MAX_SINGLE_PENALTY = 0.12;
 const MAX_TOTAL_PENALTY = 0.40;
@@ -96,6 +97,9 @@ type PendingDerivOrder = {
   requestId: number;
   localId: string;
   symbol: string;
+  engineName?: string;
+  strategy?: StrategyKind;
+  executionTemplate?: ExecutionTemplateKind;
   direction: "LONG" | "SHORT";
   position: ActivePosition;
   requestedAt: number;
@@ -175,20 +179,21 @@ let sessionBlocked = false;
 let sessionStartBalance = 0;
 let circuitBreakerResumeAt = 0;
 let tradingAutoResumePending = false;
+let lossStreakStakeBuffer: number[] = [];
+let aggressivenessReductionUntil = 0;
+let aggressivenessReductionFactor = 1;
 
 // Historical pricing buffers (rolling arrays of size 2000)
 const maxBufferLength = 2000;
 const tickBuffers: Record<string, number[]> = {
   R_25: [],
   R_75: [],
-  CRASH500: [],
   BOOM500: [],
 };
 
 const candleBuffers: Record<string, Candle[]> = {
   R_25: [],
   R_75: [],
-  CRASH500: [],
   BOOM500: [],
 };
 
@@ -196,6 +201,94 @@ const candleBuffers: Record<string, Candle[]> = {
 // CENTRAL GOVERNOR & DUAL-TIER TRADING ENGINES (AGENTIC UPGRADE)
 // ==========================================
 type StrategyKind = "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
+type ExecutionTemplateKind = "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
+type StrategyExitProfile = {
+  targetMultiple: number;
+  hybridBreakEvenR: number;
+  hybridTrailR: number;
+  multiplierBreakEvenProgress: number;
+  multiplierProfitLockShare: number;
+  multiplierTrailShare: number;
+};
+
+const ENGINE_METADATA: Record<string, { engineName: string; strategyAssignment: StrategyKind; executionTemplate: ExecutionTemplateKind; descriptor: string }> = {
+  R_25: {
+    engineName: "Atlas Reversion Engine",
+    strategyAssignment: "MEAN_REVERSION",
+    executionTemplate: "REVERSION_BOUNDED",
+    descriptor: "Mean Reversion Specialist",
+  },
+  R_75: {
+    engineName: "Vector Trend Engine",
+    strategyAssignment: "TREND_EMA",
+    executionTemplate: "TREND_MULTIPLIER",
+    descriptor: "Trend Continuation Specialist",
+  },
+  BOOM500: {
+    engineName: "Pulse Spike Harvest Engine",
+    strategyAssignment: "POST_SPIKE_HARVEST",
+    executionTemplate: "SPIKE_EVENT_BOUNDED",
+    descriptor: "Post-Spike Harvest Specialist",
+  },
+};
+
+function getEngineMetadata(symbol: string) {
+  return ENGINE_METADATA[symbol] || {
+    engineName: symbol,
+    strategyAssignment: "MEAN_REVERSION" as StrategyKind,
+    executionTemplate: "REVERSION_BOUNDED" as ExecutionTemplateKind,
+    descriptor: "Generalist Engine",
+  };
+}
+
+function isStrategyAllowedForSymbol(symbol: string, strategy: StrategyKind): boolean {
+  return getEngineMetadata(symbol).strategyAssignment === strategy;
+}
+
+function getEmbeddedTradeType(symbol: string): "MULTIPLIER" | "HYBRID_LINEAR" {
+  return getEngineMetadata(symbol).executionTemplate === "TREND_MULTIPLIER" ? "MULTIPLIER" : "HYBRID_LINEAR";
+}
+
+function getStrategyExitProfile(strategy: StrategyKind): StrategyExitProfile {
+  switch (strategy) {
+    case "MEAN_REVERSION":
+      return {
+        targetMultiple: 1.45,
+        hybridBreakEvenR: 0.55,
+        hybridTrailR: 0.80,
+        multiplierBreakEvenProgress: 0.35,
+        multiplierProfitLockShare: 0.02,
+        multiplierTrailShare: 0.45,
+      };
+    case "TREND_EMA":
+      return {
+        targetMultiple: 2.60,
+        hybridBreakEvenR: 0.90,
+        hybridTrailR: 1.35,
+        multiplierBreakEvenProgress: 0.45,
+        multiplierProfitLockShare: 0.08,
+        multiplierTrailShare: 0.60,
+      };
+    case "POST_SPIKE_HARVEST":
+      return {
+        targetMultiple: 2.10,
+        hybridBreakEvenR: 0.40,
+        hybridTrailR: 0.90,
+        multiplierBreakEvenProgress: 0.30,
+        multiplierProfitLockShare: 0.04,
+        multiplierTrailShare: 0.35,
+      };
+    default:
+      return {
+        targetMultiple: 1.80,
+        hybridBreakEvenR: hybridGreeningTriggerPct,
+        hybridTrailR: 1.0,
+        multiplierBreakEvenProgress: 0.20,
+        multiplierProfitLockShare: 0.05,
+        multiplierTrailShare: 0.25,
+      };
+  }
+}
 
 interface StrategyProposal {
   symbol: string;
@@ -233,7 +326,9 @@ interface ProposalEvidenceRecord {
   createdAt: number;
   epoch: number;
   symbol: string;
+  engineName?: string;
   strategy: StrategyKind;
+  executionTemplate?: ExecutionTemplateKind;
   direction: "LONG" | "SHORT";
   effMode: "MULTIPLIER" | "HYBRID_LINEAR";
   score: number;
@@ -375,7 +470,7 @@ function computeMLQualityScore(symbol: string, strategy: StrategyKind, direction
     if (!bucket || bucket.samples <= 0) return;
     const posteriorWinRate = (bucket.wins + 2) / (bucket.wins + bucket.losses + 4);
     const pnlTilt = Math.max(-0.12, Math.min(0.12, bucket.netPnl / Math.max(10, bucket.samples * 2) * 0.05));
-    const rejectionDrag = Math.min(0.12, (bucket.rejected + bucket.brokerRejected) / Math.max(1, bucket.samples) * 0.08);
+    const rejectionDrag = Math.min(0.12, bucket.rejected / Math.max(1, bucket.samples) * 0.08);
     const localScore = clamp01(posteriorWinRate + pnlTilt - rejectionDrag);
     const weight = [1.0, 0.55, 0.35, 0.20][index] || 0.1;
     weightedScore += localScore * weight * Math.min(1, bucket.samples / 20);
@@ -405,12 +500,16 @@ function updateEvidenceBucket(record: ProposalEvidenceRecord, outcome: ProposalO
     bucket.avgConfidence = parseFloat((((bucket.avgConfidence * (bucket.samples - 1)) + record.confidence) / bucket.samples).toFixed(4));
     bucket.avgEdge = parseFloat((((bucket.avgEdge * (bucket.samples - 1)) + record.expectedEdge) / bucket.samples).toFixed(4));
     bucket.lastUpdatedEpoch = epoch;
+    if (supabaseClient) {
+      saveMLEvidenceBucketToSupabase(bucket);
+    }
   });
 }
 
 function createProposalEvidenceRecord(proposal: StrategyProposal, decision: GovernorDecision, regimeState: RegimeState): ProposalEvidenceRecord {
   const indicators = proposal.indicators;
   const symbolPrices = tickBuffers[proposal.symbol] || [];
+  const engineMeta = getEngineMetadata(proposal.symbol);
   const price = indicators.price || symbolPrices[symbolPrices.length - 1] || INSTRUMENTS[proposal.symbol as keyof typeof INSTRUMENTS]?.basePrice || 1;
   const expectedRR = proposal.strategy === "POST_SPIKE_HARVEST" ? (indicators.postSpikeRr || POST_SPIKE_MIN_RR) : proposal.effMode === "HYBRID_LINEAR" ? hybridRewardRatio : 1.6;
   const stopDistance = Math.max(price * 0.003, (indicators.atr || 1) * (subAlgorithms[proposal.symbol]?.atrStopMultiplier || currentParams.atrStopMultiplier || 2));
@@ -422,7 +521,9 @@ function createProposalEvidenceRecord(proposal: StrategyProposal, decision: Gove
     createdAt: Date.now(),
     epoch: Math.floor(Date.now() / 1000),
     symbol: proposal.symbol,
+    engineName: engineMeta.engineName,
     strategy: proposal.strategy,
+    executionTemplate: engineMeta.executionTemplate,
     direction: proposal.direction,
     effMode: proposal.effMode,
     score: proposal.score,
@@ -461,6 +562,9 @@ function createProposalEvidenceRecord(proposal: StrategyProposal, decision: Gove
 function addProposalEvidence(record: ProposalEvidenceRecord) {
   proposalEvidenceStore.push(record);
   if (proposalEvidenceStore.length > 1500) proposalEvidenceStore.splice(0, proposalEvidenceStore.length - 1500);
+  if (supabaseClient) {
+    saveProposalEvidenceToSupabase(record);
+  }
   scheduleStateSaveToSupabase();
 }
 
@@ -471,6 +575,9 @@ function resolveProposalEvidence(record: ProposalEvidenceRecord, outcome: Propos
   record.status = status;
   record.resolvedAt = Date.now();
   updateEvidenceBucket(record, outcome, pnl, epoch);
+  if (supabaseClient) {
+    saveProposalEvidenceToSupabase(record);
+  }
   scheduleStateSaveToSupabase();
 }
 
@@ -559,7 +666,7 @@ const governorMemory: {
 const CORRELATION_CLUSTERS: Record<string, string[]> = {
   MEAN_REVERSION_CLUSTER: ["R_25"],
   HIGH_VOL_CLUSTER: ["R_75"],
-  EVENT_RISK_CLUSTER: ["BOOM500", "CRASH500"],
+  EVENT_RISK_CLUSTER: ["BOOM500"],
 };
 
 const CLUSTER_HEAT_CAPS: Record<string, number> = {
@@ -569,10 +676,9 @@ const CLUSTER_HEAT_CAPS: Record<string, number> = {
 };
 
 const CORRELATION_PRIORS: Record<string, Record<string, number>> = {
-  R_25: { R_25: 1.00, R_75: 0.38, CRASH500: 0.15, BOOM500: 0.12 },
-  R_75: { R_25: 0.38, R_75: 1.00, CRASH500: 0.22, BOOM500: 0.18 },
-  CRASH500: { R_25: 0.15, R_75: 0.22, CRASH500: 1.00, BOOM500: -0.40 },
-  BOOM500: { R_25: 0.12, R_75: 0.18, CRASH500: -0.40, BOOM500: 1.00 },
+  R_25: { R_25: 1.00, R_75: 0.38, BOOM500: 0.12 },
+  R_75: { R_25: 0.38, R_75: 1.00, BOOM500: 0.18 },
+  BOOM500: { R_25: 0.12, R_75: 0.18, BOOM500: 1.00 },
 };
 
 let executionHealth: ExecutionHealth = {
@@ -1425,6 +1531,17 @@ function deriveEffectiveDerivMultiplier(requestedMultiplier?: number): number {
   return DERIV_SUPPORTED_MULTIPLIERS.filter(m => m <= capped).pop() ?? DERIV_SUPPORTED_MULTIPLIERS[0];
 }
 
+function getExecutableStakeCapForProposal(proposal: Pick<StrategyProposal, "effMode">): number {
+  if (proposal.effMode === "MULTIPLIER" || proposal.effMode === "HYBRID_LINEAR") {
+    return Math.min(MAX_STAKE_PER_TRADE, DERIV_ROUTED_MULTIPLIER_MAX_STAKE);
+  }
+  return MAX_STAKE_PER_TRADE;
+}
+
+function getExecutableRiskFloorForProposal(proposal: Pick<StrategyProposal, "effMode">): number {
+  return Math.max(MIN_EXECUTABLE_RISK_USD, Math.min(MIN_RISK_PER_TRADE, getExecutableStakeCapForProposal(proposal)));
+}
+
 function computeRiskBudget(symbol: string, governorConfidenceScale = 1): { accountRiskBudget: number; symbolRiskBudget: number; portfolioRemainingRisk: number; executionHealthScale: number; riskBudget: number } {
   const equity = Math.max(0, balance);
   const caps = getRiskBudgetCaps(equity);
@@ -1463,8 +1580,8 @@ function assertFinalRiskAuthority(finalRisk: number, governorAllocatedRisk: numb
 }
 
 function shouldUseMinimumExecutableRiskFloor(proposal: StrategyProposal, finalConfidence: number, signalProfile: ExtendedSignalProbability, portfolioRisk: PortfolioRiskState): boolean {
-  if (proposal.effMode !== "HYBRID_LINEAR") return false;
   if (proposal.strategy === "MEAN_REVERSION") return false;
+  if (proposal.effMode !== "HYBRID_LINEAR" && proposal.effMode !== "MULTIPLIER") return false;
   if (finalConfidence < MIN_CONFIDENCE_THRESHOLD) return false;
   if (signalProfile.expectedEdge < 0.50) return false;
   if (signalProfile.uncertainty > 0.65) return false;
@@ -1510,6 +1627,9 @@ function buildCanonicalExposureModel(input: { equity: number; stake: number; eff
 function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   const caps = getRiskBudgetCaps(balance);
   let stake = Math.max(0, context.stake);
+  const executableStakeCap = (context.riskModel === "DOLLAR_LIMIT" || context.effectiveMultiplier > 1)
+    ? Math.min(MAX_STAKE_PER_TRADE, DERIV_ROUTED_MULTIPLIER_MAX_STAKE)
+    : MAX_STAKE_PER_TRADE;
   const rejectionReasons: string[] = [];
   const minRiskBudget = Math.max(0, Math.min(
     context.governorAllocatedRisk,
@@ -1524,9 +1644,9 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
     console.log(`[ORDER_PREFLIGHT_REJECT] ${context.symbol} stake=${stake.toFixed(4)} below Deriv minimum ${DERIV_MIN_STAKE} — skipping (governor risk budget too low)`);
     rejectionReasons.push("stake_below_deriv_minimum");
   }
-  if (stake > MAX_STAKE_PER_TRADE) {
-    stake = MAX_STAKE_PER_TRADE;
-    console.log(`[ORDER_PREFLIGHT_CAP] ${context.symbol} stake capped at $${MAX_STAKE_PER_TRADE}`);
+  if (stake > executableStakeCap) {
+    stake = executableStakeCap;
+    console.log(`[ORDER_PREFLIGHT_CAP] ${context.symbol} stake capped at $${executableStakeCap.toFixed(2)}`);
   }
 
   let model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
@@ -1557,7 +1677,7 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   if (adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) rejectionReasons.push(`autonomous_state_${adaptiveIntelligenceState.autonomousState}`);
   if (epistemicScore > 0.85) rejectionReasons.push("epistemic_uncertainty_above_live_threshold");
   if (activePositions.length >= caps.maxPositions) rejectionReasons.push("account_position_limit_reached");
-  if ((caps.mode === "NANO" || caps.mode === "MICRO") && ["BOOM500", "CRASH500"].includes(context.symbol)) rejectionReasons.push("micro_account_boom_crash_disabled");
+  if ((caps.mode === "NANO" || caps.mode === "MICRO") && context.symbol === "BOOM500") rejectionReasons.push("micro_account_boom_disabled");
   if ((caps.mode === "NANO" || caps.mode === "MICRO") && hybridRiskType === "FIXED") rejectionReasons.push("micro_account_fixed_risk_disabled");
   if (context.effectiveMultiplier > caps.maxMultiplier) rejectionReasons.push("effective_multiplier_exceeds_account_cap");
   if (!Number.isFinite(model.maxLossAmount) || !Number.isFinite(model.targetRewardAmount)) rejectionReasons.push("invalid_order_economics");
@@ -1642,6 +1762,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
   const pathRisk = adaptiveIntelligenceState.pathRisk ?? computePathDependentRiskState();
   const survival = adaptiveIntelligenceState.survivalEquity ?? computeSurvivalEquityCurveState();
   const defensiveScale = Math.min(executionState.executionRiskMultiplier, transitionState.adaptiveRiskMultiplier, pathRisk.adaptiveDefensiveScale, survival.adaptiveAggressionScale);
+  const aggressivenessFactor = getCurrentAggressivenessReductionFactor();
   const thresholdPenalty = (1 - defensiveScale) * 0.16;
   const heatContraction = Math.max(0.30, defensiveScale);
   let state: EquityCurveState = EquityCurveState.NORMAL;
@@ -1663,7 +1784,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
         confidenceThreshold: parseFloat(Math.min(0.82, 0.42 + thresholdPenalty).toFixed(4)),
         portfolioHeatCap: parseFloat((0.7 * heatContraction).toFixed(4)),
         maxPositionDurationScale: parseFloat(Math.max(0.35, 1.1 * defensiveScale).toFixed(4)),
-        tradeAggressiveness: parseFloat(Math.min(1.1, 1.1 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat((Math.min(1.1, 1.1 * defensiveScale) * aggressivenessFactor).toFixed(4)),
       };
     case EquityCurveState.RECOVERY:
       return {
@@ -1672,7 +1793,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
         confidenceThreshold: parseFloat(Math.min(0.82, 0.46 + thresholdPenalty).toFixed(4)),
         portfolioHeatCap: parseFloat((0.6 * heatContraction).toFixed(4)),
         maxPositionDurationScale: parseFloat(Math.max(0.35, 0.95 * defensiveScale).toFixed(4)),
-        tradeAggressiveness: parseFloat(Math.min(0.95, 0.95 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat((Math.min(0.95, 0.95 * defensiveScale) * aggressivenessFactor).toFixed(4)),
       };
     case EquityCurveState.SOFT_DRAWDOWN:
       return {
@@ -1681,7 +1802,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
         confidenceThreshold: parseFloat(Math.min(0.82, 0.5 + thresholdPenalty).toFixed(4)),
         portfolioHeatCap: parseFloat((0.5 * heatContraction).toFixed(4)),
         maxPositionDurationScale: parseFloat(Math.max(0.35, 0.8 * defensiveScale).toFixed(4)),
-        tradeAggressiveness: parseFloat(Math.min(0.75, 0.75 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat((Math.min(0.75, 0.75 * defensiveScale) * aggressivenessFactor).toFixed(4)),
       };
     case EquityCurveState.HARD_DRAWDOWN:
       return {
@@ -1690,7 +1811,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
         confidenceThreshold: parseFloat(Math.min(0.88, 0.58 + thresholdPenalty).toFixed(4)),
         portfolioHeatCap: parseFloat((0.35 * heatContraction).toFixed(4)),
         maxPositionDurationScale: parseFloat(Math.max(0.30, 0.65 * defensiveScale).toFixed(4)),
-        tradeAggressiveness: parseFloat(Math.min(0.55, 0.55 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat((Math.min(0.55, 0.55 * defensiveScale) * aggressivenessFactor).toFixed(4)),
       };
     default:
       return {
@@ -1699,7 +1820,7 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
         confidenceThreshold: parseFloat(Math.min(0.82, 0.45 + thresholdPenalty).toFixed(4)),
         portfolioHeatCap: parseFloat((0.65 * heatContraction).toFixed(4)),
         maxPositionDurationScale: parseFloat(Math.max(0.35, 1 * defensiveScale).toFixed(4)),
-        tradeAggressiveness: parseFloat(Math.min(1, 1 * defensiveScale).toFixed(4)),
+        tradeAggressiveness: parseFloat((Math.min(1, 1 * defensiveScale) * aggressivenessFactor).toFixed(4)),
       };
   }
 }
@@ -1708,8 +1829,10 @@ function deriveEquityCurveThrottle(riskState: PortfolioRiskState): EquityCurveTh
 const subAlgorithms: Record<string, SubAlgorithm> = {
   R_25: {
     symbol: "R_25",
-    name: "Volatility 25 (1s)",
-    personality: "Sentinel Divergence Sniper",
+    name: "Atlas Reversion Engine",
+    personality: "Mean Reversion Specialist",
+    strategyAssignment: "MEAN_REVERSION",
+    executionTemplate: "REVERSION_BOUNDED",
     enabled: true,
     rsiOversoldThreshold: 31,
     rsiOverboughtThreshold: 69,
@@ -1741,8 +1864,10 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
   },
   R_75: {
     symbol: "R_75",
-    name: "Volatility 75 (1s)",
-    personality: "Apex Volatility HFT Scalar",
+    name: "Vector Trend Engine",
+    personality: "Trend Continuation Specialist",
+    strategyAssignment: "TREND_EMA",
+    executionTemplate: "TREND_MULTIPLIER",
     enabled: true,
     rsiOversoldThreshold: 32,
     rsiOverboughtThreshold: 68,
@@ -1772,43 +1897,12 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     confluenceScore: 0,
     mRegime: MarketRegime.TRANSITION,
   },
-  CRASH500: {
-    symbol: "CRASH500",
-    name: "Crash 500 Index",
-    personality: "Crash Extreme Recovery Scalar",
-    enabled: true,
-    rsiOversoldThreshold: 22,
-    rsiOverboughtThreshold: 75,
-    bbPeriod: 20,
-    bbStd: 2.75,
-    minConfluenceScore: 2,
-    atrStopMultiplier: 3.25,
-    learningAdjustmentFactor: 1.0,
-    targetRiskStakeMultiplier: 0.75,
-    cooldownUntil: 0,
-    directiveMessage: "INITIALIZING STANDBY PILOT",
-    recentWinRate: 0.5,
-    targetLossPct: 0.20,
-    timeExitEnabled: true,
-    breakEvenEnabled: true,
-    trailingStopEnabled: true,
-    maxTicksInTrade: 180,
-    totalTrades: 0,
-    winningTrades: 0,
-    totalPnl: 0,
-    consecutiveLosses: 0,
-    consecutiveWins: 0,
-    rsiVal: 50,
-    bbPct: 0.5,
-    adxVal: 15,
-    atrVal: 0,
-    confluenceScore: 0,
-    mRegime: MarketRegime.TRANSITION,
-  },
   BOOM500: {
     symbol: "BOOM500",
-    name: "Boom 500 Index",
-    personality: "Boom Consolidator Ridge Sniper",
+    name: "Pulse Spike Harvest Engine",
+    personality: "Post-Spike Harvest Specialist",
+    strategyAssignment: "POST_SPIKE_HARVEST",
+    executionTemplate: "SPIKE_EVENT_BOUNDED",
     enabled: true,
     rsiOversoldThreshold: 25,
     rsiOverboughtThreshold: 78,
@@ -1913,11 +2007,15 @@ function logSupabaseRLSInstructions() {
     `-- Disable RLS if you only use this project privately for the bot:`,
     `ALTER TABLE iml_state DISABLE ROW LEVEL SECURITY;`,
     `ALTER TABLE iml_trades DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE iml_proposal_evidence DISABLE ROW LEVEL SECURITY;`,
+    `ALTER TABLE iml_ml_evidence_buckets DISABLE ROW LEVEL SECURITY;`,
     `ALTER TABLE iml_strategy_history DISABLE ROW LEVEL SECURITY;`,
     ``,
     `-- OR, create an open policy for the bot:`,
     `CREATE POLICY "Allow all operations for anon" ON iml_state FOR ALL USING (true) WITH CHECK (true);`,
     `CREATE POLICY "Allow all operations for anon" ON iml_trades FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON iml_proposal_evidence FOR ALL USING (true) WITH CHECK (true);`,
+    `CREATE POLICY "Allow all operations for anon" ON iml_ml_evidence_buckets FOR ALL USING (true) WITH CHECK (true);`,
     `CREATE POLICY "Allow all operations for anon" ON iml_strategy_history FOR ALL USING (true) WITH CHECK (true);`,
     ``,
     `Alternatively, place your SUPABASE_SERVICE_ROLE_KEY into the Environment logic instead of SUPABASE_ANON_KEY to fully bypass RLS.`
@@ -1933,7 +2031,7 @@ function logSupabaseSetupInstructions() {
   lastInstructionLogged = now;
   
   const instruction = [
-    `[SUPABASE] ⚠️ Table 'iml_state' or 'iml_trades' does not exist yet.`,
+    `[SUPABASE] ⚠️ One or more required Supabase tables do not exist yet.`,
     `Please run the following SQL schema in your Supabase SQL Editor to enable full session cloud backups:`,
     ``,
     `CREATE TABLE IF NOT EXISTS iml_state (`,
@@ -1945,6 +2043,9 @@ function logSupabaseSetupInstructions() {
     `CREATE TABLE IF NOT EXISTS iml_trades (`,
     `  id text PRIMARY KEY,`,
     `  symbol text NOT NULL,`,
+    `  engine_name text,`,
+    `  strategy_tag text,`,
+    `  execution_template text,`,
     `  contract_type text,`,
     `  direction text NOT NULL,`,
     `  entry_epoch bigint,`,
@@ -1957,12 +2058,86 @@ function logSupabaseSetupInstructions() {
     `  rsi_at_entry numeric,`,
     `  bb_pct_at_entry numeric,`,
     `  adx_at_entry numeric,`,
+    `  atr_at_entry numeric,`,
     `  regime_at_entry text,`,
+    `  conditions_met jsonb DEFAULT '[]'::jsonb,`,
     `  is_hybrid_linear boolean DEFAULT false,`,
     `  target_risk_amount numeric,`,
     `  hybrid_position_size numeric,`,
+    `  max_adverse_excursion numeric,`,
+    `  deriv_close_confirmed boolean DEFAULT false,`,
+    `  derived_sharpe_contribution numeric,`,
+    `  entry_signal_probability numeric,`,
+    `  entry_expected_edge numeric,`,
+    `  entry_expected_sharpe_impact numeric,`,
+    `  proposal_evidence_id text,`,
     `  tick_stream jsonb,`,
     `  created_at timestamp with time zone DEFAULT now()`,
+    `);`,
+    ``,
+    `CREATE TABLE IF NOT EXISTS iml_proposal_evidence (`,
+    `  id text PRIMARY KEY,`,
+    `  created_at timestamp with time zone DEFAULT now(),`,
+    `  epoch bigint NOT NULL,`,
+    `  symbol text NOT NULL,`,
+    `  engine_name text,`,
+    `  strategy text NOT NULL,`,
+    `  execution_template text,`,
+    `  direction text NOT NULL,`,
+    `  eff_mode text NOT NULL,`,
+    `  score numeric,`,
+    `  conviction numeric,`,
+    `  confidence numeric,`,
+    `  expected_edge numeric,`,
+    `  expected_sharpe_impact numeric,`,
+    `  ml_quality_score numeric,`,
+    `  ml_sample_size integer,`,
+    `  regime_bucket text,`,
+    `  confidence_bucket text,`,
+    `  adx_bucket text,`,
+    `  context_key text,`,
+    `  price numeric,`,
+    `  rsi numeric,`,
+    `  adx numeric,`,
+    `  atr numeric,`,
+    `  bb_pct numeric,`,
+    `  ema_separation numeric,`,
+    `  trend_dir numeric,`,
+    `  transition_probability numeric,`,
+    `  trend_probability numeric,`,
+    `  mean_reversion_probability numeric,`,
+    `  governor_approved boolean,`,
+    `  governor_tier text,`,
+    `  governor_reasons jsonb DEFAULT '[]'::jsonb,`,
+    `  allocated_risk numeric,`,
+    `  preflight_approved boolean,`,
+    `  preflight_reasons jsonb DEFAULT '[]'::jsonb,`,
+    `  max_loss_amount numeric,`,
+    `  target_reward_amount numeric,`,
+    `  reward_to_risk numeric,`,
+    `  status text NOT NULL,`,
+    `  linked_position_id text,`,
+    `  outcome text,`,
+    `  outcome_pnl numeric,`,
+    `  resolved_at timestamp with time zone,`,
+    `  shadow_stop_price numeric,`,
+    `  shadow_target_price numeric,`,
+    `  shadow_expires_epoch bigint,`,
+    `  model_version text`,
+    `);`,
+    ``,
+    `CREATE TABLE IF NOT EXISTS iml_ml_evidence_buckets (`,
+    `  key text PRIMARY KEY,`,
+    `  samples integer NOT NULL DEFAULT 0,`,
+    `  wins integer NOT NULL DEFAULT 0,`,
+    `  losses integer NOT NULL DEFAULT 0,`,
+    `  rejected integer NOT NULL DEFAULT 0,`,
+    `  broker_rejected integer NOT NULL DEFAULT 0,`,
+    `  net_pnl numeric NOT NULL DEFAULT 0,`,
+    `  avg_confidence numeric NOT NULL DEFAULT 0,`,
+    `  avg_edge numeric NOT NULL DEFAULT 0,`,
+    `  last_updated_epoch bigint,`,
+    `  updated_at timestamp with time zone DEFAULT now()`,
     `);`,
     ``,
     `CREATE TABLE IF NOT EXISTS iml_strategy_history (`,
@@ -2208,6 +2383,107 @@ async function saveStrategyHistoryToSupabase() {
   }
 }
 
+async function saveProposalEvidenceToSupabase(record: ProposalEvidenceRecord) {
+  if (!supabaseClient) return;
+  try {
+    const { error } = await supabaseClient
+      .from("iml_proposal_evidence")
+      .upsert({
+        id: record.id,
+        created_at: new Date(record.createdAt).toISOString(),
+        epoch: record.epoch,
+        symbol: record.symbol,
+        engine_name: record.engineName || null,
+        strategy: record.strategy,
+        execution_template: record.executionTemplate || null,
+        direction: record.direction,
+        eff_mode: record.effMode,
+        score: record.score,
+        conviction: record.conviction,
+        confidence: record.confidence,
+        expected_edge: record.expectedEdge,
+        expected_sharpe_impact: record.expectedSharpeImpact,
+        ml_quality_score: record.mlQualityScore,
+        ml_sample_size: record.mlSampleSize,
+        regime_bucket: record.regimeBucket,
+        confidence_bucket: record.confidenceBucket,
+        adx_bucket: record.adxBucket,
+        context_key: record.contextKey,
+        price: record.price,
+        rsi: record.rsi,
+        adx: record.adx,
+        atr: record.atr,
+        bb_pct: record.bbPct,
+        ema_separation: record.emaSeparation ?? null,
+        trend_dir: record.trendDir ?? null,
+        transition_probability: record.transitionProbability,
+        trend_probability: record.trendProbability,
+        mean_reversion_probability: record.meanReversionProbability,
+        governor_approved: record.governorApproved ?? null,
+        governor_tier: record.governorTier ?? null,
+        governor_reasons: record.governorReasons || [],
+        allocated_risk: record.allocatedRisk ?? null,
+        preflight_approved: record.preflightApproved ?? null,
+        preflight_reasons: record.preflightReasons || [],
+        max_loss_amount: record.maxLossAmount ?? null,
+        target_reward_amount: record.targetRewardAmount ?? null,
+        reward_to_risk: record.rewardToRisk ?? null,
+        status: record.status,
+        linked_position_id: record.linkedPositionId ?? null,
+        outcome: record.outcome ?? null,
+        outcome_pnl: record.outcomePnl ?? null,
+        resolved_at: record.resolvedAt ? new Date(record.resolvedAt).toISOString() : null,
+        shadow_stop_price: record.shadowStopPrice,
+        shadow_target_price: record.shadowTargetPrice,
+        shadow_expires_epoch: record.shadowExpiresEpoch,
+        model_version: record.modelVersion,
+      }, { onConflict: "id" });
+    if (error) {
+      if (isMissingTableError(error)) {
+        logSupabaseSetupInstructions();
+      } else if (isRLSError(error)) {
+        logSupabaseRLSInstructions();
+      } else {
+        console.error("[SUPABASE_PROPOSAL_EVIDENCE_ERROR]", error.message);
+      }
+    }
+  } catch (err: any) {
+    console.error("[SUPABASE_PROPOSAL_EVIDENCE_ERROR] Exception saving proposal evidence:", err);
+  }
+}
+
+async function saveMLEvidenceBucketToSupabase(bucket: OnlineEvidenceBucket) {
+  if (!supabaseClient) return;
+  try {
+    const { error } = await supabaseClient
+      .from("iml_ml_evidence_buckets")
+      .upsert({
+        key: bucket.key,
+        samples: bucket.samples,
+        wins: bucket.wins,
+        losses: bucket.losses,
+        rejected: bucket.rejected,
+        broker_rejected: bucket.brokerRejected,
+        net_pnl: bucket.netPnl,
+        avg_confidence: bucket.avgConfidence,
+        avg_edge: bucket.avgEdge,
+        last_updated_epoch: bucket.lastUpdatedEpoch,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: "key" });
+    if (error) {
+      if (isMissingTableError(error)) {
+        logSupabaseSetupInstructions();
+      } else if (isRLSError(error)) {
+        logSupabaseRLSInstructions();
+      } else {
+        console.error("[SUPABASE_ML_BUCKET_ERROR]", error.message);
+      }
+    }
+  } catch (err: any) {
+    console.error("[SUPABASE_ML_BUCKET_ERROR] Exception saving ml evidence bucket:", err);
+  }
+}
+
 async function saveTradeToSupabase(record: TradeRecord) {
   if (!supabaseClient) return;
   try {
@@ -2216,6 +2492,9 @@ async function saveTradeToSupabase(record: TradeRecord) {
       .upsert({
         id: record.id,
         symbol: record.symbol,
+        engine_name: record.engineName || null,
+        strategy_tag: record.strategyTag || null,
+        execution_template: record.executionTemplate || null,
         contract_type: record.contractType,
         direction: record.direction,
         entry_epoch: record.entryEpoch,
@@ -2228,10 +2507,19 @@ async function saveTradeToSupabase(record: TradeRecord) {
         rsi_at_entry: record.rsiAtEntry,
         bb_pct_at_entry: record.bbPctAtEntry,
         adx_at_entry: record.adxAtEntry,
+        atr_at_entry: record.atrAtEntry,
         regime_at_entry: record.regimeAtEntry,
+        conditions_met: record.conditionsMet || [],
         is_hybrid_linear: record.isHybridLinear || false,
         target_risk_amount: record.targetRiskAmount || null,
         hybrid_position_size: record.hybridPositionSize || null,
+        max_adverse_excursion: record.maxAdverseExcursion ?? null,
+        deriv_close_confirmed: record.derivCloseConfirmed ?? false,
+        derived_sharpe_contribution: record.derivedSharpeContribution ?? null,
+        entry_signal_probability: record.entrySignalProbability ?? null,
+        entry_expected_edge: record.entryExpectedEdge ?? null,
+        entry_expected_sharpe_impact: record.entryExpectedSharpeImpact ?? null,
+        proposal_evidence_id: record.proposalEvidenceId ?? null,
         tick_stream: record.tickStreamSnapshot || [],
         created_at: new Date().toISOString()
       });
@@ -2261,6 +2549,9 @@ async function bulkSyncTradesToSupabase() {
     const batch = uniqueTrades.slice(i, i + BATCH).map(record => ({
       id: record.id,
       symbol: record.symbol,
+      engine_name: record.engineName || null,
+      strategy_tag: record.strategyTag || null,
+      execution_template: record.executionTemplate || null,
       contract_type: record.contractType,
       direction: record.direction,
       entry_epoch: record.entryEpoch,
@@ -2273,10 +2564,19 @@ async function bulkSyncTradesToSupabase() {
       rsi_at_entry: record.rsiAtEntry,
       bb_pct_at_entry: record.bbPctAtEntry,
       adx_at_entry: record.adxAtEntry,
+      atr_at_entry: record.atrAtEntry,
       regime_at_entry: record.regimeAtEntry,
+      conditions_met: record.conditionsMet || [],
       is_hybrid_linear: record.isHybridLinear || false,
       target_risk_amount: record.targetRiskAmount || null,
       hybrid_position_size: record.hybridPositionSize || null,
+      max_adverse_excursion: record.maxAdverseExcursion ?? null,
+      deriv_close_confirmed: record.derivCloseConfirmed ?? false,
+      derived_sharpe_contribution: record.derivedSharpeContribution ?? null,
+      entry_signal_probability: record.entrySignalProbability ?? null,
+      entry_expected_edge: record.entryExpectedEdge ?? null,
+      entry_expected_sharpe_impact: record.entryExpectedSharpeImpact ?? null,
+      proposal_evidence_id: record.proposalEvidenceId ?? null,
       tick_stream: record.tickStreamSnapshot || [],
     }));
     try {
@@ -2467,14 +2767,12 @@ runSystemBootstrap();
 const INSTRUMENTS = {
   R_25: { name: "Volatility 25 (1s)", volatility: 0.28, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 250.0 },
   R_75: { name: "Volatility 75 (1s)", volatility: 0.85, tickType: "std", idealStrategy: "breakout", basePrice: 750.0 },
-  CRASH500: { name: "Crash 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
   BOOM500: { name: "Boom 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
 };
 
 const INSTRUMENT_PRIORS: Record<string, { confidence: number; expectedEdge: number; sharpe: number }> = {
   R_25: { confidence: 0.52, expectedEdge: 0.46, sharpe: 0.55 },
   R_75: { confidence: 0.51, expectedEdge: 0.47, sharpe: 0.58 },
-  CRASH500: { confidence: 0.50, expectedEdge: 0.44, sharpe: 0.50 },
   BOOM500: { confidence: 0.50, expectedEdge: 0.44, sharpe: 0.50 },
 };
 
@@ -2649,7 +2947,6 @@ class DerivLiveBridge {
     const map: Record<string, string> = {
       R_25: "1HZ25V",
       R_75: "1HZ75V",
-      CRASH500: "CRASH500",
       BOOM500: "BOOM500",
     };
     return map[symbol] || symbol;
@@ -2677,7 +2974,10 @@ class DerivLiveBridge {
           }
           delete pendingProposalEvidenceByPosition[pending.localId];
           boundedPush(rejectionTimestamps, Date.now());
-          logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry.`);
+          if (pending.strategy) {
+            startProposalCooldown(pending.symbol, pending.strategy, pending.direction);
+          }
+          logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry. Engine=${pending.engineName || pending.symbol} Strategy=${pending.strategy || "UNKNOWN"} Template=${pending.executionTemplate || "UNKNOWN"}`);
         }
         if (msg.msg_type === "authorize" || msg.error?.code === "InvalidToken") {
           this.isAuthorized = false;
@@ -2933,7 +3233,6 @@ class DerivLiveBridge {
     const map: Record<string, string> = {
       "1HZ25V": "R_25",
       "1HZ75V": "R_75",
-      "CRASH500": "CRASH500",
       "BOOM500": "BOOM500",
     };
     return map[derivSymbol] || (Object.keys(INSTRUMENTS).includes(derivSymbol) ? derivSymbol : null);
@@ -2980,15 +3279,20 @@ class DerivLiveBridge {
       return false;
     }
     const derivSymbol = this.getDerivSymbolCode(symbol);
-    const effMode = getEffectiveTradeType();
+    const effMode = getEffectiveTradeType(symbol);
     const finalMultiplier = orderEconomics.effectiveMultiplier;
+    let executableStake = stake;
     if (effMode === "HYBRID_LINEAR" && multiplier === undefined) {
       logs.push(`[DERIV_LIVE_TRADE] ℹ️ HYBRID_LINEAR signal routed through supported Deriv multiplier contract x${finalMultiplier}.`);
+      if (executableStake > DERIV_ROUTED_MULTIPLIER_MAX_STAKE) {
+        executableStake = parseFloat(DERIV_ROUTED_MULTIPLIER_MAX_STAKE.toFixed(2));
+        logs.push(`[DERIV_LIVE_TRADE] ⚠️ Routed HYBRID_LINEAR stake capped to broker max $${DERIV_ROUTED_MULTIPLIER_MAX_STAKE.toFixed(2)} before Deriv submission.`);
+      }
     }
     
     // Submission protocol for Multipliers parameters — includes server-side SL/TP limit orders
     const parameters: any = {
-      amount: stake,
+      amount: executableStake,
       basis: "stake",
       contract_type: direction === "LONG" ? "MULTUP" : "MULTDOWN",
       currency: "USD",
@@ -2998,11 +3302,11 @@ class DerivLiveBridge {
     // Attach server-side stop_loss and take_profit so Deriv manages exits even through disconnections
     if (stopLossAmount && stopLossAmount > 0) {
       parameters.limit_order = {
-        stop_loss: parseFloat(Math.min(stopLossAmount, stake).toFixed(2)),
+        stop_loss: parseFloat(Math.min(stopLossAmount, executableStake).toFixed(2)),
         ...(takeProfitAmount && takeProfitAmount > 0 ? { take_profit: parseFloat(takeProfitAmount.toFixed(2)) } : {})
       };
     }
-    const proposal: any = { buy: 1, price: stake, parameters };
+    const proposal: any = { buy: 1, price: executableStake, parameters };
     if (requestId !== undefined) {
       proposal.req_id = requestId;
     }
@@ -3011,8 +3315,8 @@ class DerivLiveBridge {
     }
 
     this.ws.send(JSON.stringify(proposal));
-    emitRiskTelemetry("execution_forensics", "proposal_submitted", { symbol, direction, stake, requestId, localId, multiplier: finalMultiplier, maxLoss: orderEconomics.maxLossAmount });
-    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${stake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
+    emitRiskTelemetry("execution_forensics", "proposal_submitted", { symbol, direction, stake: executableStake, requestId, localId, multiplier: finalMultiplier, maxLoss: orderEconomics.maxLossAmount });
+    logs.push(`[DERIV_LIVE_TRADE] 🚀 Submitting LIVE Multiplier contract order (Leverage: x${finalMultiplier}): ${direction} on ${derivSymbol} (Stake: $${executableStake}) | SL: $${stopLossAmount?.toFixed(3) ?? "none"} | TP: $${takeProfitAmount?.toFixed(3) ?? "none"}`);
     return true;
   }
 
@@ -3505,13 +3809,13 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
     postSpikeTicksElapsed: 0,
   };
 
-  if (symbol !== "CRASH500" && symbol !== "BOOM500") return prior;
+  if (symbol !== "BOOM500") return prior;
   const prices = tickBuffers[symbol] || [];
   const prevPrice = prices.length >= 2 ? prices[prices.length - 2] : currentPrice;
   const tickDelta = currentPrice - prevPrice;
   const atrDenom = Math.max(atr, Math.abs(currentPrice) * 0.0008, 1e-6);
   const magnitudeAtr = Math.abs(tickDelta) / atrDenom;
-  const expectedDirection: "UP" | "DOWN" = symbol === "BOOM500" ? "UP" : "DOWN";
+  const expectedDirection: "UP" | "DOWN" = "UP";
   const actualDirection: "UP" | "DOWN" = tickDelta >= 0 ? "UP" : "DOWN";
   const isEventSpike = magnitudeAtr >= 2.6 && actualDirection === expectedDirection;
 
@@ -3548,8 +3852,8 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
     : Math.min(prior.spikeExtremePrice || currentPrice, currentPrice);
   const spikePrePrice = prior.spikePrePrice || prevPrice;
   const exhaustionByTime = normalizeRange(ticksElapsed, 8, 42);
-  const rsiExtremeRelief = symbol === "BOOM500" ? normalizeRange(82 - rsiVal, 0, 28) : normalizeRange(rsiVal - 18, 0, 28);
-  const bandReentry = symbol === "BOOM500" ? normalizeRange(1.15 - bbPct, 0, 0.55) : normalizeRange(bbPct + 0.15, 0, 0.55);
+  const rsiExtremeRelief = normalizeRange(82 - rsiVal, 0, 28);
+  const bandReentry = normalizeRange(1.15 - bbPct, 0, 0.55);
   const persistenceDecay = normalizeRange(ticksElapsed, 10, 70);
   const volatilityCollapseProbability = clamp01(0.45 * exhaustionByTime + 0.30 * bandReentry + 0.25 * rsiExtremeRelief);
   const spikeSizeScore = normalizeRange(prior.spikeMagnitudeAtr || 0, 2.6, 7.5);
@@ -3580,7 +3884,7 @@ function buildPostSpikeHarvestSetup(symbol: string, currentPrice: number, atr: n
   rewardToRisk: number;
   reason: string;
 } {
-  if (symbol !== "CRASH500" && symbol !== "BOOM500") return null;
+  if (symbol !== "BOOM500") return null;
   if (!spikeState?.spikeDetected || !spikeState.spikeDirection) return null;
 
   const ticksElapsed = spikeState.postSpikeTicksElapsed || 0;
@@ -3599,13 +3903,7 @@ function buildPostSpikeHarvestSetup(symbol: string, currentPrice: number, atr: n
   let riskDistance: number;
   let rewardDistance: number;
 
-  if (symbol === "CRASH500" && spikeState.spikeDirection === "DOWN") {
-    direction = "LONG";
-    stopLoss = spikeExtreme - stopBuffer;
-    takeProfit = spikeExtreme + Math.abs(preSpikePrice - spikeExtreme) * POST_SPIKE_TARGET_RETRACE;
-    riskDistance = currentPrice - stopLoss;
-    rewardDistance = takeProfit - currentPrice;
-  } else if (symbol === "BOOM500" && spikeState.spikeDirection === "UP") {
+  if (symbol === "BOOM500" && spikeState.spikeDirection === "UP") {
     direction = "SHORT";
     stopLoss = spikeExtreme + stopBuffer;
     takeProfit = spikeExtreme - Math.abs(spikeExtreme - preSpikePrice) * POST_SPIKE_TARGET_RETRACE;
@@ -3691,7 +3989,8 @@ function getCurrentIndicators(symbol: string) {
 
 let activeTradeType: "MULTIPLIER" | "HYBRID_LINEAR" = "HYBRID_LINEAR";
 
-function getEffectiveTradeType(): "MULTIPLIER" | "HYBRID_LINEAR" {
+function getEffectiveTradeType(symbol?: string): "MULTIPLIER" | "HYBRID_LINEAR" {
+  if (symbol) return getEmbeddedTradeType(symbol);
   if (tradingMode === "AUTO") return activeTradeType;
   return tradingMode as "MULTIPLIER" | "HYBRID_LINEAR";
 }
@@ -3743,12 +4042,14 @@ function evaluateGovernorFocus() {
   }
   let highestScore = -1;
   let bestSymbol = governorFocusSymbol;
-  let bestType: "MULTIPLIER" | "HYBRID_LINEAR" = "HYBRID_LINEAR";
+  let bestType: "MULTIPLIER" | "HYBRID_LINEAR" = getEmbeddedTradeType(governorFocusSymbol);
 
   Object.values(subAlgorithms).forEach((sub) => {
+    if (!sub.enabled) return;
     const signal = sub.lastSignalProbability;
     const regime = sub.regimeState;
     const prior = INSTRUMENT_PRIORS[sub.symbol] || { confidence: 0.5, expectedEdge: 0.42, sharpe: 0.45 };
+    const engineMeta = getEngineMetadata(sub.symbol);
     const heat = computePortfolioHeatSnapshot({ symbol: sub.symbol, stake: Math.max(1, balance * 0.0025), direction: "LONG" });
     const confidence = signal?.confidence ?? prior.confidence;
     const edge = signal?.expectedEdge ?? prior.expectedEdge;
@@ -3756,10 +4057,14 @@ function evaluateGovernorFocus() {
     const executionQuality = signal?.executionQuality ?? deriveExecutionQualityScore();
     const regimePenalty = regime ? regime.transitionProbability * 0.35 + regime.entropyScore * 0.25 : 0.2;
     const heatPenalty = Math.max(0, (heat.correlationAdjustedHeat ?? heat.totalHeat) - equityCurveThrottle.portfolioHeatCap) * 1.4;
-    const localMaxScore = prior.sharpe * 0.35 + edge * 0.35 + confidence * 0.25 + executionQuality * 0.20 - uncertainty * 0.25 - regimePenalty - heatPenalty;
-    const localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = (regime?.trendProbability ?? 0) > 0.72 && confidence > 0.66 && uncertainty < 0.36
-      ? "MULTIPLIER"
-      : "HYBRID_LINEAR";
+    const roleAlignment =
+      engineMeta.strategyAssignment === "MEAN_REVERSION"
+        ? ((regime?.meanReversionProbability ?? 0) * 0.38 + Math.max(0, 1 - uncertainty) * 0.08)
+        : engineMeta.strategyAssignment === "TREND_EMA"
+          ? ((regime?.trendProbability ?? 0) * 0.34 + (sub.lastPersistenceProbability ?? 0) * 0.20 + Math.max(0, edge - 0.45) * 0.12)
+          : ((sub.spikeHarvestState?.spikeDetected ? 0.25 : 0) + (sub.spikeHarvestState?.recoveryProbability ?? 0) * 0.20 + (sub.spikeHarvestState?.spikeExhaustionProbability ?? 0) * 0.18);
+    const localMaxScore = prior.sharpe * 0.30 + edge * 0.28 + confidence * 0.22 + executionQuality * 0.16 + roleAlignment - uncertainty * 0.22 - regimePenalty - heatPenalty;
+    const localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = getEmbeddedTradeType(sub.symbol);
 
     if (localMaxScore > highestScore) {
       highestScore = localMaxScore;
@@ -3771,7 +4076,8 @@ function evaluateGovernorFocus() {
   if (bestSymbol !== governorFocusSymbol || bestType !== activeTradeType) {
     governorFocusSymbol = bestSymbol;
     activeTradeType = bestType;
-    logs.push(`[GOVERNOR_DECISION] 🎯 Governor shifted focus. Selected ${subAlgorithms[bestSymbol].name} optimized for ${bestType} contracts.`);
+    const bestMeta = getEngineMetadata(bestSymbol);
+    logs.push(`[GOVERNOR_DECISION] 🎯 Governor shifted focus. Selected ${subAlgorithms[bestSymbol].name} (${bestMeta.strategyAssignment} | ${bestMeta.executionTemplate}).`);
   }
 }
 
@@ -4145,9 +4451,10 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
 
   const riskBudgets = computeRiskBudget(symbol, finalConfidence);
   const useMinimumRiskFloor = confidenceTier !== ConfidenceTier.REJECT && shouldUseMinimumExecutableRiskFloor(proposal, finalConfidence, signalProfile, portfolioRisk);
+  const executableRiskFloor = getExecutableRiskFloorForProposal(proposal);
   let governorAllocatedRisk = adjustedRisk;
-  if (useMinimumRiskFloor && governorAllocatedRisk < MIN_EXECUTABLE_RISK_USD) {
-    governorAllocatedRisk = MIN_EXECUTABLE_RISK_USD;
+  if (useMinimumRiskFloor && governorAllocatedRisk < executableRiskFloor) {
+    governorAllocatedRisk = executableRiskFloor;
   }
   const accountRiskBudget = riskBudgets.accountRiskBudget;
   const symbolRiskBudget = riskBudgets.symbolRiskBudget;
@@ -4178,7 +4485,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   let allocatedRisk = rawAllocatedRisk;
   if (confidenceTier !== ConfidenceTier.REJECT && allocatedRisk > 0) {
     // Clamp risk to operational bounds
-    allocatedRisk = Math.max(MIN_RISK_PER_TRADE, Math.min(MAX_RISK_PER_TRADE, allocatedRisk));
+    allocatedRisk = Math.max(executableRiskFloor, Math.min(MAX_RISK_PER_TRADE, allocatedRisk));
     governorAllocatedRisk = Math.max(governorAllocatedRisk, allocatedRisk);
   }
   console.log(`[RISK_BUDGET] symbol=${symbol} rawRisk=${rawAllocatedRisk.toFixed(4)} clampedRisk=${allocatedRisk.toFixed(2)} stake=${stake.toFixed(2)}`);
@@ -4870,9 +5177,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const reversalBoostShort = reversalBoostLong;
 
   const spikeState = sub.spikeHarvestState;
-  const spikeRecoveryLong = symbol === "CRASH500" && spikeState?.spikeDetected ? spikeState.recoveryProbability : 0;
+  const spikeRecoveryLong = 0;
   const spikeRecoveryShort = symbol === "BOOM500" && spikeState?.spikeDetected ? spikeState.recoveryProbability : 0;
-  const spikeSuppression = (symbol === "CRASH500" || symbol === "BOOM500") && spikeState?.spikeDetected && (spikeState.postSpikeTicksElapsed || 0) < 8 ? 0.55 : 1;
+  const spikeSuppression = symbol === "BOOM500" && spikeState?.spikeDetected && (spikeState.postSpikeTicksElapsed || 0) < 8 ? 0.55 : 1;
 
   const longStrengthRaw =
     (isPersistentRegime ? clamp01((kamaLocal < currentPrice && smaHigher < currentPrice ? 0.45 + persistenceProbability * 0.55 + breakoutAlignment * 0.15 : persistenceProbability * 0.35)) : persistenceProbability * 0.12) * 0.35 +
@@ -4910,11 +5217,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     if ((direction === "LONG" ? spikeRecoveryLong : spikeRecoveryShort) > 0.45) conditionsList.push("POST_SPIKE_RECOVERY");
   }
 
-  const tickEffMode = getEffectiveTradeType();
+  const tickEffMode = getEffectiveTradeType(symbol);
   const trendDir = detectTrendEMA(prices, TREND_SHORT_EMA, TREND_LONG_EMA);
   const trendSignalActive = trendDir !== 0 && adx >= TREND_MIN_ADX;
   const trendReason = `Trend mode (EMA${TREND_SHORT_EMA}/${TREND_LONG_EMA}, ADX=${adx.toFixed(1)})`;
   const postSpikeSetup = buildPostSpikeHarvestSetup(symbol, currentPrice, atr, spikeState);
+  const assignedStrategy = getEngineMetadata(symbol).strategyAssignment;
 
   const minActivation = Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
   type TickSignalCandidate = {
@@ -4931,7 +5239,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     postSpikeRr?: number;
   };
   const signalCandidates: TickSignalCandidate[] = [];
-  if (postSpikeSetup) {
+  if (assignedStrategy === "POST_SPIKE_HARVEST" && postSpikeSetup) {
     const postSpikeDirection = postSpikeSetup.direction;
     if (!isProposalCoolingDown(symbol, "POST_SPIKE_HARVEST", postSpikeDirection)) signalCandidates.push({
       isTrend: false,
@@ -4951,7 +5259,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       postSpikeRr: postSpikeSetup.rewardToRisk,
     });
   }
-  if (trendSignalActive) {
+  if (assignedStrategy === "TREND_EMA" && trendSignalActive) {
     const trendDirection = trendDir > 0 ? "LONG" : "SHORT";
     if (!isProposalCoolingDown(symbol, "TREND_EMA", trendDirection)) signalCandidates.push({
       isTrend: true,
@@ -4965,7 +5273,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     });
   }
   const meanReversionScore = Math.round(signalStrength * 10);
-  if (signalStrength >= minActivation) {
+  if (assignedStrategy === "MEAN_REVERSION" && signalStrength >= minActivation) {
     if (!isProposalCoolingDown(symbol, "MEAN_REVERSION", direction)) signalCandidates.push({
       isTrend: false,
       isPostSpike: false,
@@ -4998,6 +5306,10 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let selectedEvidence: ProposalEvidenceRecord | null = null;
 
     for (const candidate of signalCandidates) {
+      if (!isStrategyAllowedForSymbol(symbol, candidate.strategy)) {
+        logs.push(`[ROLE_GUARD] ${symbol} ignored ${candidate.strategy} candidate because ${getEngineMetadata(symbol).engineName} is assigned to ${assignedStrategy}.`);
+        continue;
+      }
       proposalDirection = candidate.direction;
       score = candidate.score;
       proposalConviction = candidate.conviction;
@@ -5142,6 +5454,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const atrBuffer = atr * Math.max(1.0, Math.min(sub.atrStopMultiplier, adaptiveExit.stopMultiplier));
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
     let takeProfitDistance = stopLossDistance * adaptiveExit.tpMultiplier;
+    const strategyExitProfile = getStrategyExitProfile(selectedStrategy);
     if (selectedStopLoss !== undefined && selectedTakeProfit !== undefined) {
       stopLossDistance = Math.abs(currentPrice - selectedStopLoss);
       takeProfitDistance = Math.abs(selectedTakeProfit - currentPrice);
@@ -5157,9 +5470,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       const hybridStake = hybridRisk;
       targetRisk = parseFloat(Math.max(0, Math.min(hybridRisk, MAX_RISK_PER_TRADE)).toFixed(2));
       if (selectedTakeProfit === undefined) {
-        takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
+        takeProfitDistance = stopLossDistance * strategyExitProfile.targetMultiple;
       }
       stake = parseFloat(Math.max(DERIV_MIN_STAKE, Math.min(Math.max(hybridStake, DERIV_MIN_STAKE), balance * 0.1)).toFixed(2));
+      if (stake > DERIV_ROUTED_MULTIPLIER_MAX_STAKE) {
+        stake = DERIV_ROUTED_MULTIPLIER_MAX_STAKE;
+        targetRisk = parseFloat(Math.min(targetRisk, DERIV_ROUTED_MULTIPLIER_MAX_STAKE).toFixed(2));
+        logs.push(`[HYBRID_ENGINE_SINK] Broker cap applied to routed multiplier stake. Using executable stake $${stake.toFixed(2)}.`);
+      }
       stake = Math.min(stake, MAX_STAKE_PER_TRADE);
       stake = Math.max(stake, DERIV_MIN_STAKE);
       logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${hybridReward.toFixed(2)}), Stake=$${stake} reconciled to Governor risk ceiling.`);
@@ -5190,9 +5508,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
 
       if (selectedTakeProfit === undefined) {
-        // Recalculate stopLossDistance and takeProfitDistance with an adaptive 1.25x risk-reward ratio
-        // to avoid giving back open profits and highly increase hit rate
-        takeProfitDistance = stopLossDistance * 1.6;
+        takeProfitDistance = stopLossDistance * strategyExitProfile.targetMultiple;
       }
 
       // Scale stake down dynamically if expected loss is too high
@@ -5215,6 +5531,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
     const stopLoss = selectedStopLoss !== undefined ? selectedStopLoss : (proposalDirection === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance));
     const takeProfit = selectedTakeProfit !== undefined ? selectedTakeProfit : (proposalDirection === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance));
+    const engineMeta = getEngineMetadata(symbol);
 
     let contractType: ActivePosition["contractType"] = proposalDirection === "LONG" ? "MULTUP" : "MULTDOWN";
     if (tickEffMode === "HYBRID_LINEAR") {
@@ -5225,6 +5542,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const position: ActivePosition = {
       id: positionId,
       symbol,
+      engineName: engineMeta.engineName,
+      strategyTag: selectedStrategy,
+      executionTemplate: engineMeta.executionTemplate,
       contractType,
       direction: proposalDirection,
       stake,
@@ -5315,15 +5635,28 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       return;
     }
     const requestId = nextDerivRequestId++;
-    pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction: proposalDirection, position, requestedAt: Date.now() });
+    pendingOrderQueue.push({
+      requestId,
+      localId: positionId,
+      symbol,
+      engineName: position.engineName,
+      strategy: position.strategyTag,
+      executionTemplate: position.executionTemplate,
+      direction: proposalDirection,
+      position,
+      requestedAt: Date.now()
+    });
     if (selectedEvidence) {
       selectedEvidence.linkedPositionId = positionId;
       pendingProposalEvidenceByPosition[positionId] = selectedEvidence.id;
     }
-    const allocatedRisk = auditRes.allocatedRisk;
+    const allocatedRisk = orderEconomics.maxLossAmount;
     const confidence = auditRes.finalConfidence;
     const sharpeImpact = auditRes.expectedSharpeImpact;
-    console.log(`[PREFLIGHT_SUMMARY] ${symbol} ${proposalDirection} | stake=$${stake.toFixed(2)} | risk=$${allocatedRisk.toFixed(2)} | reward=$${(allocatedRisk * 3).toFixed(2)} | conf=${(confidence * 100).toFixed(1)}% | threshold=${(MIN_CONFIDENCE_THRESHOLD * 100).toFixed(1)}% | sharpeΔ=${sharpeImpact.toFixed(3)} | meetsMin=${stake >= DERIV_MIN_STAKE} | meetsMax=${stake <= MAX_STAKE_PER_TRADE}`);
+    const executableStakeCap = (tickEffMode === "MULTIPLIER" || tickEffMode === "HYBRID_LINEAR")
+      ? Math.min(MAX_STAKE_PER_TRADE, DERIV_ROUTED_MULTIPLIER_MAX_STAKE)
+      : MAX_STAKE_PER_TRADE;
+    console.log(`[PREFLIGHT_SUMMARY] ${symbol} ${proposalDirection} | stake=$${stake.toFixed(2)} | risk=$${allocatedRisk.toFixed(2)} | reward=$${orderEconomics.targetRewardAmount.toFixed(2)} | conf=${(confidence * 100).toFixed(1)}% | threshold=${(MIN_CONFIDENCE_THRESHOLD * 100).toFixed(1)}% | sharpeΔ=${sharpeImpact.toFixed(3)} | meetsMin=${stake >= DERIV_MIN_STAKE} | meetsMax=${stake <= executableStakeCap}`);
     const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, proposalDirection, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
@@ -5338,7 +5671,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
     decelerationWarningCount[symbol] = 0;
     logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal. Pending local position ${positionId} awaiting buy confirmation.`);
-    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${proposalDirection} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
+    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Engine [${position.engineName}] opened ${proposalDirection} position #${positionId} on ${symbol}. Strategy: ${position.strategyTag} | Template: ${position.executionTemplate} | Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
 }
@@ -5443,19 +5776,21 @@ function executeProposal(
   // Multipliers use ATR offsets to set boundaries
   const atrStopMult = sub ? sub.atrStopMultiplier : currentParams.atrStopMultiplier || 1.5;
   const targetLossPct = sub ? (sub.targetLossPct || 0.15) : 0.15;
+  const engineMeta = getEngineMetadata(symbol);
 
   const atrBuffer = atr * atrStopMult;
   let stopLossDistance = Math.max(entryPrice * 0.003, atrBuffer);
-  let takeProfitDistance = stopLossDistance * 1.6;
+  const strategyExitProfile = getStrategyExitProfile(engineMeta.strategyAssignment);
+  let takeProfitDistance = stopLossDistance * strategyExitProfile.targetMultiple;
   let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
   let targetRisk = 25.00;
 
-  const effMode = getEffectiveTradeType();
+  const effMode = getEffectiveTradeType(symbol);
 
   if (effMode === "HYBRID_LINEAR") {
     const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
     targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
-    takeProfitDistance = stopLossDistance * hybridRewardRatio;
+    takeProfitDistance = stopLossDistance * strategyExitProfile.targetMultiple;
     stake = parseFloat(Math.max(DERIV_MIN_STAKE_USD, Math.min(targetRisk, balance * 0.1)).toFixed(2));
     logs.push(`[HYBRID_ENGINE_MANUAL] Prepared manual trade sizing: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Stake=$${stake}`);
   } else if (effMode === "MULTIPLIER") {
@@ -5503,7 +5838,6 @@ function executeProposal(
 
   const stopLoss = direction === "LONG" ? (entryPrice - stopLossDistance) : (entryPrice + stopLossDistance);
   const takeProfit = direction === "LONG" ? (entryPrice + takeProfitDistance) : (entryPrice - takeProfitDistance);
-
   let contractType: ActivePosition["contractType"] = direction === "LONG" ? "MULTUP" : "MULTDOWN";
   if (effMode === "HYBRID_LINEAR") {
     contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
@@ -5514,6 +5848,9 @@ function executeProposal(
   const position: ActivePosition = {
     id,
     symbol,
+    engineName: engineMeta.engineName,
+    strategyTag: engineMeta.strategyAssignment,
+    executionTemplate: engineMeta.executionTemplate,
     contractType,
     direction,
     stake,
@@ -5593,7 +5930,17 @@ function executeProposal(
     return;
   }
   const requestId = nextDerivRequestId++;
-  pendingOrderQueue.push({ requestId, localId: id, symbol, direction, position, requestedAt: Date.now() });
+  pendingOrderQueue.push({
+    requestId,
+    localId: id,
+    symbol,
+    engineName: position.engineName,
+    strategy: position.strategyTag,
+    executionTemplate: position.executionTemplate,
+    direction,
+    position,
+    requestedAt: Date.now()
+  });
   const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, manualSlAmount, manualTpAmount, requestId, id, orderEconomics);
   if (!liveOrderPlaced) {
     const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
@@ -5604,7 +5951,7 @@ function executeProposal(
   decelerationWarningCount[symbol] = 0;
   logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}. Pending local position ${id} awaiting buy confirmation.`);
 
-  logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
+  logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Engine [${position.engineName}] opened ${direction} position #${id} on ${symbol}. Strategy: ${position.strategyTag} | Template: ${position.executionTemplate} | Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
 }
 
 function updateOpenPositions(symbol: string, currentPrice: number, epoch: number) {
@@ -5648,8 +5995,9 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
         pos.maxAdverseExcursion = parseFloat(posPnl.toFixed(2));
       }
     }
-    
+
     const subAlg = subAlgorithms[pos.symbol];
+    const strategyExitProfile = getStrategyExitProfile(pos.strategyTag || getEngineMetadata(pos.symbol).strategyAssignment);
 
     // Initialize or update highest/lowest since entry
     if (pos.highestPriceSinceEntry === undefined || currentPrice > pos.highestPriceSinceEntry) {
@@ -5678,14 +6026,14 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
       // 2. Greening Dynamic Trailing Stop
       if (!exitTriggered) {
         const currentR = posPnl / pos.targetRiskAmount!;
-        if (currentR >= hybridGreeningTriggerPct) {
+        if (currentR >= strategyExitProfile.hybridBreakEvenR) {
           if (!pos.breakEvenActive) {
             pos.stopLoss = pos.entryPrice;
             pos.breakEvenActive = true;
             logs.push(`[GREENING_SHIELD] Position #${pos.id} reached +${(currentR * 100).toFixed(0)}% of R profit. Stop Loss moved to Break-Even (entry: $${pos.entryPrice.toFixed(2)}). Risk is 100% eliminated.`);
           } else {
             // Trail stop loss
-            const trailDistance = stopLossDistance * 1.0; // Trail by 1R
+            const trailDistance = stopLossDistance * strategyExitProfile.hybridTrailR;
             if (pos.direction === "LONG" && pos.highestPriceSinceEntry) {
               const newSL = pos.highestPriceSinceEntry - trailDistance;
               if (newSL > pos.stopLoss) {
@@ -5780,14 +6128,14 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
           // Trigger BE early if price has covered 20% of the distance to TP
           if (pos.direction === "LONG") {
             const tpDistance = pos.takeProfit - pos.entryPrice;
-            if (currentPrice >= pos.entryPrice + tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice + tpDistance * 0.05; // lock in a small 5% profit offset
+            if (currentPrice >= pos.entryPrice + tpDistance * strategyExitProfile.multiplierBreakEvenProgress) {
+              pos.stopLoss = pos.entryPrice + tpDistance * strategyExitProfile.multiplierProfitLockShare;
               pos.breakEvenActive = true;
             }
           } else if (pos.direction === "SHORT") {
             const tpDistance = pos.entryPrice - pos.takeProfit;
-            if (currentPrice <= pos.entryPrice - tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice - tpDistance * 0.05; // lock in a small 5% profit offset
+            if (currentPrice <= pos.entryPrice - tpDistance * strategyExitProfile.multiplierBreakEvenProgress) {
+              pos.stopLoss = pos.entryPrice - tpDistance * strategyExitProfile.multiplierProfitLockShare;
               pos.breakEvenActive = true;
             }
           }
@@ -5796,7 +6144,7 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
         // 2. Trailing Stop
         if (subAlg.trailingStopEnabled && pos.breakEvenActive) {
           // Only start trailing after BE is hit, to lock in profits
-          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * 0.25; // tighter trail distance
+          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * strategyExitProfile.multiplierTrailShare;
           
           if (pos.direction === "LONG") {
             const newSL = pos.highestPriceSinceEntry - trailDistance;
@@ -5916,9 +6264,14 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   if (finalPnl > 0) {
     consecutiveWins++;
     consecutiveLosses = 0;
-  } else {
+    lossStreakStakeBuffer = [];
+  } else if (finalPnl < 0) {
     consecutiveLosses++;
     consecutiveWins = 0;
+    lossStreakStakeBuffer.push(pos.stake);
+    if (lossStreakStakeBuffer.length > 5) lossStreakStakeBuffer = lossStreakStakeBuffer.slice(-5);
+  } else {
+    // Breakeven settlements do not count as wins or losses and do not reset the loss streak.
   }
 
   // Update local stats of sub-algorithm
@@ -5929,7 +6282,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
       subAlg.winningTrades++;
       subAlg.consecutiveWins++;
       subAlg.consecutiveLosses = 0;
-    } else {
+    } else if (finalPnl < 0) {
       subAlg.consecutiveLosses++;
       subAlg.consecutiveWins = 0;
     }
@@ -5946,6 +6299,9 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   const record: TradeRecord = {
     id: pos.id,
     symbol: pos.symbol,
+    engineName: pos.engineName || getEngineMetadata(pos.symbol).engineName,
+    strategyTag: pos.strategyTag,
+    executionTemplate: pos.executionTemplate,
     contractType: pos.contractType,
     direction: pos.direction,
     stake: pos.stake,
@@ -5992,7 +6348,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   scheduleStateSaveToSupabase();
   // Balance is authoritative from Deriv WS stream — do not write locally here.
   // peakBalance tracking is maintained from the stream handler.
-  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Settled ${pos.direction} Position #${pos.id} on ${reason.toUpperCase()}. ExitPrice: ${exitPrice.toFixed(2)}, P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Closed PnL: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Source: ${derivCloseConfirmed ? "Deriv authoritative close confirmation" : "local engine settlement"}`);
+  logs.push(`[CONTRACT_SETTLED] ${new Date().toLocaleTimeString()} Engine [${record.engineName}] settled ${pos.direction} position #${pos.id}. Strategy: ${record.strategyTag || "UNKNOWN"} | Template: ${record.executionTemplate || "UNKNOWN"} | Exit: ${reason.toUpperCase()} | ExitPrice: ${exitPrice.toFixed(2)} | P&L: ${finalPnl >= 0 ? "+" : ""}$${finalPnl} | Source: ${derivCloseConfirmed ? "Deriv authoritative close confirmation" : "local engine settlement"}`);
 
   // Check trade limit to trigger report without interrupting live trading
   if (completedTrades.length > 0 && completedTrades.length % 100 === 0) {
@@ -6073,7 +6429,7 @@ function getMicroConservativeProfile(accountBalance = MICRO_CONSERVATIVE_REFEREN
       maxStakeToReward: 3.00,
       primarySymbols: ["R_25"],
       reducedSymbols: ["R_75"],
-      disabledUntilPreflight: ["BOOM500", "CRASH500"],
+      disabledUntilPreflight: ["BOOM500"],
       verdict: "Operate minimum-size only; every order must prove reward exceeds loss before execution.",
     };
   }
@@ -6091,7 +6447,7 @@ function getMicroConservativeProfile(accountBalance = MICRO_CONSERVATIVE_REFEREN
       maxStakeToReward: 3.00,
       primarySymbols: ["R_25"],
       reducedSymbols: ["R_75"],
-      disabledUntilPreflight: ["BOOM500", "CRASH500"],
+      disabledUntilPreflight: ["BOOM500"],
       verdict: "Recommended operator profile for the requested $50 live-start plan.",
     };
   }
@@ -6108,7 +6464,7 @@ function getMicroConservativeProfile(accountBalance = MICRO_CONSERVATIVE_REFEREN
       minRewardToRisk: 2.00,
       maxStakeToReward: 3.50,
       primarySymbols: ["R_25", "R_75"],
-      reducedSymbols: ["BOOM500", "CRASH500"],
+      reducedSymbols: ["BOOM500"],
       disabledUntilPreflight: [],
       verdict: "Full four-symbol portfolio can be staged only after order economics are enforced.",
     };
@@ -6296,7 +6652,7 @@ function buildRealCapitalReportSnapshot() {
     },
     recommendations: [
       "Implement the micro-safe staking engine next: percent-based default, governor allocation as final ceiling, and order-economics preflight before Deriv proposal dispatch.",
-      "For the requested $50 live-start plan, default to MICRO_CONSERVATIVE: R_25 primary, R_75 reduced, BOOM/CRASH disabled until preflight validates reward-to-risk and stake-to-reward.",
+      "For the requested $50 live-start plan, default to MICRO_CONSERVATIVE: R_25 primary, R_75 reduced, BOOM500 disabled until preflight validates reward-to-risk and stake-to-reward.",
       "Disable fixed $25 risk for micro accounts; percent risk should default around 0.50% with an absolute economic sanity check against Deriv minimum stake.",
       "Reject any order where target reward is below max loss × minimum R:R or stake-to-target-reward is structurally absurd.",
       "Keep Phase 3 adaptive intelligence in SHADOW mode until the staking layer has produced a clean sample of live executions.",
@@ -7491,10 +7847,9 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
        doc.moveDown(1);
        const auditRows = [
-         ['R_25  Sentinel Sniper',       'EMA trend mode  minConf 2  ATR×3.00  maxTicks 180',          'Low-med vol — longer trend runway'],
-         ['R_75  Apex HFT Scalar',       'EMA trend mode  minConf 2  ATR×3.15  maxTicks 200',          'Mid vol — calibrated trend baseline'],
-         ['CRASH500  Recovery Scalar',   'EMA trend mode  minConf 2  ATR×3.25  maxTicks 180',          'Spike DOWN — trend-aware recovery room'],
-         ['BOOM500   Ridge Sniper',      'EMA trend mode  minConf 2  ATR×3.25  maxTicks 180',          'Spike UP — trend-aware continuation room'],
+         ['R_25  Atlas Reversion Engine',       'Mean reversion only  target 1.45R  bounded hybrid exits',       'Low-volatility compression and Bollinger edge recovery'],
+         ['R_75  Vector Trend Engine',          'EMA trend only  target 2.60R  embedded multiplier routing',      'Trend persistence and expansion capture'],
+         ['BOOM500  Pulse Spike Harvest Engine','Post-spike harvest only  target 2.10R  bounded hybrid exits',    'Spike exhaustion and recovery asymmetry'],
        ];
        const auditY = doc.y;
        doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#94a3b8');
@@ -7513,7 +7868,7 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.strokeColor('#7c3aed').lineWidth(0.5).moveTo(50, doc.y).lineTo(560, doc.y).stroke();
        doc.moveDown(0.5);
        doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#0f172a').text('INFINITY MARKETS LAB ALGORITHM INTELLIGENCE UNIT — STRATEGY OPTIMIZATION DIVISION', 50, doc.y, { align: 'center', width: 512 });
-       doc.fontSize(6.5).font('Helvetica').fillColor('#94a3b8').text(`Sealed: ${new Date().toISOString()}  |  Governor Agentic Score: ${(governorAgenticScore * 100).toFixed(0)}%  |  Active Sub-Algorithms: ${Object.values(subAlgorithms).filter(s => s.enabled).length}/6`, 50, doc.y + 11, { align: 'center', width: 512 });
+       doc.fontSize(6.5).font('Helvetica').fillColor('#94a3b8').text(`Sealed: ${new Date().toISOString()}  |  Governor Agentic Score: ${(governorAgenticScore * 100).toFixed(0)}%  |  Active Sub-Algorithms: ${Object.values(subAlgorithms).filter(s => s.enabled).length}/3`, 50, doc.y + 11, { align: 'center', width: 512 });
 
       doc.end();
      });
@@ -7556,6 +7911,23 @@ function getCircuitBreakerRemainingSeconds() {
   return Math.max(0, Math.ceil((circuitBreakerResumeAt - Date.now()) / 1000));
 }
 
+function getSessionClosedPnl() {
+  return parseFloat(completedTrades.reduce((sum, trade) => sum + trade.pnl, 0).toFixed(2));
+}
+
+function getCurrentAggressivenessReductionFactor() {
+  if (aggressivenessReductionUntil > 0 && Date.now() < aggressivenessReductionUntil) {
+    return aggressivenessReductionFactor;
+  }
+  return 1;
+}
+
+function startAggressivenessReduction(factor: number, seconds: number, message: string) {
+  aggressivenessReductionFactor = factor;
+  aggressivenessReductionUntil = Date.now() + seconds * 1000;
+  logs.push(`[BREAKER_ACT] ⚠️ ${message}`);
+}
+
 function startGovernorCooldown(seconds: number, message: string) {
   tradingEnabled = false;
   circuitBreakerResumeAt = Date.now() + seconds * 1000;
@@ -7565,6 +7937,11 @@ function startGovernorCooldown(seconds: number, message: string) {
 }
 
 function updateCircuitBreakerCooldown() {
+  if (aggressivenessReductionUntil > 0 && Date.now() >= aggressivenessReductionUntil) {
+    aggressivenessReductionUntil = 0;
+    aggressivenessReductionFactor = 1;
+    logs.push(`[RISK_CONTROL] ${new Date().toLocaleTimeString()} Temporary aggressiveness reduction expired. Baseline aggressiveness restored.`);
+  }
   circuitBreakerCooldown = getCircuitBreakerRemainingSeconds();
   if (circuitBreakerCooldown > 0 || !tradingAutoResumePending) return;
   circuitBreakerResumeAt = 0;
@@ -7602,16 +7979,18 @@ function evaluateCircuitBreakers() {
 
   if (sessionBlocked) return; // Prevent temporal breakers overriding terminal state
 
-  if (consecutiveLosses >= 5 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
-    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 5 consecutive losses. Auto-resume in 10 minutes.");
-    logs.push(`[BREAKER_ACT] 🛑 5 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
-    return;
-  }
-
-  // Temporal Mitigation limits
-  if (consecutiveLosses >= 3 && circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
-    startGovernorCooldown(600, "GOVERNOR LOCKOUT: 3 consecutive losses. Auto-resume in 10 minutes.");
-    logs.push(`[BREAKER_ACT] ⚠️ 3 Consecutive losses met. Governor locked trading for 10 minutes with automatic resume.`);
+  if (consecutiveLosses >= 5) {
+    const streakStakeSum = parseFloat(lossStreakStakeBuffer.slice(-5).reduce((sum, stake) => sum + stake, 0).toFixed(2));
+    const sessionPnl = getSessionClosedPnl();
+    if (sessionPnl >= streakStakeSum) {
+      startAggressivenessReduction(0.5, 600, `5 consecutive settled losses while session remains profitable (sessionPnl=$${sessionPnl.toFixed(2)} vs streakStake=$${streakStakeSum.toFixed(2)}). Trade aggressiveness reduced by 50% for 10 minutes.`);
+      return;
+    }
+    if (circuitBreakerCooldown === 0 && !tradingAutoResumePending) {
+      startGovernorCooldown(600, `GOVERNOR LOCKOUT: 5 consecutive settled losses exceeded session profit buffer (sessionPnl=$${sessionPnl.toFixed(2)} vs streakStake=$${streakStakeSum.toFixed(2)}). Auto-resume in 10 minutes.`);
+      logs.push(`[BREAKER_ACT] 🛑 5 consecutive settled losses exceeded session profit buffer. Trading halted for 10 minutes.`);
+      return;
+    }
   }
 }
 
@@ -7795,6 +8174,7 @@ function runBacktestStatistics(symbol: string, requestedTicks = 3000): BacktestR
       pos.pnl = parseFloat(posPnl.toFixed(2));
       
       const subAlg = subAlgorithms[symbol];
+      const strategyExitProfile = getStrategyExitProfile(pos.strategyTag || getEngineMetadata(symbol).strategyAssignment);
 
       // Initialize or update highest/lowest since entry
       if (pos.highestPriceSinceEntry === undefined || tickPrice > pos.highestPriceSinceEntry) {
@@ -7810,14 +8190,14 @@ function runBacktestStatistics(symbol: string, requestedTicks = 3000): BacktestR
         if (subAlg.breakEvenEnabled && !pos.breakEvenActive) {
           if (pos.direction === "LONG") {
             const tpDistance = pos.takeProfit - pos.entryPrice;
-            if (tickPrice >= pos.entryPrice + tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice + tpDistance * 0.05;
+            if (tickPrice >= pos.entryPrice + tpDistance * strategyExitProfile.multiplierBreakEvenProgress) {
+              pos.stopLoss = pos.entryPrice + tpDistance * strategyExitProfile.multiplierProfitLockShare;
               pos.breakEvenActive = true;
             }
           } else if (pos.direction === "SHORT") {
             const tpDistance = pos.entryPrice - pos.takeProfit;
-            if (tickPrice <= pos.entryPrice - tpDistance * 0.2) {
-              pos.stopLoss = pos.entryPrice - tpDistance * 0.05;
+            if (tickPrice <= pos.entryPrice - tpDistance * strategyExitProfile.multiplierBreakEvenProgress) {
+              pos.stopLoss = pos.entryPrice - tpDistance * strategyExitProfile.multiplierProfitLockShare;
               pos.breakEvenActive = true;
             }
           }
@@ -7825,7 +8205,7 @@ function runBacktestStatistics(symbol: string, requestedTicks = 3000): BacktestR
 
         // 2. Trailing Stop
         if (subAlg.trailingStopEnabled && pos.breakEvenActive) {
-          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * 0.25;
+          const trailDistance = Math.abs(pos.takeProfit - pos.entryPrice) * strategyExitProfile.multiplierTrailShare;
           if (pos.direction === "LONG") {
             const newSL = pos.highestPriceSinceEntry - trailDistance;
             if (newSL > pos.stopLoss) pos.stopLoss = newSL;
@@ -8142,6 +8522,19 @@ function resolveKenyaLogRange(query: any) {
   return { startDay: formatter.format(start), endDay: today, label: range };
 }
 
+function filterToActiveSymbols<T>(record?: Record<string, T> | null): Record<string, T> {
+  if (!record) return {};
+  return Object.fromEntries(
+    Object.keys(INSTRUMENTS)
+      .filter(symbol => record[symbol] !== undefined)
+      .map(symbol => [symbol, record[symbol]])
+  );
+}
+
+function filterRetiredInstrumentLogs(entries: string[]): string[] {
+  return entries.filter(raw => !raw.includes("CRASH500") && !raw.includes("Crash 500"));
+}
+
 app.get("/api/logs/export", async (req, res) => {
   const format = String(req.query.format || "csv");
   const { startDay, endDay, label } = resolveKenyaLogRange(req.query);
@@ -8222,17 +8615,33 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   
   const totalPnl = parseFloat(completedTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
   const recentTradeWindow = completedTrades.slice(-300);
+  const visibleRecentTrades = recentTradeWindow.filter(trade => Boolean(INSTRUMENTS[trade.symbol as keyof typeof INSTRUMENTS]));
+  const visibleActivePositions = activePositions.filter(position => Boolean(INSTRUMENTS[position.symbol as keyof typeof INSTRUMENTS]));
   const recentWindowPnl = parseFloat(recentTradeWindow.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
   const completedTradesCumulativeOffset = parseFloat((totalPnl - recentWindowPnl).toFixed(2));
   const openPnl = parseFloat(activePositions.reduce((sum, p) => sum + p.pnl, 0).toFixed(2));
   const sessionBaseline = sessionStartBalance || balance;
   const estimatedSessionEquity = parseFloat((sessionBaseline + totalPnl + openPnl).toFixed(2));
   const maxDrawdown = peakBalance === 0 ? 0 : parseFloat((((peakBalance - balance) / peakBalance) * 100).toFixed(2));
+  const aggressivenessReductionRemaining = aggressivenessReductionUntil > 0 ? Math.max(0, Math.ceil((aggressivenessReductionUntil - Date.now()) / 1000)) : 0;
   updateAdaptiveIntelligence("state_endpoint_snapshot");
   const portfolioRisk = computePortfolioRiskState();
   const instrumentDiagnostics = Object.fromEntries(Object.keys(INSTRUMENTS).map(sym => [sym, computeInstrumentStats(sym)]));
   const realCapitalSnapshot = buildRealCapitalReportSnapshot();
   const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+  const visibleAdaptiveIntelligence = {
+    ...adaptiveIntelligenceState,
+    metaLearning: {
+      ...adaptiveIntelligenceState.metaLearning,
+      strategyWeights: filterToActiveSymbols(adaptiveIntelligenceState.metaLearning?.strategyWeights),
+    },
+    regimeEvolution: filterToActiveSymbols(adaptiveIntelligenceState.regimeEvolution),
+    anomaly: filterToActiveSymbols(adaptiveIntelligenceState.anomaly),
+    longHorizonMemory: filterToActiveSymbols(adaptiveIntelligenceState.longHorizonMemory),
+    strategyDecay: filterToActiveSymbols(adaptiveIntelligenceState.strategyDecay),
+    strategyDrift: filterToActiveSymbols(adaptiveIntelligenceState.strategyDrift),
+  };
+  const visibleLogs = filterRetiredInstrumentLogs(logs).slice(-1000);
 
   res.json({
     symbol: selectedSymbol,
@@ -8311,7 +8720,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       activePositionEconomics: realCapitalSnapshot.activePositionEconomics,
       readinessReasons: realCapitalSnapshot.readinessReasons,
     },
-    adaptiveIntelligence: adaptiveIntelligenceState,
+    adaptiveIntelligence: visibleAdaptiveIntelligence,
     mlEvidence: {
       modelVersion: ML_EVIDENCE_MODEL_VERSION,
       proposalsStored: proposalEvidenceStore.length,
@@ -8335,14 +8744,16 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       streakWin: consecutiveWins,
     },
     indicators: getCurrentIndicators(selectedSymbol),
-    activePositions,
-    completedTrades: recentTradeWindow, // recent chart/window payload only
+    activePositions: visibleActivePositions,
+    completedTrades: visibleRecentTrades, // recent chart/window payload only
     completedTradesTotal: completedTrades.length,
-    completedTradesReturned: recentTradeWindow.length,
+    completedTradesReturned: visibleRecentTrades.length,
     completedTradesCumulativeOffset,
     symbolDistribution: (() => {
       const counts: Record<string, number> = {};
-      completedTrades.forEach(t => { counts[t.symbol] = (counts[t.symbol] || 0) + 1; });
+      completedTrades
+        .filter(trade => Boolean(INSTRUMENTS[trade.symbol as keyof typeof INSTRUMENTS]))
+        .forEach(t => { counts[t.symbol] = (counts[t.symbol] || 0) + 1; });
       return Object.keys(counts).sort((a,b) => counts[b]-counts[a]).map(sym => ({
         symbol: sym,
         name: subAlgorithms[sym]?.name || sym,
@@ -8356,8 +8767,10 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       cooldownRemaining: circuitBreakerCooldown,
       cooldownMessage,
       sessionBlocked,
+      aggressivenessReductionFactor,
+      aggressivenessReductionRemaining,
     },
-    logs: logs.slice(-1000), // return last 1000 logs (increased to support tall terminal & scrollback searches)
+    logs: visibleLogs,
   });
 });
 
@@ -8448,7 +8861,7 @@ app.post("/api/config", (req, res) => {
 
   if (mode !== undefined) {
     tradingMode = mode;
-    logs.push(`[SYSTEM] Position contract type adjusted to: ${mode}`);
+    logs.push(`[SYSTEM] Position contract type control updated to ${mode}, but live engine templates are now embedded per engine and no longer switched globally.`);
   }
 
   if (risk !== undefined) {
@@ -8648,9 +9061,12 @@ app.post("/api/reset", async (req, res) => {
   completedTrades = [];
   consecutiveLosses = 0;
   consecutiveWins = 0;
+  lossStreakStakeBuffer = [];
   circuitBreakerCooldown = 0;
   circuitBreakerResumeAt = 0;
   tradingAutoResumePending = false;
+  aggressivenessReductionUntil = 0;
+  aggressivenessReductionFactor = 1;
   cooldownMessage = "";
   tradingEnabled = false;
   sessionBlocked = false;

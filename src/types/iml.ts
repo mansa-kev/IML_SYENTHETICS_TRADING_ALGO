@@ -32,6 +32,9 @@ export interface Candle {
 export interface ActivePosition {
   id: string;
   symbol: string;
+  engineName?: string;
+  strategyTag?: "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
+  executionTemplate?: "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
   contractType: "MULTUP" | "MULTDOWN" | "RISE" | "FALL" | "DIFFERS" | "OVER" | "UNDER" | "HYBRID_LINEAR_UP" | "HYBRID_LINEAR_DOWN";
   direction: "LONG" | "SHORT";
   stake: number;
@@ -69,6 +72,9 @@ export interface ActivePosition {
 export interface TradeRecord {
   id: string;
   symbol: string;
+  engineName?: string;
+  strategyTag?: "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
+  executionTemplate?: "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
   contractType: string;
   direction: "LONG" | "SHORT";
   stake: number;
@@ -766,6 +772,8 @@ export interface SubAlgorithm {
   symbol: string;
   name: string;
   personality: string;
+  strategyAssignment?: "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
+  executionTemplate?: "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
   enabled: boolean;
   rsiOversoldThreshold: number;
   rsiOverboughtThreshold: number;

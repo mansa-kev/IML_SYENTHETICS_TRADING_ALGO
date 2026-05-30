@@ -48,7 +48,6 @@ import {
 const INSTRUMENTS = {
   R_25: { name: "Volatility 25 (1s)", volatility: 0.28, tickType: "1s", idealStrategy: "mean_reversion", basePrice: 250.0 },
   R_75: { name: "Volatility 75 (1s)", volatility: 0.85, tickType: "std", idealStrategy: "breakout", basePrice: 750.0 },
-  CRASH500: { name: "Crash 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
   BOOM500: { name: "Boom 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
 };
 const ALLOWED_SYMBOLS = new Set(Object.keys(INSTRUMENTS));
@@ -1251,7 +1250,7 @@ export default function App() {
             <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
               <div>
                 <span className="block text-[10px] font-mono uppercase tracking-widest text-brand-mint/50">Real Capital Micro Conservative Readiness</span>
-                <span className="text-sm font-mono text-brand-mint/70">$50–$100 profile • R_25 primary • R_75 reduced • report-first risk audit</span>
+                <span className="text-sm font-mono text-brand-mint/70">Three-engine profile • R_25 reversion • R_75 trend • BOOM500 spike harvest</span>
               </div>
               <span className={`px-2 py-1 rounded text-xs font-mono font-bold ${probabilisticDiagnostics.microConservativeReadiness.microSafe ? "bg-emerald-500/10 text-emerald-300 border border-emerald-400/30" : "bg-red-500/10 text-red-300 border border-red-400/30"}`}>
                 {probabilisticDiagnostics.microConservativeReadiness.liveReadiness}
@@ -1366,7 +1365,7 @@ export default function App() {
                     <span>MR {(Number(rg?.meanReversionProbability || 0) * 100).toFixed(0)}%</span>
                     <span>Trans {(Number(rg?.transitionProbability || 0) * 100).toFixed(0)}%</span>
                     <span>Risk ${Number(gd?.allocatedRisk || 0).toFixed(2)}</span>
-                    {(sym === "CRASH500" || sym === "BOOM500") && (
+                    {sym === "BOOM500" && (
                       <>
                         <span>Spike {(Number(sk?.spikeExhaustionProbability || 0) * 100).toFixed(0)}%</span>
                         <span>Recov {(Number(sk?.recoveryProbability || 0) * 100).toFixed(0)}%</span>
@@ -1577,7 +1576,7 @@ export default function App() {
             </div>
 
             {/* Price Symbol buttons strip */}
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-2 mb-4">
+            <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mb-4">
               {Object.keys(INSTRUMENTS).map((sym) => {
                 const meta = INSTRUMENTS[sym as keyof typeof INSTRUMENTS];
                 
@@ -1585,7 +1584,6 @@ export default function App() {
                 const colors: Record<string, { active: string, inactive: string }> = {
                   R_25: { active: "bg-emerald-500/90 border-emerald-500 text-white shadow shadow-emerald-500/25 font-bold", inactive: "bg-emerald-900/25 border-emerald-800/60 text-emerald-300 hover:bg-emerald-900/60 hover:text-emerald-300" },
                   R_75: { active: "bg-purple-500/90 border-purple-500 text-white shadow shadow-purple-500/25 font-bold", inactive: "bg-purple-900/25 border-purple-800/60 text-purple-300 hover:bg-purple-900/60 hover:text-purple-300" },
-                  CRASH500: { active: "bg-rose-500/90 border-rose-500 text-white shadow shadow-rose-500/25 font-bold", inactive: "bg-rose-900/25 border-rose-800/60 text-rose-300 hover:bg-rose-900/60 hover:text-rose-300" },
                   BOOM500: { active: "bg-cyan-500/90 border-cyan-500 text-white shadow shadow-cyan-500/25 font-bold", inactive: "bg-cyan-900/25 border-cyan-800/60 text-cyan-300 hover:bg-cyan-900/60 hover:text-cyan-300" },
                 };
                 
@@ -3928,7 +3926,6 @@ export default function App() {
         // Define hardcoded INSTRUMENTS object fallback
         const titleName = selectedPerfDetail === "R_25" ? "Volatility 25 Index" :
                           selectedPerfDetail === "R_75" ? "Volatility 75 Index" :
-                          selectedPerfDetail === "CRASH500" ? "Crash 500 Index" :
                           selectedPerfDetail === "BOOM500" ? "Boom 500 Index" : selectedPerfDetail;
 
         let ratingLabel = "C TIER / ROOKIE";
@@ -3956,24 +3953,19 @@ export default function App() {
         // Analytical custom descriptions
         const strategyDescriptions: Record<string, { desc: string, strengths: string[], behavior: string }> = {
           R_25: {
-            desc: "Compression Wave Mean Reverter focused on Volatility Index 25. Takes positions at Bollinger edges when momentum shows exhaustion signs.",
-            strengths: ["Aesthetic mean reversion precision", "Filters noisy fakeouts using RSI boundaries", "Vigorous ranging optimization ratio"],
-            behavior: "Waits patiently for extreme standard deviation expansions on a 20-period scale before committing capital. Strict limit safeguards."
+            desc: "Atlas Reversion Engine focused on Volatility Index 25. Takes bounded mean-reversion positions at Bollinger edges when momentum shows exhaustion signs.",
+            strengths: ["Single-strategy mean reversion mandate", "Filters noisy fakeouts using RSI boundaries", "Bounded risk and faster 1.45R targets"],
+            behavior: "Waits for standard deviation expansion and exhaustion before committing capital, then exits with mean-reversion-specific stops and targets."
           },
           R_75: {
-            desc: "Apex Volatility Breakout algorithm deployed on Volatility Index 75 (1s). Rides massive expansions and volume impulses.",
-            strengths: ["Captures full trend lifecycle", "Trailing stops locked aggressively", "Favourable asymmetrical reward ratio"],
-            behavior: "Enters trades when ADX rises above 20 and close breaks Bollinger bandwidth boundaries, holding exposure with an active trace tracker."
-          },
-          CRASH500: {
-            desc: "Tail-risk hedging spike absorber for CRASH index assets. Enters extreme short exposures at high volume limits.",
-            strengths: ["Protects against sudden shock pullbacks", "High risk-reward ratios", "Asymmetrical volatility extraction"],
-            behavior: "Fades sudden price extensions and takes short-term option/multiplier triggers to exploit crash breakdowns."
+            desc: "Vector Trend Engine deployed on Volatility Index 75. Dedicated to EMA trend-following and persistence capture.",
+            strengths: ["Single-strategy trend mandate", "Embedded multiplier routing", "Wider 2.60R trend runway"],
+            behavior: "Enters only when the trend stack confirms persistence, then gives the position more room before trailing or taking profit."
           },
           BOOM500: {
-            desc: "Ascending impulse breakout hunter customized for BOOM index assets. Catches rapid spike expansion sequences.",
-            strengths: ["Exploits rapid explosive momentum", "Highly focused entry criterion", "Rapid settlement times"],
-            behavior: "Monitors tick velocities to jump on explosive upward jumps immediately, riding the impulse waves with trailing protections."
+            desc: "Pulse Spike Harvest Engine customized for BOOM500. It trades post-spike recovery and exhaustion rather than generic trend continuation.",
+            strengths: ["Single-strategy spike harvest mandate", "Event-aware cooldowns", "Bounded hybrid risk with 2.10R target"],
+            behavior: "Monitors spike state, recovery probability, and exhaustion context, then uses tighter event-specific protection."
           }
         };
 
