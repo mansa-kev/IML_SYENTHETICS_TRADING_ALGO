@@ -250,17 +250,11 @@ This is important because reports and analytics should not be reconstructed from
 
 # 5. Supported markets and sub-algorithm personalities
 
-IML currently supports six instruments.
+IML currently supports four instruments.
 
 ## 5.1 Instrument metadata
 
 The instrument map is defined in both frontend and backend with matching semantics.
-
-### R_10
-
-- Name: `Volatility 10 (1s)`
-- Volatility: `0.12`
-- Ideal strategy label: `mean_reversion`
 
 ### R_25
 
@@ -272,12 +266,6 @@ The instrument map is defined in both frontend and backend with matching semanti
 
 - Name: `Volatility 75 (1s)`
 - Volatility: `0.85`
-- Ideal strategy label: `breakout`
-
-### R_100
-
-- Name: `Volatility 100 Index`
-- Volatility: `1.05`
 - Ideal strategy label: `breakout`
 
 ### CRASH500
@@ -312,29 +300,16 @@ Each sub-algorithm has:
 - live runtime indicator values
 - optional fractal statistics
 
-### R_10
-
-- Personality: `Aegis Mean Fader`
-- RSI oversold: `30`
-- RSI overbought: `70`
-- BB period: `20`
-- BB std: `2.20`
-- Min confluence: `3`
-- ATR stop multiplier: `2.50`
-- Target risk stake multiplier: `0.75`
-- Target loss pct: `0.15`
-- Max ticks in trade: `45`
-
 ### R_25
 
 - Personality: `Sentinel Divergence Sniper`
 - RSI oversold: `31`
 - RSI overbought: `69`
 - BB std: `2.30`
-- Min confluence: `3`
-- ATR stop multiplier: `2.60`
+- Min confluence: `2`
+- ATR stop multiplier: `3.00`
 - Target loss pct: `0.15`
-- Max ticks in trade: `50`
+- Max ticks in trade: `180`
 
 ### R_75
 
@@ -342,10 +317,10 @@ Each sub-algorithm has:
 - RSI oversold: `32`
 - RSI overbought: `68`
 - BB std: `2.50`
-- Min confluence: `3`
-- ATR stop multiplier: `2.75`
+- Min confluence: `2`
+- ATR stop multiplier: `3.15`
 - Target loss pct: `0.20`
-- Max ticks in trade: `60`
+- Max ticks in trade: `200`
 
 ### CRASH500
 
@@ -353,10 +328,10 @@ Each sub-algorithm has:
 - RSI oversold: `22`
 - RSI overbought: `75`
 - BB std: `2.75`
-- Min confluence: `4`
-- ATR stop multiplier: `2.25`
+- Min confluence: `2`
+- ATR stop multiplier: `3.25`
 - Target loss pct: `0.20`
-- Max ticks in trade: `45`
+- Max ticks in trade: `180`
 
 ### BOOM500
 
@@ -364,21 +339,10 @@ Each sub-algorithm has:
 - RSI oversold: `25`
 - RSI overbought: `78`
 - BB std: `2.75`
-- Min confluence: `4`
-- ATR stop multiplier: `2.25`
+- Min confluence: `2`
+- ATR stop multiplier: `3.25`
 - Target loss pct: `0.20`
-- Max ticks in trade: `45`
-
-### R_100
-
-- Personality: `Spike Breakout Raider`
-- RSI oversold: `28`
-- RSI overbought: `72`
-- BB std: `2.75`
-- Min confluence: `3`
-- ATR stop multiplier: `3.00`
-- Target loss pct: `0.20`
-- Max ticks in trade: `75`
+- Max ticks in trade: `180`
 
 ---
 
@@ -1209,10 +1173,8 @@ This ensures indicators are warm quickly.
 
 Internal to Deriv mapping:
 
-- `R_10 -> 1HZ10V`
 - `R_25 -> 1HZ25V`
 - `R_75 -> 1HZ75V`
-- `R_100 -> R_100`
 - `CRASH500 -> CRASH500`
 - `BOOM500 -> BOOM500`
 

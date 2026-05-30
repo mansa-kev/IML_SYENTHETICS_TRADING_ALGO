@@ -34,9 +34,9 @@ let tradingEnabled = false;
 let selectedSymbol = "R_75"; // Volatility 75 high-frequency focus
 let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
 // Infinity Markets Lab Hybrid Risk Engine (IML-HRE) state variables
-let hybridRiskType = "FIXED" as "FIXED" | "PERCENT";
-let hybridRiskFixedAmount = 25.00;
-let hybridRiskPercent = 0.5; // 0.5% of account balance (e.g. $50 on $10k)
+let hybridRiskType = "PERCENT" as "FIXED" | "PERCENT";
+let hybridRiskFixedAmount = 1.00;
+let hybridRiskPercent = 1.0; // 1% of account balance, bounded by governor and micro-account caps
 let hybridRewardRatio = 3.0; // 3R target payout
 let hybridEarlyCutoffEnabled = true;
 let hybridEarlyCutoffPct = 0.15; // 15% of R adverse excursion limit
@@ -66,6 +66,11 @@ let currentParams: LearningParams = {
 
 const defaultParams: LearningParams = { ...currentParams };
 const DERIV_SUPPORTED_MULTIPLIERS = [40, 100, 200, 300, 400];
+
+// Trend-mode parameters
+const TREND_SHORT_EMA = 50;   // short EMA length (ticks)
+const TREND_LONG_EMA = 200;   // long EMA length (ticks)
+const TREND_MIN_ADX = 25;     // minimum ADX to consider a trend
 
 // Pending Deriv order registry — holds local positions until Deriv returns a real contract_id
 type PendingDerivOrder = {
@@ -119,6 +124,27 @@ function finalizeDerivContractSettlement(pos: ActivePosition, contract: any) {
   const reason = resolveExitReasonFromContract(pos, exitPrice);
   activePositions = activePositions.filter(p => p.id !== pos.id);
   settleContract(pos, exitPrice, reason, epoch, Number.isFinite(authoritativePnl) ? authoritativePnl : undefined, true);
+}
+
+// Compute an exponential moving average for the last `len` prices
+function ema(prices: number[], len: number): number | null {
+  if (prices.length < len) return null;
+  const alpha = 2 / (len + 1);
+  let emaVal = prices[prices.length - len];
+  for (let i = prices.length - len + 1; i < prices.length; i++) {
+    emaVal = prices[i] * alpha + emaVal * (1 - alpha);
+  }
+  return emaVal;
+}
+
+// Determine trend direction: +1 for uptrend, -1 for downtrend, 0 for no signal
+function detectTrendEMA(prices: number[], shortLen: number, longLen: number): number {
+  const shortEma = ema(prices, shortLen);
+  const longEma = ema(prices, longLen);
+  if (shortEma == null || longEma == null) return 0;
+  if (shortEma > longEma) return 1;
+  if (shortEma < longEma) return -1;
+  return 0;
 }
 
 // Circuit Breakers states
@@ -301,10 +327,10 @@ let equityCurveThrottle: EquityCurveThrottleConfig = {
   tradeAggressiveness: 1,
 };
 
-const PHASE3_MIN_WEIGHT_SAMPLE = 100;
-const PHASE3_FULL_WEIGHT_SAMPLE = 300;
-const PHASE3_MIN_POLICY_SAMPLE = 150;
-const PHASE3_MIN_ANOMALY_FEATURES = 500;
+const PHASE3_MIN_WEIGHT_SAMPLE = 30;
+const PHASE3_FULL_WEIGHT_SAMPLE = 90;
+const PHASE3_MIN_POLICY_SAMPLE = 30;
+const PHASE3_MIN_ANOMALY_FEATURES = 100;
 
 function createDefaultMemoryState(): LongHorizonMemoryState {
   return {
@@ -1369,8 +1395,8 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOverboughtThreshold: 69,
     bbPeriod: 20,
     bbStd: 2.30,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 2.60,
+    minConfluenceScore: 2,
+    atrStopMultiplier: 3.00,
     learningAdjustmentFactor: 1.0,
     targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
@@ -1380,7 +1406,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 50,
+    maxTicksInTrade: 180,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -1402,8 +1428,8 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOverboughtThreshold: 68,
     bbPeriod: 20,
     bbStd: 2.50,
-    minConfluenceScore: 3,
-    atrStopMultiplier: 2.75,
+    minConfluenceScore: 2,
+    atrStopMultiplier: 3.15,
     learningAdjustmentFactor: 1.0,
     targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
@@ -1413,7 +1439,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 60,
+    maxTicksInTrade: 200,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -1435,8 +1461,8 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOverboughtThreshold: 75,
     bbPeriod: 20,
     bbStd: 2.75,
-    minConfluenceScore: 4,
-    atrStopMultiplier: 2.25,
+    minConfluenceScore: 2,
+    atrStopMultiplier: 3.25,
     learningAdjustmentFactor: 1.0,
     targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
@@ -1446,7 +1472,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 45,
+    maxTicksInTrade: 180,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -1468,8 +1494,8 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     rsiOverboughtThreshold: 78,
     bbPeriod: 20,
     bbStd: 2.75,
-    minConfluenceScore: 4,
-    atrStopMultiplier: 2.25,
+    minConfluenceScore: 2,
+    atrStopMultiplier: 3.25,
     learningAdjustmentFactor: 1.0,
     targetRiskStakeMultiplier: 0.75,
     cooldownUntil: 0,
@@ -1479,7 +1505,7 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     timeExitEnabled: true,
     breakEvenEnabled: true,
     trailingStopEnabled: true,
-    maxTicksInTrade: 45,
+    maxTicksInTrade: 180,
     totalTrades: 0,
     winningTrades: 0,
     totalPnl: 0,
@@ -2273,10 +2299,8 @@ class DerivLiveBridge {
   // Map internal symbol labels to standard Deriv market targets
   public getDerivSymbolCode(symbol: string): string {
     const map: Record<string, string> = {
-      R_10: "1HZ10V",
       R_25: "1HZ25V",
       R_75: "1HZ75V",
-      R_100: "R_100",
       CRASH500: "CRASH500",
       BOOM500: "BOOM500",
     };
@@ -2542,10 +2566,8 @@ class DerivLiveBridge {
 
   private getInternalSymbolCode(derivSymbol: string): string | null {
     const map: Record<string, string> = {
-      "1HZ10V": "R_10",
       "1HZ25V": "R_25",
       "1HZ75V": "R_75",
-      "R_100": "R_100",
       "CRASH500": "CRASH500",
       "BOOM500": "BOOM500",
     };
@@ -4302,78 +4324,134 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   }
 
   const tickEffMode = getEffectiveTradeType();
-  const score = Math.round(signalStrength * 10);
+  const trendDir = detectTrendEMA(prices, TREND_SHORT_EMA, TREND_LONG_EMA);
+  const trendSignalActive = trendDir !== 0 && adx >= TREND_MIN_ADX;
+  const trendReason = `Trend mode (EMA${TREND_SHORT_EMA}/${TREND_LONG_EMA}, ADX=${adx.toFixed(1)})`;
 
   const minActivation = Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
-  if (signalStrength < minActivation) {
-    sub.confluenceScore = score;
+  type TickSignalCandidate = {
+    isTrend: boolean;
+    direction: "LONG" | "SHORT";
+    score: number;
+    conviction: number;
+    conditions: string[];
+    reason: string;
+  };
+  const signalCandidates: TickSignalCandidate[] = [];
+  if (trendSignalActive) {
+    signalCandidates.push({
+      isTrend: true,
+      direction: trendDir > 0 ? "LONG" : "SHORT",
+      score: 5,
+      conviction: 0.80,
+      conditions: [trendReason],
+      reason: trendReason,
+    });
+  }
+  const meanReversionScore = Math.round(signalStrength * 10);
+  if (signalStrength >= minActivation) {
+    signalCandidates.push({
+      isTrend: false,
+      direction,
+      score: meanReversionScore,
+      conviction: sub.convictionScore !== undefined ? sub.convictionScore : 1.0,
+      conditions: [...conditionsList],
+      reason: conditionsList.join(", "),
+    });
+  }
+
+  if (signalCandidates.length === 0) {
+    sub.confluenceScore = meanReversionScore;
     return;
   }
 
   if (tradingEnabled) {
-    logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}`);
-    // ----------------------------------------------------
-    // MITIGATION: Extra filtration based on contract mode
-    // ----------------------------------------------------
-    const currentMinConf = (adx > 30) ? Math.max(2, sub.minConfluenceScore - 1) : sub.minConfluenceScore;
-    if (tickEffMode === "MULTIPLIER") {
-      // Multipliers get crushed if the StopLoss triggers too often in noise.
-      if (score < currentMinConf && rsiVal > 40 && rsiVal < 60) {
-        logs.push(`[TRACE] Exiting: multiplier chop zone`);
-        // Chop zone, skip multiplier
-        return;
+    let proposalDirection: "LONG" | "SHORT" = direction;
+    let score = meanReversionScore;
+    let stake = 0;
+    let proposalConviction = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
+    let selectedConditions = conditionsList;
+    let isTrendProposal = false;
+    let auditRes: GovernorDecision | null = null;
+
+    for (const candidate of signalCandidates) {
+      proposalDirection = candidate.direction;
+      score = candidate.score;
+      proposalConviction = candidate.conviction;
+      selectedConditions = candidate.conditions;
+      isTrendProposal = candidate.isTrend;
+
+      logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}${isTrendProposal ? " [TREND]" : ""}`);
+      // ----------------------------------------------------
+      // MITIGATION: Extra filtration based on contract mode
+      // ----------------------------------------------------
+      const currentMinConf = (adx > 30) ? Math.max(2, sub.minConfluenceScore - 1) : sub.minConfluenceScore;
+      if (tickEffMode === "MULTIPLIER") {
+        // Multipliers get crushed if the StopLoss triggers too often in noise.
+        if (!isTrendProposal && score < currentMinConf && rsiVal > 40 && rsiVal < 60) {
+          logs.push(`[TRACE] Exiting mean-reversion candidate: multiplier chop zone`);
+          continue;
+        }
       }
-    }
 
-    // Determine stake sized with Kelly formula scaling factor
-    const baseStake = calculateKellyStake(symbol);
-    let stake = baseStake * sub.targetRiskStakeMultiplier;
-    
-    // Scale down dynamically using our SFT-V2 Conviction Score Composite (C) for fractal entries
-    const cScore = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
-    if (sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
-      const priorStake = stake;
-      stake = stake * cScore;
-      logs.push(`[SFT_V2_RISK] 🎚️ Active Conviction Composite scaling (C: ${(cScore * 100).toFixed(1)}%) adjusted Kelly stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)}.`);
-    } else {
-      logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
-    }
-
-    stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.015)).toFixed(2));
-    
-    // Ensure Multiplier mode respects Fixed USD risk if configured
-    if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
-      stake = Math.min(stake, hybridRiskFixedAmount);
-    }
-
-    // ----------------------------------------------------
-    // AGENTIC GOVERNOR SCAN (AUDIT VETTING)
-    // ----------------------------------------------------
-    const proposal: StrategyProposal = {
-      symbol,
-      direction,
-      score,
-      stake,
-      effMode: tickEffMode as any,
-      conviction: cScore,
-      reason: conditionsList.join(", "),
-      indicators: {
-        rsi: rsiVal,
-        adx,
-        atr,
-        bbPct: currentPrice > 0 ? Math.max(0, Math.min(1, (currentPrice - lower) / (upper - lower || 1))) : 0.5,
-        vwapVal,
-        price: currentPrice,
-        isDivergent: direction === "LONG" ? checkDivergence(prices, dRsiArr, "BULLISH") : checkDivergence(prices, dRsiArr, "BEARISH"),
-        isReversalCandle: checkReversalCandle(candles),
+      // Determine stake sized with Kelly formula scaling factor
+      const baseStake = calculateKellyStake(symbol);
+      stake = baseStake * sub.targetRiskStakeMultiplier;
+      
+      // Scale down dynamically using our SFT-V2 Conviction Score Composite (C) for fractal entries
+      const cScore = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
+      if (!isTrendProposal && sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
+        const priorStake = stake;
+        stake = stake * cScore;
+        logs.push(`[SFT_V2_RISK] 🎚️ Active Conviction Composite scaling (C: ${(cScore * 100).toFixed(1)}%) adjusted Kelly stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)}.`);
+      } else if (isTrendProposal) {
+        const priorStake = stake;
+        stake = stake * proposalConviction;
+        logs.push(`[TREND_MODE] ${symbol} ${proposalDirection} proposal generated by EMA trend detector. Stake scaled from $${priorStake.toFixed(2)} to $${stake.toFixed(2)} at ${(proposalConviction * 100).toFixed(0)}% conviction.`);
+      } else {
+        logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
       }
-    };
 
-    const auditRes = scrutinizeProposal(proposal);
-    if (!auditRes.approved) {
-      logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} REJECTED [${auditRes.confidenceTier}] conf=${(auditRes.finalConfidence*100).toFixed(0)}% transition=${(auditRes.transitionPenalty*100).toFixed(0)}% corr=${(auditRes.correlationPenalty*100).toFixed(0)}% vol=${(auditRes.volatilityPenalty*100).toFixed(0)}% reasons=${(auditRes.rejectionReasons||[]).join(",")}`);
-      return;
+      stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.015)).toFixed(2));
+      
+      // Ensure Multiplier mode respects Fixed USD risk if configured
+      if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
+        stake = Math.min(stake, hybridRiskFixedAmount);
+      }
+
+      // ----------------------------------------------------
+      // AGENTIC GOVERNOR SCAN (AUDIT VETTING)
+      // ----------------------------------------------------
+      const proposal: StrategyProposal = {
+        symbol,
+        direction: proposalDirection,
+        score,
+        stake,
+        effMode: tickEffMode as any,
+        conviction: proposalConviction,
+        reason: candidate.reason,
+        indicators: {
+          rsi: rsiVal,
+          adx,
+          atr,
+          bbPct: currentPrice > 0 ? Math.max(0, Math.min(1, (currentPrice - lower) / (upper - lower || 1))) : 0.5,
+          vwapVal,
+          price: currentPrice,
+          isDivergent: proposalDirection === "LONG" ? checkDivergence(prices, dRsiArr, "BULLISH") : checkDivergence(prices, dRsiArr, "BEARISH"),
+          isReversalCandle: checkReversalCandle(candles),
+        }
+      };
+
+      const candidateAudit = scrutinizeProposal(proposal);
+      if (!candidateAudit.approved) {
+        logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
+        continue;
+      }
+      auditRes = candidateAudit;
+      break;
     }
+
+    if (!auditRes) return;
     
     // Apply polished parameters from Governor (Agentic autonomy in action)
     stake = auditRes.allocatedRisk;
@@ -4449,12 +4527,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
     }
 
-    const stopLoss = direction === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance);
-    const takeProfit = direction === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance);
+    const stopLoss = proposalDirection === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance);
+    const takeProfit = proposalDirection === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance);
 
-    let contractType: ActivePosition["contractType"] = direction === "LONG" ? "MULTUP" : "MULTDOWN";
+    let contractType: ActivePosition["contractType"] = proposalDirection === "LONG" ? "MULTUP" : "MULTDOWN";
     if (tickEffMode === "HYBRID_LINEAR") {
-      contractType = direction === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
+      contractType = proposalDirection === "LONG" ? "HYBRID_LINEAR_UP" : "HYBRID_LINEAR_DOWN";
     }
 
     const positionId = `CT_${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
@@ -4462,7 +4540,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       id: positionId,
       symbol,
       contractType,
-      direction,
+      direction: proposalDirection,
       stake,
       entryPrice: currentPrice,
       currentPrice,
@@ -4476,12 +4554,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       entryBbPct: parseFloat((((currentPrice - lower) / ((upper - lower) || 1))).toFixed(3)),
       entryAdx: parseFloat(adx.toFixed(2)),
       entryAtr: parseFloat(atr.toFixed(4)),
-      entryConditions: [...conditionsList],
+      entryConditions: [...selectedConditions],
       multiplier: tickEffMode === "MULTIPLIER" ? chosenMultiplier : undefined,
       isHybridLinear: tickEffMode === "HYBRID_LINEAR" ? true : undefined,
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
-      isFractalTrend: isPersistentRegime,
+      isFractalTrend: isPersistentRegime || isTrendProposal,
       maxTicksOverride: Math.max(15, Math.ceil(Math.min(adaptiveExit.maxTicks, auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
         : auditRes.confidenceTier === ConfidenceTier.MEDIUM ? sub.maxTicksInTrade * 0.85
         : sub.maxTicksInTrade * 0.65) * equityCurveThrottle.maxPositionDurationScale)),
@@ -4495,7 +4573,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const budgets = computeRiskBudget(symbol, auditRes.finalConfidence);
     const orderEconomics = preflightOrderEconomics({
       symbol,
-      direction,
+      direction: proposalDirection,
       stake,
       effectiveMultiplier,
       stopLossDistance,
@@ -4508,7 +4586,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       executionAdjustedRisk: parseFloat((auditRes.allocatedRisk * budgets.executionHealthScale).toFixed(2)),
     });
     if (!orderEconomics.approved) {
-      logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${direction} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
+      logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${proposalDirection} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
       return;
     }
     stake = orderEconomics.stake;
@@ -4519,8 +4597,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       position.hybridPositionSize = orderEconomics.maxLossAmount / Math.max(1e-9, stopLossDistance);
     }
     if (SHADOW_LIVE_VALIDATION) {
-      emitRiskTelemetry("shadow_live_validation", "order_suppressed", { symbol, direction, stake, maxLossAmount: orderEconomics.maxLossAmount, targetRewardAmount: orderEconomics.targetRewardAmount, governorRisk: auditRes.allocatedRisk });
-      logs.push(`[SHADOW_LIVE_VALIDATION] ${symbol} ${direction} passed real governor/preflight logic but live dispatch is suppressed while shadow validation is active.`);
+      emitRiskTelemetry("shadow_live_validation", "order_suppressed", { symbol, direction: proposalDirection, stake, maxLossAmount: orderEconomics.maxLossAmount, targetRewardAmount: orderEconomics.targetRewardAmount, governorRisk: auditRes.allocatedRisk });
+      logs.push(`[SHADOW_LIVE_VALIDATION] ${symbol} ${proposalDirection} passed real governor/preflight logic but live dispatch is suppressed while shadow validation is active.`);
       return;
     }
     // Live authorization and successful order dispatch are both required to track this position
@@ -4532,14 +4610,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const slAmount = parseFloat(orderEconomics.maxLossAmount.toFixed(3));
     const tpAmount = parseFloat(orderEconomics.targetRewardAmount.toFixed(3));
     // Register in pending queue BEFORE dispatch so the buy confirmation can link the contract_id
-    if (hasRecentPendingDuplicate(symbol, direction)) {
-      emitRiskTelemetry("operational_resilience", "duplicate_order_suppressed", { symbol, direction, localId: positionId });
-      logs.push(`[ORDER_DUPLICATE_SUPPRESSED] ${symbol} ${direction} has a recent pending order; suppressing duplicate live exposure request.`);
+    if (hasRecentPendingDuplicate(symbol, proposalDirection)) {
+      emitRiskTelemetry("operational_resilience", "duplicate_order_suppressed", { symbol, direction: proposalDirection, localId: positionId });
+      logs.push(`[ORDER_DUPLICATE_SUPPRESSED] ${symbol} ${proposalDirection} has a recent pending order; suppressing duplicate live exposure request.`);
       return;
     }
     const requestId = nextDerivRequestId++;
-    pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction, position, requestedAt: Date.now() });
-    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, direction, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
+    pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction: proposalDirection, position, requestedAt: Date.now() });
+    const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, proposalDirection, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
       const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
@@ -4548,7 +4626,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       return;
     }
     logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal. Pending local position ${positionId} awaiting buy confirmation.`);
-    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${direction} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
+    logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${proposalDirection} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
   }
 }
@@ -6684,12 +6762,10 @@ Bollinger band filters effectively prevented top-edge fades in trending models, 
        doc.strokeColor('#7c3aed').lineWidth(1).moveTo(50, doc.y + 4).lineTo(560, doc.y + 4).stroke();
        doc.moveDown(1);
        const auditRows = [
-         ['R_10  Aegis Mean Fader',      'bbStd 2.20  ATR×2.50  maxTicks 45  breakEven+trailing ADDED', 'Low vol — tight bands, fast settle'],
-         ['R_25  Sentinel Sniper',       'bbStd 2.30  ATR×2.60  maxTicks 50',                          'Low-med vol — moderate tightening'],
-         ['R_75  Apex HFT Scalar',       'No changes — standard reference instrument',                  'Mid vol — calibrated baseline'],
-         ['CRASH500  Recovery Scalar',   'rsiOS 22  rsiOB 75  bbStd 2.75  ATR×2.25  minConf 4  maxTicks 45', 'Spike DOWN — only trade deep dips'],
-         ['BOOM500   Ridge Sniper',      'rsiOS 25  rsiOB 78  bbStd 2.75  ATR×2.25  minConf 4  maxTicks 45', 'Spike UP — only trade deep booms'],
-         ['R_100  Spike Raider',         'rsiOS 28  rsiOB 72  bbStd 2.75  ATR×3.00  maxTicks 75',      'High vol — more room required'],
+         ['R_25  Sentinel Sniper',       'EMA trend mode  minConf 2  ATR×3.00  maxTicks 180',          'Low-med vol — longer trend runway'],
+         ['R_75  Apex HFT Scalar',       'EMA trend mode  minConf 2  ATR×3.15  maxTicks 200',          'Mid vol — calibrated trend baseline'],
+         ['CRASH500  Recovery Scalar',   'EMA trend mode  minConf 2  ATR×3.25  maxTicks 180',          'Spike DOWN — trend-aware recovery room'],
+         ['BOOM500   Ridge Sniper',      'EMA trend mode  minConf 2  ATR×3.25  maxTicks 180',          'Spike UP — trend-aware continuation room'],
        ];
        const auditY = doc.y;
        doc.fontSize(7.5).font('Helvetica-Bold').fillColor('#94a3b8');
@@ -6826,7 +6902,7 @@ function runMachineLearningAdaptation() {
       return;
     }
 
-    // Historical Trade Data — filter by sub.symbol (the key e.g. "R_100"), NOT sub.name ("Volatility 100 Index")
+    // Historical Trade Data — filter by sub.symbol, NOT sub.name.
     const trades = completedTrades.filter(t => t.symbol === sub.symbol);
     const winRate = sub.recentWinRate;
     const grossWins = trades.filter(t => t.pnl > 0).reduce((sum, t) => sum + t.pnl, 0);
