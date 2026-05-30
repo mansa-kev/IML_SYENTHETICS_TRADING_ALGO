@@ -63,6 +63,7 @@ export interface ActivePosition {
   entrySignalProbability?: number;
   entryExpectedEdge?: number;
   entryExpectedSharpeImpact?: number;
+  proposalEvidenceId?: string;
 }
 
 export interface TradeRecord {
@@ -93,6 +94,7 @@ export interface TradeRecord {
   entrySignalProbability?: number;
   entryExpectedEdge?: number;
   entryExpectedSharpeImpact?: number;
+  proposalEvidenceId?: string;
 }
 
 export interface SessionStats {

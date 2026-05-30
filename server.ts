@@ -214,8 +214,79 @@ interface StrategyProposal {
     postSpikeRr?: number;
     spikeRecoveryProbability?: number;
     spikeExhaustionProbability?: number;
+    mlQualityScore?: number;
   };
 }
+
+type ProposalEvidenceStatus = "PROPOSED" | "GOVERNOR_REJECTED" | "PREFLIGHT_REJECTED" | "DISPATCHED" | "EXECUTED" | "SETTLED" | "SHADOW_RESOLVED";
+type ProposalOutcome = "WIN" | "LOSS" | "EXPIRED" | "REJECTED" | "BROKER_REJECTED";
+
+interface ProposalEvidenceRecord {
+  id: string;
+  createdAt: number;
+  epoch: number;
+  symbol: string;
+  strategy: StrategyKind;
+  direction: "LONG" | "SHORT";
+  effMode: "MULTIPLIER" | "HYBRID_LINEAR";
+  score: number;
+  conviction: number;
+  confidence: number;
+  expectedEdge: number;
+  expectedSharpeImpact: number;
+  mlQualityScore: number;
+  mlSampleSize: number;
+  regimeBucket: string;
+  confidenceBucket: string;
+  adxBucket: string;
+  contextKey: string;
+  price: number;
+  rsi: number;
+  adx: number;
+  atr: number;
+  bbPct: number;
+  emaSeparation?: number;
+  trendDir?: number;
+  transitionProbability: number;
+  trendProbability: number;
+  meanReversionProbability: number;
+  governorApproved?: boolean;
+  governorTier?: ConfidenceTier;
+  governorReasons?: string[];
+  allocatedRisk?: number;
+  preflightApproved?: boolean;
+  preflightReasons?: string[];
+  maxLossAmount?: number;
+  targetRewardAmount?: number;
+  rewardToRisk?: number;
+  status: ProposalEvidenceStatus;
+  linkedPositionId?: string;
+  outcome?: ProposalOutcome;
+  outcomePnl?: number;
+  resolvedAt?: number;
+  shadowStopPrice: number;
+  shadowTargetPrice: number;
+  shadowExpiresEpoch: number;
+  modelVersion: string;
+}
+
+interface OnlineEvidenceBucket {
+  key: string;
+  samples: number;
+  wins: number;
+  losses: number;
+  rejected: number;
+  brokerRejected: number;
+  netPnl: number;
+  avgConfidence: number;
+  avgEdge: number;
+  lastUpdatedEpoch: number;
+}
+
+const ML_EVIDENCE_MODEL_VERSION = "online-context-v1";
+const proposalEvidenceStore: ProposalEvidenceRecord[] = [];
+const mlEvidenceStats: Record<string, OnlineEvidenceBucket> = {};
+const pendingProposalEvidenceByPosition: Record<string, string> = {};
 
 const proposalCooldownUntil: Record<string, number> = {};
 
@@ -230,6 +301,181 @@ function isProposalCoolingDown(symbol: string, strategy: StrategyKind, direction
 function startProposalCooldown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT") {
   const cooldownMs = strategy === "POST_SPIKE_HARVEST" ? 30000 : strategy === "TREND_EMA" ? 12000 : 8000;
   proposalCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] = Date.now() + cooldownMs;
+}
+
+function confidenceBucket(confidence: number): string {
+  if (confidence < 0.30) return "C00_29";
+  if (confidence < 0.35) return "C30_34";
+  if (confidence < 0.40) return "C35_39";
+  if (confidence < 0.45) return "C40_44";
+  if (confidence < 0.52) return "C45_51";
+  return "C52_PLUS";
+}
+
+function adxBucket(adx: number): string {
+  if (adx < 20) return "ADX_LT20";
+  if (adx < 25) return "ADX20_24";
+  if (adx < 35) return "ADX25_34";
+  if (adx < 50) return "ADX35_49";
+  return "ADX50_PLUS";
+}
+
+function regimeBucket(regime: RegimeState): string {
+  if (regime.transitionProbability >= 0.40) return "TRANSITION";
+  if (regime.volatilityExpansionProbability >= 0.55) return "HIGH_VOL";
+  if (regime.trendProbability >= 0.60) return "TREND";
+  if (regime.meanReversionProbability >= 0.60) return "MEAN_REVERT";
+  return "MIXED";
+}
+
+function proposalEvidenceKey(parts: { symbol: string; strategy: StrategyKind; direction: "LONG" | "SHORT"; regime: string; confidence: string; adx: string }): string {
+  return [parts.symbol, parts.strategy, parts.direction, parts.regime, parts.confidence, parts.adx].join("|");
+}
+
+function getEvidenceBucket(key: string): OnlineEvidenceBucket {
+  if (!mlEvidenceStats[key]) {
+    mlEvidenceStats[key] = {
+      key,
+      samples: 0,
+      wins: 0,
+      losses: 0,
+      rejected: 0,
+      brokerRejected: 0,
+      netPnl: 0,
+      avgConfidence: 0,
+      avgEdge: 0,
+      lastUpdatedEpoch: 0,
+    };
+  }
+  return mlEvidenceStats[key];
+}
+
+function computeMLQualityScore(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT", regime: RegimeState, confidence: number, adx: number): { score: number; sampleSize: number; key: string; regime: string; confidence: string; adx: string } {
+  const rBucket = regimeBucket(regime);
+  const cBucket = confidenceBucket(confidence);
+  const aBucket = adxBucket(adx);
+  const keys = [
+    proposalEvidenceKey({ symbol, strategy, direction, regime: rBucket, confidence: cBucket, adx: aBucket }),
+    proposalEvidenceKey({ symbol, strategy, direction, regime: rBucket, confidence: "ANY_CONF", adx: aBucket }),
+    proposalEvidenceKey({ symbol, strategy, direction, regime: rBucket, confidence: "ANY_CONF", adx: "ANY_ADX" }),
+    proposalEvidenceKey({ symbol, strategy, direction: "LONG", regime: "ANY_REGIME", confidence: "ANY_CONF", adx: "ANY_ADX" }).replace("|LONG|", "|ANY_DIR|"),
+  ];
+  let weightedScore = 0;
+  let weightSum = 0;
+  let sampleSize = 0;
+  keys.forEach((key, index) => {
+    const bucket = mlEvidenceStats[key];
+    if (!bucket || bucket.samples <= 0) return;
+    const posteriorWinRate = (bucket.wins + 2) / (bucket.wins + bucket.losses + 4);
+    const pnlTilt = Math.max(-0.12, Math.min(0.12, bucket.netPnl / Math.max(10, bucket.samples * 2) * 0.05));
+    const rejectionDrag = Math.min(0.12, (bucket.rejected + bucket.brokerRejected) / Math.max(1, bucket.samples) * 0.08);
+    const localScore = clamp01(posteriorWinRate + pnlTilt - rejectionDrag);
+    const weight = [1.0, 0.55, 0.35, 0.20][index] || 0.1;
+    weightedScore += localScore * weight * Math.min(1, bucket.samples / 20);
+    weightSum += weight * Math.min(1, bucket.samples / 20);
+    sampleSize += bucket.samples;
+  });
+  const fallback = 0.50 + (confidence - 0.40) * 0.35 + (regime.trendProbability - regime.transitionProbability) * 0.08;
+  const score = weightSum > 0 ? weightedScore / weightSum : clamp01(fallback);
+  return { score: parseFloat(clamp01(score).toFixed(4)), sampleSize, key: keys[0], regime: rBucket, confidence: cBucket, adx: aBucket };
+}
+
+function updateEvidenceBucket(record: ProposalEvidenceRecord, outcome: ProposalOutcome, pnl = 0, epoch = Math.floor(Date.now() / 1000)) {
+  const keys = [
+    record.contextKey,
+    proposalEvidenceKey({ symbol: record.symbol, strategy: record.strategy, direction: record.direction, regime: record.regimeBucket, confidence: "ANY_CONF", adx: record.adxBucket }),
+    proposalEvidenceKey({ symbol: record.symbol, strategy: record.strategy, direction: record.direction, regime: record.regimeBucket, confidence: "ANY_CONF", adx: "ANY_ADX" }),
+    proposalEvidenceKey({ symbol: record.symbol, strategy: record.strategy, direction: "LONG", regime: "ANY_REGIME", confidence: "ANY_CONF", adx: "ANY_ADX" }).replace("|LONG|", "|ANY_DIR|"),
+  ];
+  keys.forEach(key => {
+    const bucket = getEvidenceBucket(key);
+    bucket.samples++;
+    if (outcome === "WIN") bucket.wins++;
+    if (outcome === "LOSS" || outcome === "EXPIRED") bucket.losses++;
+    if (outcome === "REJECTED") bucket.rejected++;
+    if (outcome === "BROKER_REJECTED") bucket.brokerRejected++;
+    bucket.netPnl = parseFloat((bucket.netPnl + pnl).toFixed(4));
+    bucket.avgConfidence = parseFloat((((bucket.avgConfidence * (bucket.samples - 1)) + record.confidence) / bucket.samples).toFixed(4));
+    bucket.avgEdge = parseFloat((((bucket.avgEdge * (bucket.samples - 1)) + record.expectedEdge) / bucket.samples).toFixed(4));
+    bucket.lastUpdatedEpoch = epoch;
+  });
+}
+
+function createProposalEvidenceRecord(proposal: StrategyProposal, decision: GovernorDecision, regimeState: RegimeState): ProposalEvidenceRecord {
+  const indicators = proposal.indicators;
+  const symbolPrices = tickBuffers[proposal.symbol] || [];
+  const price = indicators.price || symbolPrices[symbolPrices.length - 1] || INSTRUMENTS[proposal.symbol as keyof typeof INSTRUMENTS]?.basePrice || 1;
+  const expectedRR = proposal.strategy === "POST_SPIKE_HARVEST" ? (indicators.postSpikeRr || POST_SPIKE_MIN_RR) : proposal.effMode === "HYBRID_LINEAR" ? hybridRewardRatio : 1.6;
+  const stopDistance = Math.max(price * 0.003, (indicators.atr || 1) * (subAlgorithms[proposal.symbol]?.atrStopMultiplier || currentParams.atrStopMultiplier || 2));
+  const targetDistance = stopDistance * expectedRR;
+  const ml = computeMLQualityScore(proposal.symbol, proposal.strategy, proposal.direction, regimeState, decision.finalConfidence, indicators.adx || 0);
+  const id = `PE_${Date.now().toString(36).toUpperCase()}_${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+  return {
+    id,
+    createdAt: Date.now(),
+    epoch: Math.floor(Date.now() / 1000),
+    symbol: proposal.symbol,
+    strategy: proposal.strategy,
+    direction: proposal.direction,
+    effMode: proposal.effMode,
+    score: proposal.score,
+    conviction: proposal.conviction,
+    confidence: decision.finalConfidence,
+    expectedEdge: decision.expectedEdge,
+    expectedSharpeImpact: decision.expectedSharpeImpact,
+    mlQualityScore: ml.score,
+    mlSampleSize: ml.sampleSize,
+    regimeBucket: ml.regime,
+    confidenceBucket: ml.confidence,
+    adxBucket: ml.adx,
+    contextKey: ml.key,
+    price,
+    rsi: indicators.rsi || 50,
+    adx: indicators.adx || 0,
+    atr: indicators.atr || 0,
+    bbPct: indicators.bbPct || 0.5,
+    emaSeparation: indicators.emaSeparation,
+    trendDir: indicators.trendDir,
+    transitionProbability: regimeState.transitionProbability,
+    trendProbability: regimeState.trendProbability,
+    meanReversionProbability: regimeState.meanReversionProbability,
+    governorApproved: decision.approved,
+    governorTier: decision.confidenceTier,
+    governorReasons: decision.rejectionReasons,
+    allocatedRisk: decision.allocatedRisk,
+    status: decision.approved ? "PROPOSED" : "GOVERNOR_REJECTED",
+    shadowStopPrice: proposal.direction === "LONG" ? price - stopDistance : price + stopDistance,
+    shadowTargetPrice: proposal.direction === "LONG" ? price + targetDistance : price - targetDistance,
+    shadowExpiresEpoch: Math.floor(Date.now() / 1000) + Math.max(60, (subAlgorithms[proposal.symbol]?.maxTicksInTrade || 150) * 2),
+    modelVersion: ML_EVIDENCE_MODEL_VERSION,
+  };
+}
+
+function addProposalEvidence(record: ProposalEvidenceRecord) {
+  proposalEvidenceStore.push(record);
+  if (proposalEvidenceStore.length > 1500) proposalEvidenceStore.splice(0, proposalEvidenceStore.length - 1500);
+  scheduleStateSaveToSupabase();
+}
+
+function resolveProposalEvidence(record: ProposalEvidenceRecord, outcome: ProposalOutcome, pnl = 0, status: ProposalEvidenceStatus = "SHADOW_RESOLVED", epoch = Math.floor(Date.now() / 1000)) {
+  if (record.outcome) return;
+  record.outcome = outcome;
+  record.outcomePnl = parseFloat(pnl.toFixed(4));
+  record.status = status;
+  record.resolvedAt = Date.now();
+  updateEvidenceBucket(record, outcome, pnl, epoch);
+  scheduleStateSaveToSupabase();
+}
+
+function updateShadowProposalOutcomes(symbol: string, price: number, epoch: number) {
+  proposalEvidenceStore.forEach(record => {
+    if (record.symbol !== symbol || record.outcome || record.status === "DISPATCHED" || record.status === "EXECUTED" || record.status === "SETTLED") return;
+    const hitTarget = record.direction === "LONG" ? price >= record.shadowTargetPrice : price <= record.shadowTargetPrice;
+    const hitStop = record.direction === "LONG" ? price <= record.shadowStopPrice : price >= record.shadowStopPrice;
+    if (hitTarget) resolveProposalEvidence(record, "WIN", Math.max(0.01, record.allocatedRisk || 1) * (record.rewardToRisk || hybridRewardRatio), "SHADOW_RESOLVED", epoch);
+    else if (hitStop) resolveProposalEvidence(record, "LOSS", -Math.max(0.01, record.allocatedRisk || 1), "SHADOW_RESOLVED", epoch);
+    else if (epoch >= record.shadowExpiresEpoch) resolveProposalEvidence(record, "EXPIRED", 0, "SHADOW_RESOLVED", epoch);
+  });
 }
 
 
@@ -1863,6 +2109,8 @@ async function saveStateToSupabase() {
       hybridGreeningTriggerPct,
       activePositions,
       completedTrades,
+      proposalEvidenceStore: proposalEvidenceStore.slice(-1500),
+      mlEvidenceStats,
       adaptiveIntelligenceState,
       currentParams,
       logs: logs.slice(-2000), // keep plenty of logs in database
@@ -2107,6 +2355,13 @@ async function loadStateFromSupabase() {
           logs.push(`[STATE_SANITIZER] Removed ${recoveredTrades.length - authoritativeTrades.length} legacy/disallowed trades from recovered session state.`);
         }
         completedTrades = authoritativeTrades;
+      }
+      if (loaded.proposalEvidenceStore !== undefined) {
+        const recoveredEvidence = Array.isArray(loaded.proposalEvidenceStore) ? loaded.proposalEvidenceStore : [];
+        proposalEvidenceStore.splice(0, proposalEvidenceStore.length, ...recoveredEvidence.slice(-1500));
+      }
+      if (loaded.mlEvidenceStats !== undefined && typeof loaded.mlEvidenceStats === "object") {
+        Object.assign(mlEvidenceStats, loaded.mlEvidenceStats);
       }
       if (loaded.currentParams !== undefined) {
         currentParams = loaded.currentParams;
@@ -2375,6 +2630,14 @@ class DerivLiveBridge {
         );
         if (pendingIndex !== -1) {
           const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
+          const evidenceId = pendingProposalEvidenceByPosition[pending.localId];
+          const evidence = proposalEvidenceStore.find(record => record.id === evidenceId);
+          if (evidence) {
+            resolveProposalEvidence(evidence, "BROKER_REJECTED", 0, "SHADOW_RESOLVED");
+            evidence.preflightApproved = true;
+            evidence.preflightReasons = [msg.error.message || msg.error.code || "broker_rejected"];
+          }
+          delete pendingProposalEvidenceByPosition[pending.localId];
           boundedPush(rejectionTimestamps, Date.now());
           logs.push(`[DERIV_LIVE_TRADE] ❌ Pending local position ${pending.localId} rejected by Deriv and removed from pending registry.`);
         }
@@ -2595,7 +2858,16 @@ class DerivLiveBridge {
           const [pending] = pendingOrderQueue.splice(pendingIndex, 1);
           boundedPush(proposalLatencySamples, (Date.now() - pending.requestedAt) / 1000);
           boundedPush(executionMismatchSamples, 0);
+          const evidenceId = pendingProposalEvidenceByPosition[pending.localId] || pending.position.proposalEvidenceId;
+          const evidence = proposalEvidenceStore.find(record => record.id === evidenceId);
           pending.position.id = derivContractId;
+          if (evidence) {
+            evidence.status = "EXECUTED";
+            evidence.linkedPositionId = derivContractId;
+            pending.position.proposalEvidenceId = evidence.id;
+            pendingProposalEvidenceByPosition[derivContractId] = evidence.id;
+          }
+          delete pendingProposalEvidenceByPosition[pending.localId];
           if (!activePositions.some((p) => p.id === derivContractId)) {
             activePositions.push(pending.position);
           }
@@ -3647,6 +3919,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     adxVal, atrVal, isDivergent, isReversalCandle, regimeState, sub.hurstVal || 0.5, conviction, sub.lastPersistenceProbability ?? 0.5
   );
   sub.lastSignalProbability = signalProfile;
+  const mlEvidence = computeMLQualityScore(symbol, proposal.strategy, direction, regimeState, signalProfile.confidence, adxVal);
+  indicators.mlQualityScore = mlEvidence.score;
   const executionState = computeExecutionStateModel(symbol);
   const transitionState = computeRegimeTransitionState(symbol);
   const pathRisk = computePathDependentRiskState();
@@ -3664,8 +3938,10 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const strategySignalFloor = proposal.strategy === "MEAN_REVERSION" ? 0 : proposal.strategy === "TREND_EMA" ? 0.72 : 0.78;
   const recentWeight = Math.max(strategySignalFloor, Math.min(1, (sub.totalTrades || 0) / 40));
   const baselineWeight = 1 - recentWeight;
-  const blendedConfidence = parseFloat((signalProfile.confidence * recentWeight + prior.confidence * baselineWeight).toFixed(4));
-  const blendedEdge = parseFloat((signalProfile.expectedEdge * recentWeight + prior.expectedEdge * baselineWeight).toFixed(4));
+  const mlInfluence = mlEvidence.sampleSize >= 10 ? Math.min(0.18, mlEvidence.sampleSize / 250) : 0;
+  const mlConfidenceTilt = (mlEvidence.score - 0.5) * mlInfluence;
+  const blendedConfidence = parseFloat(clamp01((signalProfile.confidence * recentWeight + prior.confidence * baselineWeight) + mlConfidenceTilt).toFixed(4));
+  const blendedEdge = parseFloat(clamp01((signalProfile.expectedEdge * recentWeight + prior.expectedEdge * baselineWeight) + mlConfidenceTilt * 0.8).toFixed(4));
 
   const instantUncertainty: UncertaintyState = {
     epistemicUncertainty: clamp01(1 - signalProfile.confidence),
@@ -4410,6 +4686,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   sub.spikeHarvestState = updateSpikeHarvestState(symbol, currentPrice, atr, epoch, rsiVal, currentBbPct);
   const volForecast = forecastVolatility(symbol);
   recordFeatureSnapshot(symbol, currentPrice, rsiVal, currentBbPct, adx, atr, hMicro, conviction, regimeState, volForecast, epoch);
+  updateShadowProposalOutcomes(symbol, currentPrice, epoch);
   if (epoch % 60 === 0) {
     updateAdaptiveIntelligence("feature_shadow_update");
   }
@@ -4604,6 +4881,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let selectedStopLoss: number | undefined;
     let selectedTakeProfit: number | undefined;
     let auditRes: GovernorDecision | null = null;
+    let selectedEvidence: ProposalEvidenceRecord | null = null;
 
     for (const candidate of signalCandidates) {
       proposalDirection = candidate.direction;
@@ -4696,12 +4974,15 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       };
 
       const candidateAudit = scrutinizeProposal(proposal);
+      const evidence = createProposalEvidenceRecord(proposal, candidateAudit, regimeState);
+      addProposalEvidence(evidence);
       if (!candidateAudit.approved) {
         logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : isPostSpikeProposal ? "POST_SPIKE " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
         startProposalCooldown(symbol, candidate.strategy, proposalDirection);
         continue;
       }
       auditRes = candidateAudit;
+      selectedEvidence = evidence;
       break;
     }
 
@@ -4829,6 +5110,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       entrySignalProbability: auditRes.finalConfidence,
       entryExpectedEdge: auditRes.executionAdjustedEdge,
       entryExpectedSharpeImpact: auditRes.expectedSharpeImpact,
+      proposalEvidenceId: selectedEvidence?.id,
     };
 
     logs.push(`[TRACE] Built position object successfully. Placing live order payload...`);
@@ -4851,6 +5133,14 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       portfolioRemainingRisk: budgets.portfolioRemainingRisk,
       executionAdjustedRisk: auditRes.allocatedRisk,
     });
+    if (selectedEvidence) {
+      selectedEvidence.preflightApproved = orderEconomics.approved;
+      selectedEvidence.preflightReasons = orderEconomics.rejectionReasons;
+      selectedEvidence.maxLossAmount = orderEconomics.maxLossAmount;
+      selectedEvidence.targetRewardAmount = orderEconomics.targetRewardAmount;
+      selectedEvidence.rewardToRisk = orderEconomics.rewardToRisk;
+      selectedEvidence.status = orderEconomics.approved ? "DISPATCHED" : "PREFLIGHT_REJECTED";
+    }
     if (!orderEconomics.approved) {
       logs.push(`[ORDER_PREFLIGHT_REJECT] ${symbol} ${proposalDirection} blocked before live dispatch: ${orderEconomics.rejectionReasons.join(",")} | maxLoss=$${orderEconomics.maxLossAmount.toFixed(2)} reward=$${orderEconomics.targetRewardAmount.toFixed(2)} RR=${orderEconomics.rewardToRisk.toFixed(2)} heat+${(orderEconomics.portfolioHeatContribution * 100).toFixed(2)}%.`);
       startProposalCooldown(symbol, selectedStrategy, proposalDirection);
@@ -4884,11 +5174,19 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
     const requestId = nextDerivRequestId++;
     pendingOrderQueue.push({ requestId, localId: positionId, symbol, direction: proposalDirection, position, requestedAt: Date.now() });
+    if (selectedEvidence) {
+      selectedEvidence.linkedPositionId = positionId;
+      pendingProposalEvidenceByPosition[positionId] = selectedEvidence.id;
+    }
     const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, proposalDirection, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
       const pendingIndex = pendingOrderQueue.findIndex((order) => order.requestId === requestId);
       if (pendingIndex !== -1) pendingOrderQueue.splice(pendingIndex, 1);
+      if (selectedEvidence) {
+        resolveProposalEvidence(selectedEvidence, "BROKER_REJECTED", 0, "SHADOW_RESOLVED", epoch);
+        delete pendingProposalEvidenceByPosition[positionId];
+      }
       logs.push(`[ORDER_FAILED] Live order dispatch failed for Sub-algorithm ${sub.name}. Position not tracked.`);
       return;
     }
@@ -5522,6 +5820,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     entrySignalProbability: pos.entrySignalProbability,
     entryExpectedEdge: pos.entryExpectedEdge,
     entryExpectedSharpeImpact: pos.entryExpectedSharpeImpact,
+    proposalEvidenceId: pos.proposalEvidenceId,
   };
 
   const latencySample = Math.abs((epoch - (pos.closeRequestedAt || pos.entryEpoch)) || 1);
@@ -5534,6 +5833,12 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   }
 
   completedTrades.push(record);
+  const evidenceId = pos.proposalEvidenceId || pendingProposalEvidenceByPosition[pos.id];
+  const evidence = proposalEvidenceStore.find(item => item.id === evidenceId);
+  if (evidence) {
+    resolveProposalEvidence(evidence, finalPnl > 0 ? "WIN" : "LOSS", finalPnl, "SETTLED", epoch);
+  }
+  delete pendingProposalEvidenceByPosition[pos.id];
   updateLongHorizonMemory(record);
   updateAdaptiveIntelligence("settlement_update");
   scheduleStateSaveToSupabase();
@@ -7859,6 +8164,16 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
       readinessReasons: realCapitalSnapshot.readinessReasons,
     },
     adaptiveIntelligence: adaptiveIntelligenceState,
+    mlEvidence: {
+      modelVersion: ML_EVIDENCE_MODEL_VERSION,
+      proposalsStored: proposalEvidenceStore.length,
+      resolvedProposals: proposalEvidenceStore.filter(record => Boolean(record.outcome)).length,
+      bucketCount: Object.keys(mlEvidenceStats).length,
+      recentProposals: proposalEvidenceStore.slice(-25),
+      topBuckets: Object.values(mlEvidenceStats)
+        .sort((a, b) => b.samples - a.samples)
+        .slice(0, 20),
+    },
     riskTelemetry: riskTelemetry.slice(-250),
     shadowLiveValidation: SHADOW_LIVE_VALIDATION,
     subAlgorithms,
