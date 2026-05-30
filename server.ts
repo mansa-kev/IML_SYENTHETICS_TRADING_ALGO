@@ -72,6 +72,15 @@ const TREND_SHORT_EMA = 50;   // short EMA length (ticks)
 const TREND_LONG_EMA = 200;   // long EMA length (ticks)
 const TREND_MIN_ADX = 25;     // minimum ADX to consider a trend
 
+// Post-spike harvest parameters for Crash/Boom event reversals
+const POST_SPIKE_ENTRY_MIN_TICKS = 10;
+const POST_SPIKE_ENTRY_MAX_TICKS = 20;
+const POST_SPIKE_MIN_RECOVERY_PROB = 0.45;
+const POST_SPIKE_MIN_EXHAUSTION_PROB = 0.45;
+const POST_SPIKE_TARGET_RETRACE = 0.50;
+const POST_SPIKE_STOP_ATR_BUFFER = 0.35;
+const POST_SPIKE_MIN_RR = 2.50;
+
 // Pending Deriv order registry — holds local positions until Deriv returns a real contract_id
 type PendingDerivOrder = {
   requestId: number;
@@ -3128,7 +3137,10 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
   const prior = subAlgorithms[symbol]?.spikeHarvestState || {
     spikeDetected: false,
     spikeEpoch: 0,
+    spikeTickIndex: 0,
     spikeDirection: undefined,
+    spikePrePrice: 0,
+    spikeExtremePrice: 0,
     spikeMagnitudeAtr: 0,
     spikeExhaustionProbability: 0,
     recoveryProbability: 0,
@@ -3151,7 +3163,10 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
     return {
       spikeDetected: true,
       spikeEpoch: epoch,
+      spikeTickIndex: prices.length,
       spikeDirection: actualDirection,
+      spikePrePrice: parseFloat(prevPrice.toFixed(5)),
+      spikeExtremePrice: parseFloat(currentPrice.toFixed(5)),
       spikeMagnitudeAtr: parseFloat(magnitudeAtr.toFixed(3)),
       spikeExhaustionProbability: 0.05,
       recoveryProbability: 0,
@@ -3171,7 +3186,11 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
     };
   }
 
-  const ticksElapsed = Math.max(0, epoch - prior.spikeEpoch);
+  const ticksElapsed = Math.max(0, prices.length - (prior.spikeTickIndex || prices.length));
+  const spikeExtremePrice = prior.spikeDirection === "UP"
+    ? Math.max(prior.spikeExtremePrice || currentPrice, currentPrice)
+    : Math.min(prior.spikeExtremePrice || currentPrice, currentPrice);
+  const spikePrePrice = prior.spikePrePrice || prevPrice;
   const exhaustionByTime = normalizeRange(ticksElapsed, 8, 42);
   const rsiExtremeRelief = symbol === "BOOM500" ? normalizeRange(82 - rsiVal, 0, 28) : normalizeRange(rsiVal - 18, 0, 28);
   const bandReentry = symbol === "BOOM500" ? normalizeRange(1.15 - bbPct, 0, 0.55) : normalizeRange(bbPct + 0.15, 0, 0.55);
@@ -3185,13 +3204,71 @@ function updateSpikeHarvestState(symbol: string, currentPrice: number, atr: numb
   return {
     spikeDetected: !expired,
     spikeEpoch: expired ? 0 : prior.spikeEpoch,
+    spikeTickIndex: expired ? 0 : prior.spikeTickIndex,
     spikeDirection: expired ? undefined : prior.spikeDirection,
+    spikePrePrice: expired ? 0 : parseFloat(spikePrePrice.toFixed(5)),
+    spikeExtremePrice: expired ? 0 : parseFloat(spikeExtremePrice.toFixed(5)),
     spikeMagnitudeAtr: expired ? 0 : prior.spikeMagnitudeAtr,
     spikeExhaustionProbability: parseFloat((expired ? 0 : spikeExhaustionProbability).toFixed(4)),
     recoveryProbability: parseFloat((expired ? 0 : recoveryProbability).toFixed(4)),
     persistenceDecay: parseFloat((expired ? 0 : persistenceDecay).toFixed(4)),
     volatilityCollapseProbability: parseFloat((expired ? 0 : volatilityCollapseProbability).toFixed(4)),
     postSpikeTicksElapsed: expired ? 0 : ticksElapsed,
+  };
+}
+
+function buildPostSpikeHarvestSetup(symbol: string, currentPrice: number, atr: number, spikeState?: SpikeHarvestState): null | {
+  direction: "LONG" | "SHORT";
+  stopLoss: number;
+  takeProfit: number;
+  rewardToRisk: number;
+  reason: string;
+} {
+  if (symbol !== "CRASH500" && symbol !== "BOOM500") return null;
+  if (!spikeState?.spikeDetected || !spikeState.spikeDirection) return null;
+
+  const ticksElapsed = spikeState.postSpikeTicksElapsed || 0;
+  if (ticksElapsed < POST_SPIKE_ENTRY_MIN_TICKS || ticksElapsed > POST_SPIKE_ENTRY_MAX_TICKS) return null;
+  if ((spikeState.recoveryProbability || 0) < POST_SPIKE_MIN_RECOVERY_PROB) return null;
+  if ((spikeState.spikeExhaustionProbability || 0) < POST_SPIKE_MIN_EXHAUSTION_PROB) return null;
+
+  const preSpikePrice = spikeState.spikePrePrice || 0;
+  const spikeExtreme = spikeState.spikeExtremePrice || 0;
+  if (preSpikePrice <= 0 || spikeExtreme <= 0 || currentPrice <= 0) return null;
+
+  const stopBuffer = Math.max(atr * POST_SPIKE_STOP_ATR_BUFFER, currentPrice * 0.0004);
+  let direction: "LONG" | "SHORT";
+  let stopLoss: number;
+  let takeProfit: number;
+  let riskDistance: number;
+  let rewardDistance: number;
+
+  if (symbol === "CRASH500" && spikeState.spikeDirection === "DOWN") {
+    direction = "LONG";
+    stopLoss = spikeExtreme - stopBuffer;
+    takeProfit = spikeExtreme + Math.abs(preSpikePrice - spikeExtreme) * POST_SPIKE_TARGET_RETRACE;
+    riskDistance = currentPrice - stopLoss;
+    rewardDistance = takeProfit - currentPrice;
+  } else if (symbol === "BOOM500" && spikeState.spikeDirection === "UP") {
+    direction = "SHORT";
+    stopLoss = spikeExtreme + stopBuffer;
+    takeProfit = spikeExtreme - Math.abs(spikeExtreme - preSpikePrice) * POST_SPIKE_TARGET_RETRACE;
+    riskDistance = stopLoss - currentPrice;
+    rewardDistance = currentPrice - takeProfit;
+  } else {
+    return null;
+  }
+
+  if (riskDistance <= 0 || rewardDistance <= 0) return null;
+  const rewardToRisk = rewardDistance / riskDistance;
+  if (rewardToRisk < POST_SPIKE_MIN_RR) return null;
+
+  return {
+    direction,
+    stopLoss,
+    takeProfit,
+    rewardToRisk: parseFloat(rewardToRisk.toFixed(2)),
+    reason: `Post-spike harvest (${ticksElapsed} ticks, recovery=${((spikeState.recoveryProbability || 0) * 100).toFixed(0)}%, exhaustion=${((spikeState.spikeExhaustionProbability || 0) * 100).toFixed(0)}%, RR=${rewardToRisk.toFixed(2)})`,
   };
 }
 
@@ -4327,20 +4404,42 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const trendDir = detectTrendEMA(prices, TREND_SHORT_EMA, TREND_LONG_EMA);
   const trendSignalActive = trendDir !== 0 && adx >= TREND_MIN_ADX;
   const trendReason = `Trend mode (EMA${TREND_SHORT_EMA}/${TREND_LONG_EMA}, ADX=${adx.toFixed(1)})`;
+  const postSpikeSetup = buildPostSpikeHarvestSetup(symbol, currentPrice, atr, spikeState);
 
   const minActivation = Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
   type TickSignalCandidate = {
     isTrend: boolean;
+    isPostSpike: boolean;
     direction: "LONG" | "SHORT";
     score: number;
     conviction: number;
     conditions: string[];
     reason: string;
+    stopLoss?: number;
+    takeProfit?: number;
   };
   const signalCandidates: TickSignalCandidate[] = [];
+  if (postSpikeSetup) {
+    signalCandidates.push({
+      isTrend: false,
+      isPostSpike: true,
+      direction: postSpikeSetup.direction,
+      score: 5,
+      conviction: 0.82,
+      conditions: [
+        "POST_SPIKE_HARVEST",
+        `SPIKE_WAIT_${spikeState?.postSpikeTicksElapsed || 0}_TICKS`,
+        `SPIKE_RR_${postSpikeSetup.rewardToRisk}`,
+      ],
+      reason: postSpikeSetup.reason,
+      stopLoss: postSpikeSetup.stopLoss,
+      takeProfit: postSpikeSetup.takeProfit,
+    });
+  }
   if (trendSignalActive) {
     signalCandidates.push({
       isTrend: true,
+      isPostSpike: false,
       direction: trendDir > 0 ? "LONG" : "SHORT",
       score: 5,
       conviction: 0.80,
@@ -4352,6 +4451,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   if (signalStrength >= minActivation) {
     signalCandidates.push({
       isTrend: false,
+      isPostSpike: false,
       direction,
       score: meanReversionScore,
       conviction: sub.convictionScore !== undefined ? sub.convictionScore : 1.0,
@@ -4372,6 +4472,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let proposalConviction = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
     let selectedConditions = conditionsList;
     let isTrendProposal = false;
+    let isPostSpikeProposal = false;
+    let selectedStopLoss: number | undefined;
+    let selectedTakeProfit: number | undefined;
     let auditRes: GovernorDecision | null = null;
 
     for (const candidate of signalCandidates) {
@@ -4380,15 +4483,18 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       proposalConviction = candidate.conviction;
       selectedConditions = candidate.conditions;
       isTrendProposal = candidate.isTrend;
+      isPostSpikeProposal = candidate.isPostSpike;
+      selectedStopLoss = candidate.stopLoss;
+      selectedTakeProfit = candidate.takeProfit;
 
-      logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}${isTrendProposal ? " [TREND]" : ""}`);
+      logs.push(`[TRACE] Entering execution block for ${symbol} with score ${score}. EffMode: ${tickEffMode}${isTrendProposal ? " [TREND]" : isPostSpikeProposal ? " [POST_SPIKE]" : ""}`);
       // ----------------------------------------------------
       // MITIGATION: Extra filtration based on contract mode
       // ----------------------------------------------------
       const currentMinConf = (adx > 30) ? Math.max(2, sub.minConfluenceScore - 1) : sub.minConfluenceScore;
       if (tickEffMode === "MULTIPLIER") {
         // Multipliers get crushed if the StopLoss triggers too often in noise.
-        if (!isTrendProposal && score < currentMinConf && rsiVal > 40 && rsiVal < 60) {
+        if (!isTrendProposal && !isPostSpikeProposal && score < currentMinConf && rsiVal > 40 && rsiVal < 60) {
           logs.push(`[TRACE] Exiting mean-reversion candidate: multiplier chop zone`);
           continue;
         }
@@ -4400,7 +4506,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       
       // Scale down dynamically using our SFT-V2 Conviction Score Composite (C) for fractal entries
       const cScore = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
-      if (!isTrendProposal && sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
+      if (!isTrendProposal && !isPostSpikeProposal && sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
         const priorStake = stake;
         stake = stake * cScore;
         logs.push(`[SFT_V2_RISK] 🎚️ Active Conviction Composite scaling (C: ${(cScore * 100).toFixed(1)}%) adjusted Kelly stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)}.`);
@@ -4408,6 +4514,10 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
         const priorStake = stake;
         stake = stake * proposalConviction;
         logs.push(`[TREND_MODE] ${symbol} ${proposalDirection} proposal generated by EMA trend detector. Stake scaled from $${priorStake.toFixed(2)} to $${stake.toFixed(2)} at ${(proposalConviction * 100).toFixed(0)}% conviction.`);
+      } else if (isPostSpikeProposal) {
+        const priorStake = stake;
+        stake = stake * proposalConviction;
+        logs.push(`[POST_SPIKE_HARVEST] ${symbol} ${proposalDirection} strict reversal candidate submitted. Stake scaled from $${priorStake.toFixed(2)} to $${stake.toFixed(2)} at ${(proposalConviction * 100).toFixed(0)}% conviction.`);
       } else {
         logs.push(`[TRACE] Sized stake: baseStake=${baseStake}, multiplier=${sub.targetRiskStakeMultiplier}, final=${stake}`);
       }
@@ -4444,7 +4554,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
       const candidateAudit = scrutinizeProposal(proposal);
       if (!candidateAudit.approved) {
-        logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
+        logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : isPostSpikeProposal ? "POST_SPIKE " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
         continue;
       }
       auditRes = candidateAudit;
@@ -4470,13 +4580,20 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     const atrBuffer = atr * Math.max(1.0, Math.min(sub.atrStopMultiplier, adaptiveExit.stopMultiplier));
     let stopLossDistance = Math.max(currentPrice * 0.003, atrBuffer);
     let takeProfitDistance = stopLossDistance * adaptiveExit.tpMultiplier;
+    if (selectedStopLoss !== undefined && selectedTakeProfit !== undefined) {
+      stopLossDistance = Math.abs(currentPrice - selectedStopLoss);
+      takeProfitDistance = Math.abs(selectedTakeProfit - currentPrice);
+      logs.push(`[POST_SPIKE_HARVEST] Using spike-anchored exits for ${symbol}: stop=${selectedStopLoss.toFixed(5)}, target=${selectedTakeProfit.toFixed(5)}, RR=${(takeProfitDistance / Math.max(1e-9, stopLossDistance)).toFixed(2)}.`);
+    }
     let chosenMultiplier = DERIV_SUPPORTED_MULTIPLIERS[0];
     let targetRisk = 25.00;
 
     if (tickEffMode === "HYBRID_LINEAR") {
       const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
       targetRisk = parseFloat(Math.max(1.0, Math.min(calculatedRisk, balance * 0.1)).toFixed(2));
-      takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
+      if (selectedTakeProfit === undefined) {
+        takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
+      }
       stake = parseFloat(Math.max(0.35, Math.min(targetRisk, balance * 0.1)).toFixed(2));
       logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Allocated Stake/Margin=$${stake}`);
     } else if (tickEffMode === "MULTIPLIER") {
@@ -4505,9 +4622,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
         }
       }
 
-      // Recalculate stopLossDistance and takeProfitDistance with an adaptive 1.25x risk-reward ratio
-      // to avoid giving back open profits and highly increase hit rate
-      takeProfitDistance = stopLossDistance * 1.6;
+      if (selectedTakeProfit === undefined) {
+        // Recalculate stopLossDistance and takeProfitDistance with an adaptive 1.25x risk-reward ratio
+        // to avoid giving back open profits and highly increase hit rate
+        takeProfitDistance = stopLossDistance * 1.6;
+      }
 
       // Scale stake down dynamically if expected loss is too high
       const expectedLossPct = (stopLossDistance / currentPrice) * chosenMultiplier;
@@ -4527,8 +4646,8 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
     }
 
-    const stopLoss = proposalDirection === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance);
-    const takeProfit = proposalDirection === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance);
+    const stopLoss = selectedStopLoss !== undefined ? selectedStopLoss : (proposalDirection === "LONG" ? (currentPrice - stopLossDistance) : (currentPrice + stopLossDistance));
+    const takeProfit = selectedTakeProfit !== undefined ? selectedTakeProfit : (proposalDirection === "LONG" ? (currentPrice + takeProfitDistance) : (currentPrice - takeProfitDistance));
 
     let contractType: ActivePosition["contractType"] = proposalDirection === "LONG" ? "MULTUP" : "MULTDOWN";
     if (tickEffMode === "HYBRID_LINEAR") {

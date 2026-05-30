@@ -282,7 +282,10 @@ export interface OpportunityDensityMetrics {
 export interface SpikeHarvestState {
   spikeDetected: boolean;
   spikeEpoch: number;
+  spikeTickIndex?: number;
   spikeDirection?: "UP" | "DOWN";
+  spikePrePrice?: number;
+  spikeExtremePrice?: number;
   spikeMagnitudeAtr?: number;
   spikeExhaustionProbability: number;
   recoveryProbability: number;
