@@ -2079,7 +2079,7 @@ async function loadStateFromSupabase() {
             sub.atrStopMultiplier = Math.max(0.5, Math.min(5.0, sub.atrStopMultiplier));
             sub.bbStd             = Math.max(1.8, Math.min(3.5, sub.bbStd));
             sub.maxTicksInTrade   = Math.max(20,  Math.min(500, sub.maxTicksInTrade));
-            if (sub.minConfluenceScore > 4) sub.minConfluenceScore = 4;
+            sub.minConfluenceScore = Math.max(1, Math.min(2, sub.minConfluenceScore));
           }
         });
       }
@@ -4231,7 +4231,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       
       // Auto-tuning runs whether paused or not — recalibrate during downtime
       if (syntheticDelta < -0.3) {
-         sub.minConfluenceScore = Math.min(4, sub.minConfluenceScore + 1);
+         sub.minConfluenceScore = Math.min(2, sub.minConfluenceScore + 1);
          if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
       } else if (syntheticDelta > 0.3 && sub.minConfluenceScore > 2) {
          sub.minConfluenceScore--;
@@ -7341,7 +7341,7 @@ Use clean markdown. Do not recommend Martingale or aggressive profit chasing.`;
 
   try {
     const response = await client.models.generateContent({
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       contents: contextPrompt,
     });
     return `${deterministicReport}\n\n---\n\n## AI Advisory Overlay\n${response.text || "No advisory response received from model."}`;
@@ -7732,6 +7732,8 @@ app.post("/api/config", (req, res) => {
     if (hybridConfig.hybridGreeningTriggerPct !== undefined) hybridGreeningTriggerPct = Number(hybridConfig.hybridGreeningTriggerPct);
     logs.push(`[IML_HYBRID_RISK_ENGINE] Applied updated risk parameters and protection shield metrics (Risk: ${hybridRiskType === "FIXED" ? "$" + hybridRiskFixedAmount : hybridRiskPercent + "%"}, Reward: ${hybridRewardRatio}R).`);
   }
+
+  scheduleStateSaveToSupabase(true);
 
   res.json({
     success: true,
