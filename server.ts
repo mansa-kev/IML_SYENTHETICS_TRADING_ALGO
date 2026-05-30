@@ -202,6 +202,7 @@ const candleBuffers: Record<string, Candle[]> = {
 // ==========================================
 type StrategyKind = "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
 type ExecutionTemplateKind = "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
+type TradeOutcomeAttribution = "signal_failure" | "exit_policy" | "thesis_realized" | "manual_override";
 type StrategyExitProfile = {
   targetMultiple: number;
   hybridBreakEvenR: number;
@@ -209,6 +210,17 @@ type StrategyExitProfile = {
   multiplierBreakEvenProgress: number;
   multiplierProfitLockShare: number;
   multiplierTrailShare: number;
+};
+type GovernorRoleProfile = {
+  focusAlignmentWeight: number;
+  baseConfidenceFloor: number;
+  executionEdgeWeight: number;
+  transitionPenaltyScale: number;
+  uncertaintyPenaltyScale: number;
+  executionPenaltyScale: number;
+  minExpectedEdge: number;
+  maxLiveUncertainty: number;
+  riskBudgetWeight: number;
 };
 
 const ENGINE_METADATA: Record<string, { engineName: string; strategyAssignment: StrategyKind; executionTemplate: ExecutionTemplateKind; descriptor: string }> = {
@@ -286,6 +298,59 @@ function getStrategyExitProfile(strategy: StrategyKind): StrategyExitProfile {
         multiplierBreakEvenProgress: 0.20,
         multiplierProfitLockShare: 0.05,
         multiplierTrailShare: 0.25,
+      };
+  }
+}
+
+function getGovernorRoleProfile(strategy: StrategyKind): GovernorRoleProfile {
+  switch (strategy) {
+    case "MEAN_REVERSION":
+      return {
+        focusAlignmentWeight: 0.42,
+        baseConfidenceFloor: 0.82,
+        executionEdgeWeight: 0.18,
+        transitionPenaltyScale: 1.08,
+        uncertaintyPenaltyScale: 0.94,
+        executionPenaltyScale: 0.92,
+        minExpectedEdge: 0.36,
+        maxLiveUncertainty: 0.70,
+        riskBudgetWeight: 1.0,
+      };
+    case "TREND_EMA":
+      return {
+        focusAlignmentWeight: 0.48,
+        baseConfidenceFloor: 0.80,
+        executionEdgeWeight: 0.20,
+        transitionPenaltyScale: 0.90,
+        uncertaintyPenaltyScale: 0.96,
+        executionPenaltyScale: 0.88,
+        minExpectedEdge: 0.44,
+        maxLiveUncertainty: 0.66,
+        riskBudgetWeight: 0.85,
+      };
+    case "POST_SPIKE_HARVEST":
+      return {
+        focusAlignmentWeight: 0.52,
+        baseConfidenceFloor: 0.81,
+        executionEdgeWeight: 0.19,
+        transitionPenaltyScale: 0.86,
+        uncertaintyPenaltyScale: 0.98,
+        executionPenaltyScale: 0.92,
+        minExpectedEdge: 0.42,
+        maxLiveUncertainty: 0.68,
+        riskBudgetWeight: 0.6,
+      };
+    default:
+      return {
+        focusAlignmentWeight: 0.40,
+        baseConfidenceFloor: 0.80,
+        executionEdgeWeight: 0.20,
+        transitionPenaltyScale: 1.0,
+        uncertaintyPenaltyScale: 1.0,
+        executionPenaltyScale: 1.0,
+        minExpectedEdge: 0.40,
+        maxLiveUncertainty: 0.68,
+        riskBudgetWeight: 0.8,
       };
   }
 }
@@ -1545,6 +1610,7 @@ function getExecutableRiskFloorForProposal(proposal: Pick<StrategyProposal, "eff
 function computeRiskBudget(symbol: string, governorConfidenceScale = 1): { accountRiskBudget: number; symbolRiskBudget: number; portfolioRemainingRisk: number; executionHealthScale: number; riskBudget: number } {
   const equity = Math.max(0, balance);
   const caps = getRiskBudgetCaps(equity);
+  const roleProfile = getGovernorRoleProfile(getEngineMetadata(symbol).strategyAssignment);
   const baseRiskPct = caps.maxRiskPct;
   const uncertaintyScale = clamp01(1 - Math.max(uncertaintyState.epistemicUncertainty, uncertaintyState.marketUncertainty) * 0.65);
   const executionState = adaptiveIntelligenceState.executionState ?? computeExecutionStateModel(symbol);
@@ -1562,7 +1628,7 @@ function computeRiskBudget(symbol: string, governorConfidenceScale = 1): { accou
   const stateScale = autonomousStateRiskScale(adaptiveIntelligenceState.autonomousState ?? AutonomousState.NORMAL);
   const riskBudget = equity * baseRiskPct * clamp01(governorConfidenceScale) * uncertaintyScale * executionHealthScale * portfolioHeatScale * drawdownScale * transitionState.adaptiveRiskMultiplier * pathRisk.adaptiveDefensiveScale * epistemic.uncertaintyAdjustedRisk * calibrationRiskScale * selfHealingScale * Math.max(0.10, validationScale) * stateScale;
   const accountRiskBudget = equity * caps.maxRiskPct;
-  const symbolRiskBudget = accountRiskBudget * (symbol === "R_25" ? 1 : symbol === "R_75" ? 0.75 : 0.5);
+  const symbolRiskBudget = accountRiskBudget * roleProfile.riskBudgetWeight;
   const portfolioRemainingRisk = Math.max(0, (equityCurveThrottle.portfolioHeatCap - (portfolioSnapshot.correlationAdjustedHeat ?? portfolioSnapshot.totalHeat)) * equity);
   return {
     accountRiskBudget: parseFloat(accountRiskBudget.toFixed(2)),
@@ -1580,11 +1646,12 @@ function assertFinalRiskAuthority(finalRisk: number, governorAllocatedRisk: numb
 }
 
 function shouldUseMinimumExecutableRiskFloor(proposal: StrategyProposal, finalConfidence: number, signalProfile: ExtendedSignalProbability, portfolioRisk: PortfolioRiskState): boolean {
+  const roleProfile = getGovernorRoleProfile(proposal.strategy);
   if (proposal.strategy === "MEAN_REVERSION") return false;
   if (proposal.effMode !== "HYBRID_LINEAR" && proposal.effMode !== "MULTIPLIER") return false;
   if (finalConfidence < MIN_CONFIDENCE_THRESHOLD) return false;
-  if (signalProfile.expectedEdge < 0.50) return false;
-  if (signalProfile.uncertainty > 0.65) return false;
+  if (signalProfile.expectedEdge < Math.max(0.50, roleProfile.minExpectedEdge)) return false;
+  if (signalProfile.uncertainty > roleProfile.maxLiveUncertainty) return false;
   if (portfolioRisk.drawdownSeverity > 0.02) return false;
   if (activePositions.length > 0) return false;
   return true;
@@ -1622,6 +1689,13 @@ function buildCanonicalExposureModel(input: { equity: number; stake: number; eff
     exposurePct: parseFloat((equity > 0 ? (stake * effectiveMultiplier) / equity : 0).toFixed(6)),
     portfolioHeatContribution: parseFloat(Math.max(0, (heatWithCandidate.correlationAdjustedHeat ?? heatWithCandidate.totalHeat) - (heatNow.correlationAdjustedHeat ?? heatNow.totalHeat)).toFixed(6)),
   };
+}
+
+function classifyTradeOutcomeAttribution(reason: TradeRecord["exitReason"], pnl: number): TradeOutcomeAttribution {
+  if (reason === "manual") return "manual_override";
+  if (reason === "time_exit" || reason === "early_cutoff" || reason === "circuit_breaker") return "exit_policy";
+  if (reason === "take_profit" && pnl >= 0) return "thesis_realized";
+  return "signal_failure";
 }
 
 function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
@@ -2070,6 +2144,7 @@ function logSupabaseSetupInstructions() {
     `  entry_signal_probability numeric,`,
     `  entry_expected_edge numeric,`,
     `  entry_expected_sharpe_impact numeric,`,
+    `  outcome_attribution text,`,
     `  proposal_evidence_id text,`,
     `  tick_stream jsonb,`,
     `  created_at timestamp with time zone DEFAULT now()`,
@@ -2495,6 +2570,7 @@ async function saveTradeToSupabase(record: TradeRecord) {
         engine_name: record.engineName || null,
         strategy_tag: record.strategyTag || null,
         execution_template: record.executionTemplate || null,
+        outcome_attribution: record.outcomeAttribution || null,
         contract_type: record.contractType,
         direction: record.direction,
         entry_epoch: record.entryEpoch,
@@ -2552,6 +2628,7 @@ async function bulkSyncTradesToSupabase() {
       engine_name: record.engineName || null,
       strategy_tag: record.strategyTag || null,
       execution_template: record.executionTemplate || null,
+      outcome_attribution: record.outcomeAttribution || null,
       contract_type: record.contractType,
       direction: record.direction,
       entry_epoch: record.entryEpoch,
@@ -3991,8 +4068,7 @@ let activeTradeType: "MULTIPLIER" | "HYBRID_LINEAR" = "HYBRID_LINEAR";
 
 function getEffectiveTradeType(symbol?: string): "MULTIPLIER" | "HYBRID_LINEAR" {
   if (symbol) return getEmbeddedTradeType(symbol);
-  if (tradingMode === "AUTO") return activeTradeType;
-  return tradingMode as "MULTIPLIER" | "HYBRID_LINEAR";
+  return getEmbeddedTradeType(governorFocusSymbol);
 }
 
 // ==========================================
@@ -4008,23 +4084,29 @@ async function runGovernorAudit() {
   for (const symbol of Object.keys(subAlgorithms)) {
     const sub = subAlgorithms[symbol];
     const recentWinRate = sub.recentWinRate || 0.5;
+    const engineMeta = getEngineMetadata(symbol);
     
-    // Agentic Adaptation: If win rate drops below 35%, the Governor "Intervenes"
+    // Role-preserving adaptation: tune risk and thresholds within each engine's lane.
     if (recentWinRate < 0.35 && sub.totalTrades > 5) {
-      logs.push(`[GOVERNOR_INTERVENTION] 🚨 ${sub.name} exhibits degraded efficacy (WR: ${(recentWinRate * 100).toFixed(1)}%). Initiating personality realignment...`);
-      
-      // Perform a "Personality Shift"
-      if (sub.personality.includes("Fader")) {
-         sub.personality = `${sub.personality.split(" ")[0]} Divergence Sniper`;
-         sub.rsiOversoldThreshold = 25;
-         sub.rsiOverboughtThreshold = 75;
+      const priorRiskMult = sub.targetRiskStakeMultiplier;
+      const priorTicks = sub.maxTicksInTrade;
+      sub.targetRiskStakeMultiplier = parseFloat(Math.max(0.55, sub.targetRiskStakeMultiplier * 0.92).toFixed(2));
+      if (engineMeta.strategyAssignment === "MEAN_REVERSION") {
+        sub.maxTicksInTrade = Math.max(120, Math.round(sub.maxTicksInTrade * 0.94));
+        sub.rsiOversoldThreshold = Math.min(35, sub.rsiOversoldThreshold + 1);
+        sub.rsiOverboughtThreshold = Math.max(65, sub.rsiOverboughtThreshold - 1);
+      } else if (engineMeta.strategyAssignment === "TREND_EMA") {
+        sub.maxTicksInTrade = Math.max(150, Math.round(sub.maxTicksInTrade * 0.90));
+        sub.atrStopMultiplier = parseFloat(Math.max(2.8, sub.atrStopMultiplier * 0.97).toFixed(2));
       } else {
-         sub.personality = `${sub.personality.split(" ")[0]} Mean Fader`;
-         sub.rsiOversoldThreshold = 35;
-         sub.rsiOverboughtThreshold = 65;
+        sub.maxTicksInTrade = Math.max(120, Math.round(sub.maxTicksInTrade * 0.92));
+        sub.minConfluenceScore = Math.min(4, Math.max(2, sub.minConfluenceScore + 1));
       }
-      
-      logs.push(`[GOVERNOR_INTERVENTION] ✅ Reconfigured ${symbol} to '${sub.personality}' profile for better regime fit.`);
+      logs.push(`[GOVERNOR_INTERVENTION] ${sub.name} underperformed (WR ${(recentWinRate * 100).toFixed(1)}%). Preserved role ${engineMeta.strategyAssignment} and tightened internal risk from x${priorRiskMult.toFixed(2)} to x${sub.targetRiskStakeMultiplier.toFixed(2)} with maxTicks ${priorTicks} -> ${sub.maxTicksInTrade}.`);
+    } else if (recentWinRate > 0.58 && sub.totalTrades >= 8) {
+      const priorRiskMult = sub.targetRiskStakeMultiplier;
+      sub.targetRiskStakeMultiplier = parseFloat(Math.min(0.90, sub.targetRiskStakeMultiplier * 1.04).toFixed(2));
+      logs.push(`[GOVERNOR_INTERVENTION] ${sub.name} retained role ${engineMeta.strategyAssignment} and earned a measured risk restore from x${priorRiskMult.toFixed(2)} to x${sub.targetRiskStakeMultiplier.toFixed(2)}.`);
     }
   }
   
@@ -4050,6 +4132,7 @@ function evaluateGovernorFocus() {
     const regime = sub.regimeState;
     const prior = INSTRUMENT_PRIORS[sub.symbol] || { confidence: 0.5, expectedEdge: 0.42, sharpe: 0.45 };
     const engineMeta = getEngineMetadata(sub.symbol);
+    const roleProfile = getGovernorRoleProfile(engineMeta.strategyAssignment);
     const heat = computePortfolioHeatSnapshot({ symbol: sub.symbol, stake: Math.max(1, balance * 0.0025), direction: "LONG" });
     const confidence = signal?.confidence ?? prior.confidence;
     const edge = signal?.expectedEdge ?? prior.expectedEdge;
@@ -4059,10 +4142,10 @@ function evaluateGovernorFocus() {
     const heatPenalty = Math.max(0, (heat.correlationAdjustedHeat ?? heat.totalHeat) - equityCurveThrottle.portfolioHeatCap) * 1.4;
     const roleAlignment =
       engineMeta.strategyAssignment === "MEAN_REVERSION"
-        ? ((regime?.meanReversionProbability ?? 0) * 0.38 + Math.max(0, 1 - uncertainty) * 0.08)
+        ? ((regime?.meanReversionProbability ?? 0) * roleProfile.focusAlignmentWeight + Math.max(0, 1 - uncertainty) * 0.08)
         : engineMeta.strategyAssignment === "TREND_EMA"
-          ? ((regime?.trendProbability ?? 0) * 0.34 + (sub.lastPersistenceProbability ?? 0) * 0.20 + Math.max(0, edge - 0.45) * 0.12)
-          : ((sub.spikeHarvestState?.spikeDetected ? 0.25 : 0) + (sub.spikeHarvestState?.recoveryProbability ?? 0) * 0.20 + (sub.spikeHarvestState?.spikeExhaustionProbability ?? 0) * 0.18);
+          ? ((regime?.trendProbability ?? 0) * roleProfile.focusAlignmentWeight + (sub.lastPersistenceProbability ?? 0) * 0.20 + Math.max(0, edge - roleProfile.minExpectedEdge) * 0.12)
+          : ((sub.spikeHarvestState?.spikeDetected ? 0.25 : 0) + (sub.spikeHarvestState?.recoveryProbability ?? 0) * 0.20 + (sub.spikeHarvestState?.spikeExhaustionProbability ?? 0) * roleProfile.focusAlignmentWeight * 0.35);
     const localMaxScore = prior.sharpe * 0.30 + edge * 0.28 + confidence * 0.22 + executionQuality * 0.16 + roleAlignment - uncertainty * 0.22 - regimePenalty - heatPenalty;
     const localBestType: "MULTIPLIER" | "HYBRID_LINEAR" = getEmbeddedTradeType(sub.symbol);
 
@@ -4286,6 +4369,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const mlConfidenceTilt = (mlEvidence.score - 0.5) * mlInfluence;
   const blendedConfidence = parseFloat(clamp01((signalProfile.confidence * recentWeight + prior.confidence * baselineWeight) + mlConfidenceTilt).toFixed(4));
   const blendedEdge = parseFloat(clamp01((signalProfile.expectedEdge * recentWeight + prior.expectedEdge * baselineWeight) + mlConfidenceTilt * 0.8).toFixed(4));
+  const roleProfile = getGovernorRoleProfile(proposal.strategy);
 
   const instantUncertainty: UncertaintyState = {
     epistemicUncertainty: clamp01(1 - signalProfile.confidence),
@@ -4316,7 +4400,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     transitionPenalty *= 0.60;
   }
   transitionPenalty += transitionState.instabilityScore * 0.28 + transitionState.confidenceDecay * 0.20;
-  transitionPenalty = Math.min(0.70, Math.max(0, transitionPenalty));
+  transitionPenalty = Math.min(0.70, Math.max(0, transitionPenalty * roleProfile.transitionPenaltyScale));
 
   let correlationPenalty = 0;
   const sameDirection = activePositions.filter(p => p.direction === direction).length;
@@ -4339,13 +4423,13 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (portfolioRisk.entropyLevel > 0.40) uncertaintyPenalty = 0.10 + (portfolioRisk.entropyLevel - 0.40) * 0.9;
   if (uncertaintyState.marketUncertainty > 0.55) uncertaintyPenalty += 0.15;
   if (signalProfile.uncertainty > 0.55) uncertaintyPenalty += (signalProfile.uncertainty - 0.55) * 0.55;
-  uncertaintyPenalty = Math.min(0.55, uncertaintyPenalty);
+  uncertaintyPenalty = Math.min(0.55, uncertaintyPenalty * roleProfile.uncertaintyPenaltyScale);
 
   let executionPenalty = 0;
   if (portfolioRisk.drawdownSeverity > 0.02) executionPenalty = 0.10 + portfolioRisk.drawdownSeverity * 1.8;
   if (signalProfile.executionQuality < 0.55) executionPenalty += (0.55 - signalProfile.executionQuality) * 0.6;
   executionPenalty += executionState.degradationProbability * 0.45 + Math.max(0, 0.70 - executionState.executionReliability) * 0.35;
-  executionPenalty = Math.min(0.65, executionPenalty);
+  executionPenalty = Math.min(0.65, executionPenalty * roleProfile.executionPenaltyScale);
 
   const candidateHeat = computePortfolioHeatSnapshot({ symbol, stake, direction });
   const heatPenalty = Math.max(0, candidateHeat.totalHeat - equityCurveThrottle.portfolioHeatCap);
@@ -4355,7 +4439,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     ? 0
     : Math.min(0.30, adaptiveIntelligenceState.policy.uncertaintyPenalty + (symbolAnomaly?.recommendedRiskReduction ?? 0) * 0.35);
 
-  const baseConfidence = Math.min(1, blendedConfidence * (0.7 + 0.3 * executionAdjustedEdge));
+  const baseConfidence = Math.min(1, blendedConfidence * (roleProfile.baseConfidenceFloor + roleProfile.executionEdgeWeight * executionAdjustedEdge));
   const calibrationPenalty = confidenceCalibration.overconfidenceProbability * 0.22 + Math.max(0, 1 - probabilityCalibration.reliabilityScore) * 0.18;
   const epistemicPenalty = epistemicState.uncertaintyScore * 0.22;
   const pathPenalty = pathRisk.confidenceErosion * 0.25;
@@ -4403,6 +4487,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   else if (finalConfidence >= Math.max(0.48, strategyConfidenceFloor + 0.05)) confidenceTier = ConfidenceTier.MEDIUM;
   else if (finalConfidence >= strategyConfidenceFloor) confidenceTier = ConfidenceTier.LOW;
   if (signalProfile.uncertainty > 0.85 || transitionPenalty > 0.45 || heatPenalty > 0.35 || executionState.executionReliability < 0.30 || epistemicState.uncertaintyScore > 0.82 || adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) confidenceTier = ConfidenceTier.REJECT;
+  if (signalProfile.expectedEdge < roleProfile.minExpectedEdge || signalProfile.uncertainty > roleProfile.maxLiveUncertainty) confidenceTier = ConfidenceTier.REJECT;
 
   const rejectionReasons: string[] = [];
   if (confidenceTier === ConfidenceTier.REJECT) {
@@ -4416,6 +4501,8 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     if (executionState.executionReliability < 0.30) rejectionReasons.push("execution_reliability_collapse");
     if (epistemicState.uncertaintyScore > 0.82) rejectionReasons.push("epistemic_uncertainty_extreme");
     if (adaptiveIntelligenceState.autonomousState === AutonomousState.EXECUTION_UNSAFE) rejectionReasons.push(`autonomous_state_${adaptiveIntelligenceState.autonomousState}`);
+    if (signalProfile.expectedEdge < roleProfile.minExpectedEdge) rejectionReasons.push("role_min_edge_not_met");
+    if (signalProfile.uncertainty > roleProfile.maxLiveUncertainty) rejectionReasons.push("role_uncertainty_cap_exceeded");
   }
 
   const tierScale = confidenceTier === ConfidenceTier.HIGH ? 1
@@ -6302,6 +6389,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     engineName: pos.engineName || getEngineMetadata(pos.symbol).engineName,
     strategyTag: pos.strategyTag,
     executionTemplate: pos.executionTemplate,
+    outcomeAttribution: classifyTradeOutcomeAttribution(reason, finalPnl),
     contractType: pos.contractType,
     direction: pos.direction,
     stake: pos.stake,
@@ -8860,8 +8948,8 @@ app.post("/api/config", (req, res) => {
   }
 
   if (mode !== undefined) {
-    tradingMode = mode;
-    logs.push(`[SYSTEM] Position contract type control updated to ${mode}, but live engine templates are now embedded per engine and no longer switched globally.`);
+    tradingMode = "AUTO";
+    logs.push(`[SYSTEM] Deprecated mode control '${mode}' ignored. Live routing remains embedded per engine template.`);
   }
 
   if (risk !== undefined) {

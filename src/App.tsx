@@ -51,6 +51,22 @@ const INSTRUMENTS = {
   BOOM500: { name: "Boom 500 Index", volatility: 0.35, tickType: "std", idealStrategy: "spike_fade", basePrice: 500.0 },
 };
 const ALLOWED_SYMBOLS = new Set(Object.keys(INSTRUMENTS));
+const ENGINE_TEMPLATE_LABELS: Record<string, string> = {
+  REVERSION_BOUNDED: "Bounded Reversion",
+  TREND_MULTIPLIER: "Multiplier Trend",
+  SPIKE_EVENT_BOUNDED: "Spike Event Bounded",
+};
+const STRATEGY_ROLE_LABELS: Record<string, string> = {
+  MEAN_REVERSION: "Mean Reversion",
+  TREND_EMA: "Trend Following",
+  POST_SPIKE_HARVEST: "Post-Spike Harvest",
+};
+const OUTCOME_ATTRIBUTION_LABELS: Record<string, string> = {
+  signal_failure: "Signal Failure",
+  exit_policy: "Exit Policy",
+  thesis_realized: "Thesis Realized",
+  manual_override: "Manual Override",
+};
 
 export default function App() {
   // Top level server states
@@ -891,17 +907,21 @@ export default function App() {
             ))}
           </div>
 
-          {/* Sizing presets and toggle options vs multipliers */}
-          <select
-            value={tradingMode}
-            onChange={(e) => updateBackendConfig({ mode: e.target.value })}
-            disabled={configUpdating}
-            className="bg-[#1b211f] text-brand-mint border border-brand-teal/25 rounded px-2 text-sm py-1.5 font-mono outline-soft disabled:opacity-60 disabled:cursor-wait"
-          >
-            <option value="AUTO">AUTO: Algo Adaptive</option>
-            <option value="HYBRID_LINEAR">HYBRID: Linear (Risk R Sizing)</option>
-            <option value="MULTIPLIER">MULT: Multipliers</option>
-          </select>
+          <div className="flex items-center gap-2 flex-wrap">
+            <div className="px-2.5 py-1.5 rounded border border-brand-gold/20 bg-[#1b211f] min-w-[150px]">
+              <div className="text-[10px] uppercase font-mono text-brand-mint/45 tracking-wider">Routing</div>
+              <div className="text-xs font-mono font-bold text-brand-gold mt-0.5">{tradingMode === "AUTO" ? "Embedded Per Engine" : "Embedded Override"}</div>
+            </div>
+            {Object.values(subAlgorithms).slice(0, 3).map((sub: any) => (
+              <div
+                key={`${sub.symbol}-template`}
+                className="px-2.5 py-1.5 rounded border border-brand-teal/20 bg-[#1b211f] min-w-[170px]"
+              >
+                <div className="text-[10px] uppercase font-mono text-brand-mint/45 tracking-wider">Embedded Template</div>
+                <div className="text-xs font-mono font-bold text-brand-mint mt-0.5">{sub.symbol} · {ENGINE_TEMPLATE_LABELS[sub.executionTemplate] || sub.executionTemplate || "Template Pending"}</div>
+              </div>
+            ))}
+          </div>
 
           {/* Toggle Engine trading State */}
           <button
@@ -1379,7 +1399,7 @@ export default function App() {
         )}
 
         {/* Dynamic Parallel Sub-Algorithm status grid cards */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-4 gap-5 xl:gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-5 xl:gap-6">
           {Object.keys(subAlgorithms).length === 0 ? (
             <div className="col-span-full text-center py-12 bg-slate-950/30 rounded border border-slate-900 border-dashed text-slate-600 text-base font-mono">
               Bootstrapping IML subprocess registries and indicator warming tables...
@@ -1441,9 +1461,12 @@ export default function App() {
                   </div>
 
                   {/* Personality identifier tag */}
-                  <div className="flex items-center justify-between z-10">
+                  <div className="flex flex-wrap items-center gap-2 z-10">
                     <span className="px-1.5 py-0.5 rounded text-xs font-mono font-bold text-brand-teal bg-brand-teal/12 border border-brand-teal/25">
-                      {sub.personality}
+                      {STRATEGY_ROLE_LABELS[sub.strategyAssignment] || sub.personality}
+                    </span>
+                    <span className="px-1.5 py-0.5 rounded text-xs font-mono font-bold text-brand-slate bg-brand-slate/10 border border-brand-slate/20">
+                      {ENGINE_TEMPLATE_LABELS[sub.executionTemplate] || sub.executionTemplate || "Embedded"}
                     </span>
                     {isFocused && (
                       <span className="px-1.5 py-0.5 rounded text-xs font-mono font-black text-[#b45309] bg-amber-500/15 border border-amber-500/30 animate-pulse">
@@ -1537,8 +1560,37 @@ export default function App() {
                     )}
                   </div>
 
+                  <div className="grid grid-cols-2 gap-2 text-xs font-mono z-10">
+                    <div className="rounded border border-brand-slate/15 bg-white/35 p-2 min-h-[64px]">
+                      <div className="text-[10px] uppercase text-brand-slate/55 tracking-wider">Last Signal</div>
+                      <div className="text-brand-slate font-black mt-1">
+                        {sub.lastSignalProbability?.confidence !== undefined
+                          ? `${(Number(sub.lastSignalProbability.confidence) * 100).toFixed(0)}%`
+                          : "--"}
+                      </div>
+                      <div className="text-[10px] text-brand-slate/65 mt-1">
+                        Edge {sub.lastSignalProbability?.expectedEdge !== undefined
+                          ? `${(Number(sub.lastSignalProbability.expectedEdge) * 100).toFixed(0)}%`
+                          : "--"}
+                      </div>
+                    </div>
+                    <div className="rounded border border-brand-slate/15 bg-white/35 p-2 min-h-[64px]">
+                      <div className="text-[10px] uppercase text-brand-slate/55 tracking-wider">Governor</div>
+                      <div className="text-brand-slate font-black mt-1">
+                        {sub.lastGovernorDecision?.approved === true
+                          ? "Approved"
+                          : sub.lastGovernorDecision?.approved === false
+                            ? "Rejected"
+                            : "Watching"}
+                      </div>
+                      <div className="text-[10px] text-brand-slate/65 mt-1 line-clamp-2">
+                        {sub.lastGovernorDecision?.confidenceTier || "No recent verdict"}
+                      </div>
+                    </div>
+                  </div>
+
                   {/* Executive action directive message */}
-                  <div className="p-2.5 rounded bg-[#111513] border border-brand-teal/30 text-xs font-mono text-brand-peach leading-normal min-h-[4rem] flex items-center justify-center shadow-inner z-10">
+                  <div className="p-2.5 rounded bg-[#111513] border border-brand-teal/30 text-xs font-mono text-brand-peach leading-normal min-h-[4.75rem] flex items-center justify-center shadow-inner z-10">
                     <p className="line-clamp-3 leading-snug text-center font-bold text-brand-mint/90">
                       {sub.directiveMessage || "Lobbying governor orders..."}
                     </p>
@@ -1847,7 +1899,7 @@ export default function App() {
             </div>
 
             {/* Asset Subprocesses Panel */}
-            <div className="space-y-2 max-h-[295px] overflow-y-auto pr-1">
+            <div className="space-y-2 max-h-[340px] overflow-y-auto pr-1">
               {Object.keys(subAlgorithms).length === 0 ? (
                 <div className="text-center py-6 text-sm text-slate-500 font-mono bg-slate-950/20 rounded border border-slate-900 border-dashed">
                   Waiting for subprocess registries...
@@ -1881,7 +1933,7 @@ export default function App() {
                     <div 
                       key={sub.symbol}
                       onClick={() => setSelectedPerfDetail(sub.symbol)}
-                      className={`p-2.5 rounded-lg bg-slate-950/40 border transition-all duration-150 cursor-pointer flex items-center justify-between gap-3 group overflow-hidden relative ${
+                      className={`p-3 rounded-lg bg-slate-950/40 border transition-all duration-150 cursor-pointer flex items-center justify-between gap-3 group overflow-hidden relative ${
                         isFocused 
                           ? "border-brand-gold/60 hover:bg-slate-900/30" 
                           : "border-slate-900 hover:border-slate-800 hover:bg-slate-900/20"
@@ -1891,14 +1943,14 @@ export default function App() {
                         <div className="absolute top-0 bottom-0 left-0 w-[3px] bg-brand-gold shadow-[0_0_8px_#D9B08C]" />
                       )}
 
-                      <div className="flex items-center gap-2 max-w-[50%] shrink-0">
+                      <div className="flex items-center gap-2 max-w-[58%] shrink-0">
                         <span className={`w-1.5 h-1.5 rounded-full ${sub.enabled ? "bg-emerald-500 animate-pulse shadow-[0_0_6px_#10b981]" : "bg-slate-600"}`} />
                         <div className="flex flex-col truncate">
                           <span className="text-xs font-mono font-bold text-slate-200 group-hover:text-brand-peach transition-colors">
                             {sub.symbol}
                           </span>
                           <span className="text-[10px] text-slate-500 font-sans truncate" title={sub.personality}>
-                            {sub.personality}
+                            {STRATEGY_ROLE_LABELS[sub.strategyAssignment] || sub.personality} · {ENGINE_TEMPLATE_LABELS[sub.executionTemplate] || sub.executionTemplate}
                           </span>
                         </div>
                       </div>
@@ -2609,6 +2661,12 @@ export default function App() {
                               <span className="text-xs text-slate-500 font-light truncate max-w-[110px]" title={instName}>
                                 {instName}
                               </span>
+                              <span className="text-[10px] text-indigo-300 truncate max-w-[150px]" title={t.engineName || t.symbol}>
+                                {t.engineName || t.symbol}
+                              </span>
+                              <span className="text-[10px] text-slate-500 truncate max-w-[150px]">
+                                {(t.strategyTag && STRATEGY_ROLE_LABELS[t.strategyTag]) || t.strategyTag || "Strategy pending"} · {(t.executionTemplate && ENGINE_TEMPLATE_LABELS[t.executionTemplate]) || t.executionTemplate || "Template pending"}
+                              </span>
                             </div>
                           </td>
 
@@ -2661,6 +2719,9 @@ export default function App() {
                             <div className="flex flex-col gap-0.5 leading-tight">
                               <span className="text-xs text-indigo-400 font-semibold uppercase">{t.regimeAtEntry ? t.regimeAtEntry.replace('_', ' ') : "NORMAL"}</span>
                               <span className="text-slate-500 lowercase text-xs italic">{t.exitReason ? t.exitReason.replace('_', ' ') : "settled"}</span>
+                              <span className="text-[10px] text-amber-300/90 uppercase">
+                                {OUTCOME_ATTRIBUTION_LABELS[t.outcomeAttribution || "signal_failure"] || t.outcomeAttribution || "Signal Failure"}
+                              </span>
                             </div>
                           </td>
 

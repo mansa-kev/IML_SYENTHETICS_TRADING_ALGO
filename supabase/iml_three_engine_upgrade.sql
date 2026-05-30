@@ -38,6 +38,7 @@ alter table public.iml_trades add column if not exists derived_sharpe_contributi
 alter table public.iml_trades add column if not exists entry_signal_probability numeric;
 alter table public.iml_trades add column if not exists entry_expected_edge numeric;
 alter table public.iml_trades add column if not exists entry_expected_sharpe_impact numeric;
+alter table public.iml_trades add column if not exists outcome_attribution text;
 alter table public.iml_trades add column if not exists proposal_evidence_id text;
 
 create table if not exists public.iml_proposal_evidence (

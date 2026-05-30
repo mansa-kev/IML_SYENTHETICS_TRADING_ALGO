@@ -75,6 +75,7 @@ export interface TradeRecord {
   engineName?: string;
   strategyTag?: "MEAN_REVERSION" | "TREND_EMA" | "POST_SPIKE_HARVEST";
   executionTemplate?: "REVERSION_BOUNDED" | "TREND_MULTIPLIER" | "SPIKE_EVENT_BOUNDED";
+  outcomeAttribution?: "signal_failure" | "exit_policy" | "thesis_realized" | "manual_override";
   contractType: string;
   direction: "LONG" | "SHORT";
   stake: number;
