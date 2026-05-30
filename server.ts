@@ -1465,10 +1465,10 @@ function assertFinalRiskAuthority(finalRisk: number, governorAllocatedRisk: numb
 function shouldUseMinimumExecutableRiskFloor(proposal: StrategyProposal, finalConfidence: number, signalProfile: ExtendedSignalProbability, portfolioRisk: PortfolioRiskState): boolean {
   if (proposal.effMode !== "HYBRID_LINEAR") return false;
   if (proposal.strategy === "MEAN_REVERSION") return false;
-  if (finalConfidence < LIVE_TREND_MIN_CONFIDENCE) return false;
-  if (signalProfile.expectedEdge < 0.60) return false;
+  if (finalConfidence < MIN_CONFIDENCE_THRESHOLD) return false;
+  if (signalProfile.expectedEdge < 0.50) return false;
   if (signalProfile.uncertainty > 0.65) return false;
-  if (portfolioRisk.drawdownSeverity > 0.01) return false;
+  if (portfolioRisk.drawdownSeverity > 0.02) return false;
   if (activePositions.length > 0) return false;
   return true;
 }
@@ -4162,6 +4162,19 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     executionAdjustedRisk,
     adaptiveRiskBudget
   )).toFixed(2)) : 0;
+  console.log("[GOVERNOR_RISK_BREAKDOWN]", {
+    symbol,
+    confidenceTier,
+    useMinimumRiskFloor,
+    adjustedRisk,
+    governorAllocatedRisk,
+    accountRiskBudget,
+    symbolRiskBudget,
+    portfolioRemainingRisk,
+    executionAdjustedRisk,
+    adaptiveRiskBudget: Number.isFinite(adaptiveRiskBudget) ? adaptiveRiskBudget : "INF",
+    rawAllocatedRisk,
+  });
   let allocatedRisk = rawAllocatedRisk;
   if (confidenceTier !== ConfidenceTier.REJECT && allocatedRisk > 0) {
     // Clamp risk to operational bounds
