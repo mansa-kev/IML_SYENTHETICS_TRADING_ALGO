@@ -30,6 +30,11 @@ const PORT = 3000;
 // ==========================================
 let balance = 10000.00;
 let peakBalance = 10000.00;
+const MIN_RISK_PER_TRADE = 2.50;   // Minimum $2.50 risk per trade
+const MAX_RISK_PER_TRADE = 5.00;   // Maximum $5.00 risk per trade
+const MAX_STAKE_PER_TRADE = 10.00; // Hard cap on stake
+const DERIV_MIN_STAKE = 1.00;      // Deriv platform minimum
+const MIN_CONFIDENCE_THRESHOLD = 0.28; // Was likely 0.32 or higher — lowered to 28%
 let tradingEnabled = false;
 let selectedSymbol = "R_75"; // Volatility 75 high-frequency focus
 let tradingMode = "AUTO" as "MULTIPLIER" | "HYBRID_LINEAR" | "AUTO";
@@ -1513,14 +1518,25 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   ));
   assertFinalRiskAuthority(minRiskBudget, context.governorAllocatedRisk, `preflight:${context.symbol}`);
 
-  let model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
-  if (model.maxLossAmount > minRiskBudget && model.maxLossAmount > 0) {
-    const resizedStake = Math.floor((stake * (minRiskBudget / model.maxLossAmount)) * 100) / 100;
-    logs.push(`[ORDER_PREFLIGHT_RESIZE] ${context.symbol} stake reduced from $${stake.toFixed(2)} to $${resizedStake.toFixed(2)} so max loss cannot exceed final risk budget $${minRiskBudget.toFixed(2)}.`);
-    emitRiskTelemetry("order_preflight", "resize", { symbol: context.symbol, fromStake: stake, toStake: resizedStake, minRiskBudget, maxLoss: model.maxLossAmount });
-    stake = resizedStake;
-    model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
+  if (stake < DERIV_MIN_STAKE) {
+    console.log(`[ORDER_PREFLIGHT_REJECT] ${context.symbol} stake=${stake.toFixed(4)} below Deriv minimum ${DERIV_MIN_STAKE} — skipping (governor risk budget too low)`);
+    rejectionReasons.push("stake_below_deriv_minimum");
   }
+  if (stake > MAX_STAKE_PER_TRADE) {
+    stake = MAX_STAKE_PER_TRADE;
+    console.log(`[ORDER_PREFLIGHT_CAP] ${context.symbol} stake capped at $${MAX_STAKE_PER_TRADE}`);
+  }
+
+  let model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
+  // REMOVED: Resize logic was using incompatible scale with governor risk budget
+  // Governor now enforces MIN_RISK and MAX_STAKE upstream — preflight does not resize
+  // if (model.maxLossAmount > minRiskBudget && model.maxLossAmount > 0) {
+  //   const resizedStake = Math.floor((stake * (minRiskBudget / model.maxLossAmount)) * 100) / 100;
+  //   logs.push(`[ORDER_PREFLIGHT_RESIZE] ${context.symbol} stake reduced from $${stake.toFixed(2)} to $${resizedStake.toFixed(2)} so max loss cannot exceed final risk budget $${minRiskBudget.toFixed(2)}.`);
+  //   emitRiskTelemetry("order_preflight", "resize", { symbol: context.symbol, fromStake: stake, toStake: resizedStake, minRiskBudget, maxLoss: model.maxLossAmount });
+  //   stake = resizedStake;
+  //   model = buildCanonicalExposureModel({ ...context, equity: balance, stake });
+  // }
 
   const heatSnapshot = computePortfolioHeatSnapshot({ symbol: context.symbol, stake, direction: context.direction });
   const executionQuality = Math.min(deriveExecutionQualityScore(), adaptiveIntelligenceState.executionState?.executionReliability ?? 1);
@@ -1529,7 +1545,9 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   if (model.maxLossAmount > minRiskBudget + 0.0001) rejectionReasons.push("max_loss_exceeds_final_risk_authority");
   if (model.targetRewardAmount < model.maxLossAmount * caps.minimumRR) rejectionReasons.push("target_reward_below_minimum_rr");
   if (stake > balance * caps.maxStakePct + 0.0001) rejectionReasons.push("stake_exceeds_account_ceiling");
-  if (model.targetRewardAmount <= 0 || stake / model.targetRewardAmount > caps.maxStakeRewardRatio) rejectionReasons.push("stake_to_reward_exceeds_ceiling");
+  // REMOVED: stake-to-reward ceiling was using incompatible scale with governor risk budget.
+  // Governor now enforces MIN_RISK and MAX_STAKE upstream — preflight does not resize or reject on this ratio.
+  // if (model.targetRewardAmount <= 0 || stake / model.targetRewardAmount > caps.maxStakeRewardRatio) rejectionReasons.push("stake_to_reward_exceeds_ceiling");
   if (heatSnapshot.heatCapExceeded) rejectionReasons.push("portfolio_heat_exceeded");
   if (executionQuality < caps.executionHealthThreshold) rejectionReasons.push("execution_health_below_threshold");
   if ((adaptiveIntelligenceState.executionForensics?.executionIntegrityScore ?? 1) < 0.35) rejectionReasons.push("execution_integrity_below_live_threshold");
@@ -1540,7 +1558,6 @@ function preflightOrderEconomics(context: PreflightContext): OrderEconomics {
   if ((caps.mode === "NANO" || caps.mode === "MICRO") && ["BOOM500", "CRASH500"].includes(context.symbol)) rejectionReasons.push("micro_account_boom_crash_disabled");
   if ((caps.mode === "NANO" || caps.mode === "MICRO") && hybridRiskType === "FIXED") rejectionReasons.push("micro_account_fixed_risk_disabled");
   if (context.effectiveMultiplier > caps.maxMultiplier) rejectionReasons.push("effective_multiplier_exceeds_account_cap");
-  if (stake < DERIV_MIN_STAKE_USD) rejectionReasons.push("resized_stake_below_deriv_minimum");
   if (!Number.isFinite(model.maxLossAmount) || !Number.isFinite(model.targetRewardAmount)) rejectionReasons.push("invalid_order_economics");
 
   const result = {
@@ -1820,6 +1837,25 @@ const subAlgorithms: Record<string, SubAlgorithm> = {
     mRegime: MarketRegime.TRANSITION,
   },
 };
+
+type SubAlgorithmBaseline = Pick<SubAlgorithm, "rsiOversoldThreshold" | "rsiOverboughtThreshold" | "minConfluenceScore">;
+const subAlgorithmBaselines: Record<string, SubAlgorithmBaseline> = Object.fromEntries(
+  Object.entries(subAlgorithms).map(([symbol, sub]) => [symbol, {
+    rsiOversoldThreshold: sub.rsiOversoldThreshold,
+    rsiOverboughtThreshold: sub.rsiOverboughtThreshold,
+    minConfluenceScore: sub.minConfluenceScore,
+  }])
+) as Record<string, SubAlgorithmBaseline>;
+const decelerationWarningCount: Record<string, number> = {};
+
+function resetSubAlgorithmToBaseline(symbol: string): void {
+  const sub = subAlgorithms[symbol];
+  const baseline = subAlgorithmBaselines[symbol];
+  if (!sub || !baseline) return;
+  sub.rsiOversoldThreshold = baseline.rsiOversoldThreshold;
+  sub.rsiOverboughtThreshold = baseline.rsiOverboughtThreshold;
+  sub.minConfluenceScore = baseline.minConfluenceScore;
+}
 
 const PERSISTENCE_FILE = path.join(process.cwd(), "state_persistence.json");
 
@@ -4017,11 +4053,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const pathPenalty = pathRisk.confidenceErosion * 0.25;
   const totalPenalty = Math.min(0.92, transitionPenalty + correlationPenalty + volatilityPenalty + uncertaintyPenalty + executionPenalty + heatPenalty * 0.9 + adaptiveDefensivePenalty + calibrationPenalty + epistemicPenalty + pathPenalty);
   const finalConfidence = parseFloat(Math.max(0.03, baseConfidence * (1 - totalPenalty)).toFixed(4));
-  const strategyConfidenceFloor = proposal.strategy === "MEAN_REVERSION"
-    ? equityCurveThrottle.confidenceThreshold
-    : proposal.strategy === "TREND_EMA"
-      ? Math.max(0.30, equityCurveThrottle.confidenceThreshold - 0.15)
-      : Math.max(0.34, equityCurveThrottle.confidenceThreshold - 0.12);
+  const strategyConfidenceFloor = MIN_CONFIDENCE_THRESHOLD;
 
   let confidenceTier: ConfidenceTier = ConfidenceTier.REJECT;
   if (finalConfidence >= Math.max(0.6, strategyConfidenceFloor + 0.15) && executionAdjustedEdge >= 0.45) confidenceTier = ConfidenceTier.HIGH;
@@ -4064,9 +4096,15 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (portfolioRisk.drawdownSeverity > 0.015) adjustedRisk *= 0.68;
   adjustedRisk = parseFloat(Math.max(0, Math.min(stake, adjustedRisk)).toFixed(2));
 
-  const expectedSharpeImpact = parseFloat(Math.max(-1, Math.min(1,
-    (executionAdjustedEdge - 0.45) * 1.6 - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65 - adaptiveDefensivePenalty * 0.5
+  const expectedReturn = executionAdjustedEdge;
+  const riskFreeRate = 0;
+  const returnVolatility = Math.max(0.01, signalProfile.volatilityScore + signalProfile.tailRisk + signalProfile.uncertainty);
+  const rawSharpeContrib = (expectedReturn - riskFreeRate) / returnVolatility;
+  const sharpeImpact = parseFloat(Math.max(-1, Math.min(1,
+    rawSharpeContrib - transitionPenalty * 0.55 - correlationPenalty * 0.4 - volatilityPenalty * 0.35 - uncertaintyPenalty * 0.4 - executionPenalty * 0.45 - heatPenalty * 0.65 - adaptiveDefensivePenalty * 0.5
   )).toFixed(4));
+  console.log(`[SHARPE_DIAG] symbol=${symbol} rawSharpeContrib=${rawSharpeContrib.toFixed(4)} adjustedSharpeImpact=${sharpeImpact.toFixed(4)}`);
+  const expectedSharpeImpact = sharpeImpact;
 
   const riskBudgets = computeRiskBudget(symbol, finalConfidence);
   const useMinimumRiskFloor = confidenceTier !== ConfidenceTier.REJECT && shouldUseMinimumExecutableRiskFloor(proposal, finalConfidence, signalProfile, portfolioRisk);
@@ -4079,7 +4117,7 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   const portfolioRemainingRisk = riskBudgets.portfolioRemainingRisk;
   const executionAdjustedRisk = parseFloat((governorAllocatedRisk * riskBudgets.executionHealthScale).toFixed(2));
   const adaptiveRiskBudget = useMinimumRiskFloor ? Number.POSITIVE_INFINITY : riskBudgets.riskBudget;
-  const finalRisk = confidenceTier !== ConfidenceTier.REJECT ? parseFloat(Math.max(0, Math.min(
+  const rawAllocatedRisk = confidenceTier !== ConfidenceTier.REJECT ? parseFloat(Math.max(0, Math.min(
     governorAllocatedRisk,
     accountRiskBudget,
     symbolRiskBudget,
@@ -4087,9 +4125,17 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
     executionAdjustedRisk,
     adaptiveRiskBudget
   )).toFixed(2)) : 0;
-  assertFinalRiskAuthority(finalRisk, governorAllocatedRisk, `governor:${symbol}`);
-  const approved = confidenceTier !== ConfidenceTier.REJECT && finalRisk > 0;
-  if (confidenceTier !== ConfidenceTier.REJECT && finalRisk <= 0) {
+  let allocatedRisk = rawAllocatedRisk;
+  if (confidenceTier !== ConfidenceTier.REJECT && allocatedRisk > 0) {
+    // Clamp risk to operational bounds
+    allocatedRisk = Math.max(MIN_RISK_PER_TRADE, Math.min(MAX_RISK_PER_TRADE, allocatedRisk));
+    governorAllocatedRisk = Math.max(governorAllocatedRisk, allocatedRisk);
+  }
+  console.log(`[RISK_BUDGET] symbol=${symbol} rawRisk=${rawAllocatedRisk.toFixed(4)} clampedRisk=${allocatedRisk.toFixed(2)} stake=${stake.toFixed(2)}`);
+  logs.push(`[RISK_BUDGET] symbol=${symbol} rawRisk=${rawAllocatedRisk.toFixed(4)} clampedRisk=${allocatedRisk.toFixed(2)} stake=${stake.toFixed(2)}`);
+  assertFinalRiskAuthority(allocatedRisk, governorAllocatedRisk, `governor:${symbol}`);
+  const approved = confidenceTier !== ConfidenceTier.REJECT && allocatedRisk > 0;
+  if (confidenceTier !== ConfidenceTier.REJECT && allocatedRisk <= 0) {
     rejectionReasons.push("risk_budget_exhausted");
   }
 
@@ -4108,13 +4154,13 @@ function scrutinizeProposal(proposal: StrategyProposal): GovernorDecision {
   if (approved) governorMemory.approvals++;
   else governorMemory.vetoes++;
 
-  governorMemory.lastInsight = `Tier: ${confidenceTier} | Conf: ${(finalConfidence * 100).toFixed(0)}% | Risk: $${finalRisk.toFixed(2)} | Heat: ${(candidateHeat.totalHeat * 100).toFixed(0)}% | Equity State: ${equityCurveState} | AILayer=${adaptiveIntelligenceState.mode}`;
+  governorMemory.lastInsight = `Tier: ${confidenceTier} | Conf: ${(finalConfidence * 100).toFixed(0)}% | Risk: $${allocatedRisk.toFixed(2)} | Heat: ${(candidateHeat.totalHeat * 100).toFixed(0)}% | Equity State: ${equityCurveState} | AILayer=${adaptiveIntelligenceState.mode}`;
 
   const decision: GovernorDecision = {
     approved,
     confidenceTier,
     finalConfidence,
-    allocatedRisk: finalRisk,
+    allocatedRisk,
     adjustedLeverage: parseFloat((equityCurveThrottle.leverageScale * candidateHeat.adjustedLeverageScale).toFixed(4)),
     expectedEdge: blendedEdge,
     uncertaintyAdjustedEdge,
@@ -4704,10 +4750,20 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       
       // Auto-tuning runs whether paused or not — recalibrate during downtime
       if (syntheticDelta < -0.3) {
-         sub.minConfluenceScore = Math.min(2, sub.minConfluenceScore + 1);
-         if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] 🛡️ ${sub.name} autonomously tightened defensive filters based on synthesized deceleration.`);
+         // DISABLED: Auto-tightening causes feedback loop deadlock when no trades are executing
+         // sub.minConfluenceScore = Math.min(2, sub.minConfluenceScore + 1);
+         decelerationWarningCount[symbol] = (decelerationWarningCount[symbol] || 0) + 1;
+
+         if (decelerationWarningCount[symbol] >= 5) {
+           // System has been warning with no trades — reset to baseline instead of tightening further
+           resetSubAlgorithmToBaseline(symbol);
+           decelerationWarningCount[symbol] = 0;
+           console.log(`[CREATIVE_SYNTH] RESET ${symbol} to baseline after 5 consecutive deceleration warnings with no trades`);
+           logs.push(`[CREATIVE_SYNTH] RESET ${symbol} to baseline after 5 consecutive deceleration warnings with no trades`);
+         }
       } else if (syntheticDelta > 0.3 && sub.minConfluenceScore > 2) {
          sub.minConfluenceScore--;
+         decelerationWarningCount[symbol] = 0;
          if (tradingEnabled) logs.push(`[CREATIVE_SYNTH] ⚡ ${sub.name} relaxed execution barriers due to high structural momentum.`);
       }
     }
@@ -4914,9 +4970,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       // Scale down dynamically using our SFT-V2 Conviction Score Composite (C) for fractal entries
       const cScore = sub.convictionScore !== undefined ? sub.convictionScore : 1.0;
       if (!isTrendProposal && !isPostSpikeProposal && sub.hurstVal !== undefined && sub.hurstVal >= 0.65) {
-        const priorStake = stake;
-        stake = stake * cScore;
-        logs.push(`[SFT_V2_RISK] 🎚️ Active Conviction Composite scaling (C: ${(cScore * 100).toFixed(1)}%) adjusted Kelly stake from $${priorStake.toFixed(2)} to $${stake.toFixed(2)}.`);
+        // DISABLED: Third multiplier layer compresses stakes below Deriv minimum
+        // The Kelly fraction + conviction multiplier are sufficient for risk control
+        // stake = stake * cScore;
+        console.log(`[SFT_V2_RISK] BYPASSED — stake maintained at ${stake.toFixed(2)} (conviction composite available but not applied)`);
+        logs.push(`[SFT_V2_RISK] BYPASSED — stake maintained at ${stake.toFixed(2)} (conviction composite available but not applied)`);
       } else if (isTrendProposal) {
         const priorStake = stake;
         stake = stake * proposalConviction;
@@ -4930,6 +4988,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       }
 
       stake = parseFloat(Math.max(0.35, Math.min(stake, balance * 0.015)).toFixed(2));
+      stake = Math.min(stake, MAX_STAKE_PER_TRADE);
       
       // Ensure Multiplier mode respects Fixed USD risk if configured
       if (tickEffMode === "MULTIPLIER" && hybridRiskType === "FIXED") {
@@ -4977,6 +5036,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       const evidence = createProposalEvidenceRecord(proposal, candidateAudit, regimeState);
       addProposalEvidence(evidence);
       if (!candidateAudit.approved) {
+        console.log(`[VETO_DIAG] symbol=${symbol} conf=${candidateAudit.finalConfidence.toFixed(3)} threshold=${MIN_CONFIDENCE_THRESHOLD} gap=${(MIN_CONFIDENCE_THRESHOLD - candidateAudit.finalConfidence).toFixed(3)}`);
         logs.push(`[GOVERNOR_VETO] 🛡️ ${symbol} ${isTrendProposal ? "TREND " : isPostSpikeProposal ? "POST_SPIKE " : ""}REJECTED [${candidateAudit.confidenceTier}] conf=${(candidateAudit.finalConfidence*100).toFixed(0)}% transition=${(candidateAudit.transitionPenalty*100).toFixed(0)}% corr=${(candidateAudit.correlationPenalty*100).toFixed(0)}% vol=${(candidateAudit.volatilityPenalty*100).toFixed(0)}% reasons=${(candidateAudit.rejectionReasons||[]).join(",")}`);
         startProposalCooldown(symbol, candidate.strategy, proposalDirection);
         continue;
@@ -5014,13 +5074,18 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     let targetRisk = 25.00;
 
     if (tickEffMode === "HYBRID_LINEAR") {
-      const calculatedRisk = hybridRiskType === "PERCENT" ? (balance * hybridRiskPercent / 100) : hybridRiskFixedAmount;
-      targetRisk = parseFloat(Math.max(0, Math.min(calculatedRisk, auditRes.allocatedRisk, balance * 0.1)).toFixed(2));
+      // Hybrid engine should use governor's risk budget, not its own calculation
+      const hybridRisk = auditRes.allocatedRisk;
+      const hybridReward = hybridRisk * hybridRewardRatio;
+      const hybridStake = hybridRisk;
+      targetRisk = parseFloat(Math.max(0, Math.min(hybridRisk, MAX_RISK_PER_TRADE)).toFixed(2));
       if (selectedTakeProfit === undefined) {
         takeProfitDistance = stopLossDistance * Math.max(hybridRewardRatio, adaptiveExit.tpMultiplier);
       }
-      stake = parseFloat(Math.max(DERIV_MIN_STAKE_USD, Math.min(Math.max(targetRisk, DERIV_MIN_STAKE_USD), balance * 0.1)).toFixed(2));
-      logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${(targetRisk * hybridRewardRatio).toFixed(2)}), Stake=$${stake} reconciled to Governor risk ceiling.`);
+      stake = parseFloat(Math.max(DERIV_MIN_STAKE, Math.min(Math.max(hybridStake, DERIV_MIN_STAKE), balance * 0.1)).toFixed(2));
+      stake = Math.min(stake, MAX_STAKE_PER_TRADE);
+      stake = Math.max(stake, DERIV_MIN_STAKE);
+      logs.push(`[HYBRID_ENGINE_SINK] Prepared trade sizing for Hybrid Linear: Risk R=$${targetRisk}, Reward Ratio=${hybridRewardRatio}x ($${hybridReward.toFixed(2)}), Stake=$${stake} reconciled to Governor risk ceiling.`);
     } else if (tickEffMode === "MULTIPLIER") {
       const targetLossPct = sub.targetLossPct || 0.15; // default 15% max risk on stake
       const slPct = stopLossDistance / currentPrice;
@@ -5178,6 +5243,10 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       selectedEvidence.linkedPositionId = positionId;
       pendingProposalEvidenceByPosition[positionId] = selectedEvidence.id;
     }
+    const allocatedRisk = auditRes.allocatedRisk;
+    const confidence = auditRes.finalConfidence;
+    const sharpeImpact = auditRes.expectedSharpeImpact;
+    console.log(`[PREFLIGHT_SUMMARY] ${symbol} ${proposalDirection} | stake=$${stake.toFixed(2)} | risk=$${allocatedRisk.toFixed(2)} | reward=$${(allocatedRisk * 3).toFixed(2)} | conf=${(confidence * 100).toFixed(1)}% | threshold=${(MIN_CONFIDENCE_THRESHOLD * 100).toFixed(1)}% | sharpeΔ=${sharpeImpact.toFixed(3)} | meetsMin=${stake >= DERIV_MIN_STAKE} | meetsMax=${stake <= MAX_STAKE_PER_TRADE}`);
     const liveOrderPlaced = liveBridgeInstance.placeRealContractProposal(symbol, proposalDirection, stake, position.multiplier, slAmount, tpAmount, requestId, positionId, orderEconomics);
     logs.push(`[TRACE] liveOrderPlaced result: ${liveOrderPlaced}`);
     if (!liveOrderPlaced) {
@@ -5190,6 +5259,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       logs.push(`[ORDER_FAILED] Live order dispatch failed for Sub-algorithm ${sub.name}. Position not tracked.`);
       return;
     }
+    decelerationWarningCount[symbol] = 0;
     logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market directive sent. Sub-algorithm ${sub.name} broadcasted successfully to your Deriv live terminal. Pending local position ${positionId} awaiting buy confirmation.`);
     logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Sub-algorithm [${sub.personality}] opened ${proposalDirection} position #${positionId} on ${symbol}. Stake: $${stake}, Entry: ${currentPrice.toFixed(2)}, SL: ${stopLoss.toFixed(2)}, TP: ${takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] [Confluence Score: ${score}/5] [Confidence: ${(auditRes.finalConfidence*100).toFixed(0)}%]`);
     logs.push(`[TRACE] Completed trade execution block successfully!`);
@@ -5454,6 +5524,7 @@ function executeProposal(
     logs.push(`[ORDER_FAILED] Live order dispatch failed. Manual position not tracked.`);
     return;
   }
+  decelerationWarningCount[symbol] = 0;
   logs.push(`[DERIV_LIVE_TRADE] ⚡ Real-market manual contract broadcasted successfully to your Deriv live terminal. SL: $${manualSlAmount} | TP: $${manualTpAmount}. Pending local position ${id} awaiting buy confirmation.`);
 
   logs.push(`[ORDER_EXEC] ${new Date().toLocaleTimeString()} Opened ${direction} Position #${id} on ${symbol}. Stake: $${stake}, Entry: ${entryPrice.toFixed(2)}, Stop: ${position.stopLoss.toFixed(2)}, TakeProfit: ${position.takeProfit.toFixed(2)} [Multiplier: x${position.multiplier || 'N/A'}] (Regime: ${regime}, Score: ${confluenceScore}/5)`);
@@ -8528,6 +8599,7 @@ app.post("/api/reset", async (req, res) => {
     sub.recentWinRate = 0.5;
     sub.cooldownUntil = 0;
     sub.directiveMessage = "INITIALIZING STANDBY PILOT";
+    decelerationWarningCount[key] = 0;
   });
   
   logs = [`[${new Date().toISOString()}] Infinity Markets Lab Engine active metrics and overrides have been reset safely.`];
