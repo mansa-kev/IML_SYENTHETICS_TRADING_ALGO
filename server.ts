@@ -9456,37 +9456,28 @@ app.post("/api/reset", async (req, res) => {
   
   if (supabaseClient) {
     // Wipe every table — full clean slate as requested
-    const tablesToWipe: string[] = [
-      "iml_trades",
-      "iml_logs",
-      "iml_strategy_history",
-      "iml_proposal_evidence",
-      "iml_ml_evidence_buckets",
+    const tablesToWipe: Array<{ table: string; column: string; mode: "gt" | "neq" }> = [
+      { table: "iml_trades", column: "id", mode: "neq" },
+      { table: "iml_logs", column: "id", mode: "gt" },
+      { table: "iml_strategy_history", column: "id", mode: "gt" },
+      { table: "iml_proposal_evidence", column: "id", mode: "neq" },
+      { table: "iml_ml_evidence_buckets", column: "key", mode: "neq" },
     ];
-    for (const table of tablesToWipe) {
+    for (const target of tablesToWipe) {
       try {
-        const filterCol = table === "iml_trades" ? "id" : "id";
-        const { error } = await supabaseClient
-          .from(table)
-          .delete()
-          .gt(filterCol, 0); // deletes all rows (bigserial id > 0 covers all, text ids use neq below)
-        // For text-id tables use neq trick
-        if (error && table === "iml_trades") {
-          await supabaseClient.from(table).delete().neq("id", "__NONE__");
-        }
-        if (error && table !== "iml_trades") {
-          logs.push(`[SUPABASE_RESET_WARNING] Could not wipe '${table}': ${error.message}`);
+        const query = supabaseClient.from(target.table).delete();
+        const { error } = target.mode === "gt"
+          ? await query.gt(target.column, 0)
+          : await query.neq(target.column, "__NONE__");
+        if (error) {
+          logs.push(`[SUPABASE_RESET_WARNING] Could not wipe '${target.table}': ${error.message}`);
         } else {
-          logs.push(`[SUPABASE_RESET] '${table}' wiped from cloud database ✓`);
+          logs.push(`[SUPABASE_RESET] '${target.table}' wiped from cloud database ✓`);
         }
       } catch (err: any) {
-        logs.push(`[SUPABASE_RESET_ERROR] Exception wiping '${table}': ${err.message}`);
+        logs.push(`[SUPABASE_RESET_ERROR] Exception wiping '${target.table}': ${err.message}`);
       }
     }
-    // iml_trades uses text id — wipe it separately with correct filter
-    try {
-      await supabaseClient.from("iml_trades").delete().neq("id", "__NONE__");
-    } catch (_) {}
     try {
       await supabaseClient.from("iml_state").delete().eq("id", "dashboard");
       logs.push(`[SUPABASE_RESET] 'iml_state' dashboard document removed from cloud database ✓`);
