@@ -481,6 +481,19 @@ Why it exists:
 - without a warmup buffer, the engine would begin trading with unstable indicators and weak regime estimates
 - the first part of runtime would otherwise be partly blind
 
+The current implementation also runs a startup calibration gate before live entries are released.
+
+Startup calibration checks:
+
+- each active engine has received its Deriv history response
+- each active engine has at least `350` ticks in its buffer
+- each active engine has enough synthesized candles for ATR / ADX stability
+- average regime-confidence is at least `45%`
+- the engine has observed at least a `45` second stability window after warmup starts
+- deployment readiness is not in an execution-unsafe state
+
+During this phase, `tradingEnabled` may be true, but proposal generation is still held. The dashboard surfaces this as `STARTUP CALIBRATION` / `CALIBRATING` instead of letting the first eligible tick become a live order.
+
 Important limitation:
 
 - `350` ticks is fast, but still shallow for deeper structural understanding
@@ -505,8 +518,9 @@ The current live weaknesses are:
 
 1. **engine distribution is still uneven**
    - `R_75` dominates
-2. **startup regime context is still shallow**
-   - `350` warmup ticks are workable, not rich
+2. **startup regime context is now gated, but still shallow**
+   - `350` warmup ticks plus a calibration gate reduces blind startup entries
+   - deeper multi-horizon history is still a future upgrade
 3. **trend exits needed repair**
    - this has been improved, but fresh-session validation still matters
 4. **stale historical state can contaminate perception**
@@ -521,6 +535,7 @@ The highest-value next improvements are:
 1. **better startup regime context**
    - longer historical warmup
    - multi-horizon warmup instead of one shallow 350-tick request
+   - compare startup shadow signals against immediate post-signal drift before releasing full aggression
 2. **better state classification**
    - distinguish “trend exists” from “trend is worth paying for”
    - distinguish “range” from “transitioning range”
@@ -1615,8 +1630,9 @@ If another AI must rebuild the system **exactly as it is**, the following invari
 
 ## 25.2 Market-data invariants
 
-- All six instruments are subscribed on live connection.
+- The active three-engine research set is subscribed on live connection: `R_25`, `R_75`, and `BOOM500`.
 - 350 historical ticks are requested for warmup.
+- Startup calibration gates live entries until warmup depth, regime confidence, elapsed stability, and deployment readiness pass.
 - `tickBuffers` are capped at 2000 entries.
 - candles are synthesized from ticks locally.
 

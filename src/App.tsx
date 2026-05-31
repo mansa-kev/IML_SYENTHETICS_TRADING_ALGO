@@ -164,6 +164,7 @@ export default function App() {
     microConservativeReadiness?: any;
     adaptiveIntelligence?: any;
     derivDiagnostics?: any;
+    startupCalibration?: any;
   }>({});
   const [subAlgorithms, setSubAlgorithms] = useState<Record<string, any>>({});
 
@@ -303,6 +304,7 @@ export default function App() {
         instrumentDiagnostics: data.instrumentDiagnostics,
         microConservativeReadiness: data.microConservativeReadiness,
         adaptiveIntelligence: data.adaptiveIntelligence,
+        startupCalibration: data.startupCalibration,
         derivDiagnostics: data.derivDiagnostics || {
           derivConfigured: data.derivConfigured,
           derivConnected: data.derivConnected,
@@ -865,10 +867,19 @@ export default function App() {
             <h1 className="text-2xl font-display font-medium tracking-tight text-brand-mint">
               INFINITY MARKETS LAB TRADING ALGORITHM
             </h1>
-            <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono text-emerald-400 font-bold">
-              <span className={`w-2 h-2 rounded-full ${tradingEnabled ? "bg-emerald-500 animate-pulse" : "bg-red-500"}`}></span>
-              ENGINE AUTO-TRADE: {tradingEnabled ? "ACTIVE" : "PAUSED"}
-            </span>
+            {(() => {
+              const startup = probabilisticDiagnostics.startupCalibration || {};
+              const calibrating = tradingEnabled && startup.ready === false;
+              const label = calibrating ? `CALIBRATING ${Math.round(Number(startup.readinessScore || 0) * 100)}%` : tradingEnabled ? "ACTIVE" : "PAUSED";
+              const dot = calibrating ? "bg-amber-300 animate-pulse" : tradingEnabled ? "bg-emerald-500 animate-pulse" : "bg-red-500";
+              const text = calibrating ? "text-amber-200" : tradingEnabled ? "text-emerald-400" : "text-red-300";
+              return (
+                <span className={`flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold ${text}`}>
+                  <span className={`w-2 h-2 rounded-full ${dot}`}></span>
+                  ENGINE AUTO-TRADE: {label}
+                </span>
+              );
+            })()}
             <span className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-[#1e2522] border border-brand-teal/30 text-sm font-mono font-bold text-brand-gold">
               {(() => {
                 const derivDiag = probabilisticDiagnostics.derivDiagnostics || {};
@@ -921,6 +932,14 @@ export default function App() {
                 <div className="text-xs font-mono font-bold text-brand-mint mt-0.5">{sub.symbol} · {ENGINE_TEMPLATE_LABELS[sub.executionTemplate] || sub.executionTemplate || "Template Pending"}</div>
               </div>
             ))}
+            {probabilisticDiagnostics.startupCalibration && (
+              <div className={`px-2.5 py-1.5 rounded border min-w-[220px] ${probabilisticDiagnostics.startupCalibration.ready ? "border-emerald-400/25 bg-emerald-950/20" : "border-amber-400/25 bg-amber-950/20"}`}>
+                <div className="text-[10px] uppercase font-mono text-brand-mint/45 tracking-wider">Startup Gate</div>
+                <div className={`text-xs font-mono font-bold mt-0.5 ${probabilisticDiagnostics.startupCalibration.ready ? "text-emerald-300" : "text-amber-200"}`}>
+                  {probabilisticDiagnostics.startupCalibration.phase} · {(Number(probabilisticDiagnostics.startupCalibration.warmupCompletion || 0) * 100).toFixed(0)}% warm · {(Number(probabilisticDiagnostics.startupCalibration.avgRegimeConfidence || 0) * 100).toFixed(0)}% regime
+                </div>
+              </div>
+            )}
           </div>
 
           {/* Toggle Engine trading State */}
@@ -934,6 +953,10 @@ export default function App() {
             ) : tradingEnabled ? (
               <>
                 <Square className="w-3.5 h-3.5 fill-current" /> Pause trading
+              </>
+            ) : probabilisticDiagnostics.startupCalibration?.ready === false ? (
+              <>
+                <Play className="w-3.5 h-3.5 fill-current" /> START CALIBRATED
               </>
             ) : (
               <>

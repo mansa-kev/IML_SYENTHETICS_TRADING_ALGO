@@ -89,6 +89,32 @@ const TREND_HARD_TIMEOUT_MULTIPLIER = 2.1;
 const TREND_POST_LOSS_DIRECTIONAL_COOLDOWN_MS = 90000;
 const TREND_POST_TIMEOUT_DIRECTIONAL_COOLDOWN_MS = 45000;
 
+// Startup calibration gate: warm indicators and market-state inference before first live entries.
+const STARTUP_HISTORY_TICK_TARGET = 350;
+const STARTUP_MIN_CANDLE_TARGET = 50;
+const STARTUP_MIN_ELAPSED_MS = 45000;
+const STARTUP_MIN_REGIME_CONFIDENCE = 0.45;
+const STARTUP_MIN_READINESS_SCORE = 0.78;
+type StartupCalibrationStatus = {
+  active: boolean;
+  ready: boolean;
+  phase: "BOOTING" | "WARMING" | "CALIBRATING" | "READY";
+  startedAt: number;
+  elapsedSeconds: number;
+  warmupCompletion: number;
+  readinessScore: number;
+  minTickDepth: number;
+  minCandleDepth: number;
+  avgRegimeConfidence: number;
+  deploymentReadinessScore: number;
+  reasons: string[];
+  symbolDepth: Record<string, { ticks: number; candles: number; regimeConfidence: number; historyLoaded: boolean }>;
+};
+let startupCalibrationStartedAt = Date.now();
+let startupCalibrationReleasedAt = 0;
+const startupHistoryLoaded: Record<string, boolean> = {};
+let lastStartupCalibrationLogAt = 0;
+
 // Post-spike harvest parameters for Crash/Boom event reversals
 const POST_SPIKE_ENTRY_MIN_TICKS = 8;
 const POST_SPIKE_ENTRY_MAX_TICKS = 28;
@@ -1592,6 +1618,94 @@ function computeDeploymentReadiness(): DeploymentReadiness {
   };
 }
 
+function resetStartupCalibration(reason: string) {
+  startupCalibrationStartedAt = Date.now();
+  startupCalibrationReleasedAt = 0;
+  lastStartupCalibrationLogAt = 0;
+  Object.keys(tickBuffers).forEach(symbol => {
+    startupHistoryLoaded[symbol] = false;
+  });
+  logs.push(`[STARTUP_CALIBRATION] ${reason}. Live entries are gated until warmup, regime confidence, and deployment readiness stabilize.`);
+}
+
+function computeStartupCalibrationStatus(): StartupCalibrationStatus {
+  const symbols = Object.keys(tickBuffers);
+  const depthEntries = symbols.map(symbol => {
+    const regimeConfidence = subAlgorithms[symbol]?.regimeState?.confidence ?? computeRegimeState(symbol).confidence ?? 0;
+    return {
+      symbol,
+      ticks: tickBuffers[symbol]?.length || 0,
+      candles: candleBuffers[symbol]?.length || 0,
+      regimeConfidence,
+      historyLoaded: Boolean(startupHistoryLoaded[symbol]),
+    };
+  });
+  const minTickDepth = Math.min(...depthEntries.map(entry => entry.ticks));
+  const minCandleDepth = Math.min(...depthEntries.map(entry => entry.candles));
+  const avgRegimeConfidence = mean(depthEntries.map(entry => entry.regimeConfidence));
+  const elapsedMs = Date.now() - startupCalibrationStartedAt;
+  const elapsedReady = elapsedMs >= STARTUP_MIN_ELAPSED_MS;
+  const historyReady = depthEntries.every(entry => entry.historyLoaded);
+  const tickReady = minTickDepth >= STARTUP_HISTORY_TICK_TARGET;
+  const candleReady = minCandleDepth >= STARTUP_MIN_CANDLE_TARGET;
+  const regimeReady = avgRegimeConfidence >= STARTUP_MIN_REGIME_CONFIDENCE;
+  const deploymentReadiness = adaptiveIntelligenceState.deploymentReadiness || computeDeploymentReadiness();
+  const deploymentReady = deploymentReadiness.readinessScore >= 0.50 && adaptiveIntelligenceState.autonomousState !== AutonomousState.EXECUTION_UNSAFE;
+  const reasons: string[] = [];
+  if (!historyReady) reasons.push("waiting_for_all_history_responses");
+  if (!tickReady) reasons.push(`tick_depth_${minTickDepth}/${STARTUP_HISTORY_TICK_TARGET}`);
+  if (!candleReady) reasons.push(`candle_depth_${minCandleDepth}/${STARTUP_MIN_CANDLE_TARGET}`);
+  if (!regimeReady) reasons.push(`regime_confidence_${avgRegimeConfidence.toFixed(2)}/${STARTUP_MIN_REGIME_CONFIDENCE}`);
+  if (!elapsedReady) reasons.push(`stability_window_${Math.floor(elapsedMs / 1000)}s/${Math.floor(STARTUP_MIN_ELAPSED_MS / 1000)}s`);
+  if (!deploymentReady) reasons.push(`deployment_readiness_${deploymentReadiness.readinessScore.toFixed(2)}/0.50`);
+  const checks = [historyReady, tickReady, candleReady, regimeReady, elapsedReady, deploymentReady];
+  const readinessScore = checks.filter(Boolean).length / checks.length;
+  const ready = readinessScore >= STARTUP_MIN_READINESS_SCORE && reasons.length === 0;
+  if (ready && startupCalibrationReleasedAt === 0) {
+    startupCalibrationReleasedAt = Date.now();
+    logs.push(`[STARTUP_CALIBRATION] READY warmup=${(Math.min(1, minTickDepth / STARTUP_HISTORY_TICK_TARGET) * 100).toFixed(0)}% regime=${(avgRegimeConfidence * 100).toFixed(0)}% deployment=${(deploymentReadiness.readinessScore * 100).toFixed(0)}%. Live entries released.`);
+  }
+  const phase: StartupCalibrationStatus["phase"] = ready
+    ? "READY"
+    : !historyReady || !tickReady || !candleReady
+      ? "WARMING"
+      : "CALIBRATING";
+  return {
+    active: !ready,
+    ready,
+    phase,
+    startedAt: startupCalibrationStartedAt,
+    elapsedSeconds: Math.floor(elapsedMs / 1000),
+    warmupCompletion: parseFloat(Math.min(1, minTickDepth / STARTUP_HISTORY_TICK_TARGET).toFixed(4)),
+    readinessScore: parseFloat(readinessScore.toFixed(4)),
+    minTickDepth,
+    minCandleDepth,
+    avgRegimeConfidence: parseFloat(avgRegimeConfidence.toFixed(4)),
+    deploymentReadinessScore: deploymentReadiness.readinessScore,
+    reasons,
+    symbolDepth: Object.fromEntries(depthEntries.map(entry => [
+      entry.symbol,
+      {
+        ticks: entry.ticks,
+        candles: entry.candles,
+        regimeConfidence: parseFloat(entry.regimeConfidence.toFixed(4)),
+        historyLoaded: entry.historyLoaded,
+      }
+    ])),
+  };
+}
+
+function shouldGateLiveEntriesForStartup(symbol: string, epoch: number): boolean {
+  const status = computeStartupCalibrationStatus();
+  if (status.ready) return false;
+  const now = Date.now();
+  if (symbol === selectedSymbol && now - lastStartupCalibrationLogAt > 30000) {
+    lastStartupCalibrationLogAt = now;
+    logs.push(`[STARTUP_CALIBRATION] ${status.phase} live entries held. readiness=${(status.readinessScore * 100).toFixed(0)}% warmup=${(status.warmupCompletion * 100).toFixed(0)}% regime=${(status.avgRegimeConfidence * 100).toFixed(0)}% reasons=${status.reasons.join(",") || "none"}`);
+  }
+  return true;
+}
+
 function deriveExecutionQualityScore(): number {
   const latencyPenalty = clamp01(executionHealth.fillLatency / 1.2); // normalize vs 1.2s worst-case
   const slippagePenalty = clamp01(Math.abs(executionHealth.slippageEstimate) / 1.5);
@@ -3015,6 +3129,7 @@ class DerivLiveBridge {
 
   public requestHistoryForSymbols() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    resetStartupCalibration("Historical warmup requested from Deriv");
     logs.push(`[DERIV_LIVE] 📊 Querying authentic historical market tick data from Deriv API for warmup buffers...`);
     Object.keys(INSTRUMENTS).forEach((symbol) => {
       const derivSymbol = this.getDerivSymbolCode(symbol);
@@ -3251,6 +3366,7 @@ class DerivLiveBridge {
         if (internalSymbol && tickBuffers[internalSymbol]) {
           const prices = msg.history.prices.map((p: any) => parseFloat(p));
           tickBuffers[internalSymbol] = prices;
+          startupHistoryLoaded[internalSymbol] = true;
           
           // Seed candles from these historical ticks to initialize indicators instantly
           const candles = candleBuffers[internalSymbol];
@@ -5283,6 +5399,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     if (epoch % 300 === 0 && symbol === selectedSymbol) {
       logs.push(`[IML_MONITOR] 🔍 PAUSED — Monitoring ${symbol} | RSI: ${rsiVal.toFixed(1)} | ADX: ${adx.toFixed(1)} | Regime: ${currentRegime} | PersistenceP: ${(persistenceProbability * 100).toFixed(0)}% | Conviction: ${(conviction * 100).toFixed(0)}% | Positions: ${activePositions.length}`);
     }
+    return;
+  }
+
+  if (shouldGateLiveEntriesForStartup(symbol, epoch)) {
+    sub.directiveMessage = "STARTUP CALIBRATION: collecting multi-engine warmup evidence before live entries";
     return;
   }
 
@@ -8835,6 +8956,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   const instrumentDiagnostics = Object.fromEntries(Object.keys(INSTRUMENTS).map(sym => [sym, computeInstrumentStats(sym)]));
   const realCapitalSnapshot = buildRealCapitalReportSnapshot();
   const derivDiagnostics = liveBridgeInstance.getDerivDiagnostics();
+  const startupCalibration = computeStartupCalibrationStatus();
   const visibleAdaptiveIntelligence = {
     ...adaptiveIntelligenceState,
     metaLearning: {
@@ -8869,6 +8991,7 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
     derivRuntimeSource: derivDiagnostics.derivRuntimeSource,
     derivInitializationErrors: derivDiagnostics.derivInitializationErrors,
     websocketConnected: derivDiagnostics.websocketConnected,
+    startupCalibration,
     tradingEnabled,
     tradingMode,
     riskPreset,
@@ -9059,7 +9182,11 @@ app.post("/api/config", (req, res) => {
     }
     tradingEnabled = enabled;
     if (enabled) {
+      const startupCalibration = computeStartupCalibrationStatus();
       logs.push(`[SYSTEM] Auto-trade ENABLED 🟢 (Active Live Terminal Trading)`);
+      if (!startupCalibration.ready) {
+        logs.push(`[STARTUP_CALIBRATION] Operator enabled trading, but entries remain gated: ${startupCalibration.reasons.join(",") || "startup checks pending"}.`);
+      }
     } else {
       logs.push(`[SYSTEM] Auto-trade DISABLED 🔴 (Engine Paused / Idle)`);
     }
@@ -9100,6 +9227,7 @@ app.post("/api/config", (req, res) => {
     tradingMode,
     riskPreset,
     selectedSymbol,
+    startupCalibration: computeStartupCalibrationStatus(),
   });
 });
 
@@ -9324,6 +9452,7 @@ app.post("/api/reset", async (req, res) => {
   });
   
   logs = [`[${new Date().toISOString()}] Infinity Markets Lab Engine active metrics and overrides have been reset safely.`];
+  resetStartupCalibration("Operational reset requested");
   
   if (supabaseClient) {
     // Wipe every table — full clean slate as requested
