@@ -15,6 +15,7 @@ The most important objective of this document is to explain:
 - The **Deriv live-trading integration model**
 - The **reporting and persistence model**
 - The **exact replication constraints** another AI must preserve
+- The **current operating reality and known limitations**
 
 ---
 
@@ -226,6 +227,15 @@ Important invariant:
 - `activePositions` contains locally tracked positions that may initially have local temporary IDs before being linked to Deriv contract IDs.
 - `completedTrades` is intended to represent **authoritative, closed trade history**.
 - After the live-close fix, recovered persisted trades are filtered so only trades with `derivCloseConfirmed === true` are retained from persisted state.
+- After the reset hardening, a full metrics reset also clears:
+  - in-memory logs
+  - completed trades
+  - active positions
+  - proposal evidence
+  - ML evidence buckets
+  - cooldown registries
+  - pending order registry
+  - the persisted Supabase dashboard document
 
 ## 4.4 Shared types
 
@@ -248,9 +258,9 @@ This is important because reports and analytics should not be reconstructed from
 
 ---
 
-# 5. Supported markets and sub-algorithm personalities
+# 5. Supported markets and engine roles
 
-IML currently supports four instruments.
+IML currently runs as a **three-engine system**.
 
 ## 5.1 Instrument metadata
 
@@ -261,36 +271,47 @@ The instrument map is defined in both frontend and backend with matching semanti
 - Name: `Volatility 25 (1s)`
 - Volatility: `0.28`
 - Ideal strategy label: `mean_reversion`
+- Engine name: `Atlas Reversion Engine`
+- Assigned strategy: `MEAN_REVERSION`
+- Assigned execution template: `REVERSION_BOUNDED`
 
 ### R_75
 
 - Name: `Volatility 75 (1s)`
 - Volatility: `0.85`
 - Ideal strategy label: `breakout`
-
-### CRASH500
-
-- Name: `Crash 500 Index`
-- Volatility: `0.35`
-- Ideal strategy label: `spike_fade`
+- Engine name: `Vector Trend Engine`
+- Assigned strategy: `TREND_EMA`
+- Assigned execution template: `TREND_MULTIPLIER`
 
 ### BOOM500
 
 - Name: `Boom 500 Index`
 - Volatility: `0.35`
 - Ideal strategy label: `spike_fade`
+- Engine name: `Pulse Spike Harvest Engine`
+- Assigned strategy: `POST_SPIKE_HARVEST`
+- Assigned execution template: `SPIKE_EVENT_BOUNDED`
 
-## 5.2 Sub-algorithms
+### CRASH500 status
 
-The system uses a **sub-algorithm per instrument**.
+`CRASH500` is retired from the active live engine set. Legacy references may still exist in older historical exports, but the active runtime is now centered on:
 
-This is not six completely different code paths. It is the **same core engine** parameterized per symbol.
+- `R_25`
+- `R_75`
+- `BOOM500`
 
-Each sub-algorithm has:
+## 5.2 Engine assignments
+
+The system uses one dedicated engine per active instrument.
+
+This is still the **same core runtime** parameterized per symbol, but strategy assignment is now intentionally hard-bounded.
+
+Each engine has:
 
 - a symbol
 - a name
-- a personality label
+- a bounded role
 - oscillator thresholds
 - Bollinger settings
 - confluence threshold
@@ -299,10 +320,12 @@ Each sub-algorithm has:
 - local win/loss/performance counters
 - live runtime indicator values
 - optional fractal statistics
+- an embedded execution template
 
 ### R_25
 
-- Personality: `Sentinel Divergence Sniper`
+- Engine: `Atlas Reversion Engine`
+- Role: `bounded mean reversion`
 - RSI oversold: `31`
 - RSI overbought: `69`
 - BB std: `2.30`
@@ -313,7 +336,8 @@ Each sub-algorithm has:
 
 ### R_75
 
-- Personality: `Apex Volatility HFT Scalar`
+- Engine: `Vector Trend Engine`
+- Role: `trend continuation / multiplier trend`
 - RSI oversold: `32`
 - RSI overbought: `68`
 - BB std: `2.50`
@@ -322,20 +346,10 @@ Each sub-algorithm has:
 - Target loss pct: `0.20`
 - Max ticks in trade: `200`
 
-### CRASH500
-
-- Personality: `Crash Extreme Recovery Scalar`
-- RSI oversold: `22`
-- RSI overbought: `75`
-- BB std: `2.75`
-- Min confluence: `2`
-- ATR stop multiplier: `3.25`
-- Target loss pct: `0.20`
-- Max ticks in trade: `180`
-
 ### BOOM500
 
-- Personality: `Boom Consolidator Ridge Sniper`
+- Engine: `Pulse Spike Harvest Engine`
+- Role: `post-spike recovery / exhaustion harvest`
 - RSI oversold: `25`
 - RSI overbought: `78`
 - BB std: `2.75`
@@ -350,31 +364,23 @@ Each sub-algorithm has:
 
 This section is the most important part of the document.
 
-IML is **not a pure trend-following system**.
-It is **not a pure mean-reversion system**.
-It is **not a pure breakout system**.
+IML is currently best understood as a **role-assigned three-engine system**:
 
-It is a **dual-regime, multi-symbol, governor-supervised tactical engine** with two dominant styles:
+- `R_25` expresses the mean-reversion side
+- `R_75` expresses the trend-following side
+- `BOOM500` expresses the event-driven post-spike side
 
-- **Fractal persistence trend capture** when market structure looks persistent
-- **Confluence-based mean-reversion fading** when structure is non-persistent
-
-The contract layer then chooses between:
-
-- `MULTIPLIER`
-- `HYBRID_LINEAR`
-
-depending on the active mode or governor choice.
+The old global mode-toggle mentality is no longer the right operating model. Execution style is now embedded in the engine role itself.
 
 ## 6.1 Primary style summary
 
 The system’s actual trading style is best described as:
 
-> A multi-instrument tactical engine that tries to classify whether a symbol is in a persistent memory/trend corridor or in a more stationary/noisy regime, then switches between a fractal trend-following entry model and a five-factor mean-reversion confluence model, with governor supervision, adaptive stake sizing, dynamic stop management, and Deriv-authoritative settlement.
+> A role-assigned, governor-supervised synthetic-index engine that infers whether each active market is better suited to bounded reversion, persistence trend capture, or post-spike recovery, then routes execution through an engine-specific contract template with adaptive risk, dynamic stop management, and Deriv-authoritative settlement.
 
-## 6.2 The two main strategy personalities
+## 6.2 The three active roles
 
-### A. Persistent-regime style
+### A. Trend role: `R_75`
 
 When Hurst/fractal conditions are strong, IML behaves like a **trend/persistence follower**.
 
@@ -389,9 +395,15 @@ Characteristics:
 - may bypass take profit on live management if `isFractalTrend` is true
 - uses adaptive ATR trailing to stay in fat-tail moves
 
-This is the system’s **trend capture / breakout persistence personality**.
+This is the system’s most active live engine today.
 
-### B. Non-persistent regime style
+Current known issue:
+
+- it has historically dominated engine distribution
+- it was exiting too often through `TIME_EXIT`
+- it is now adjusted to use a better hold/progress model plus post-loss directional cooldown, but this still needs fresh-session validation
+
+### B. Mean-reversion role: `R_25`
 
 When persistence is absent, IML behaves like a **mean reversion confluence fader**.
 
@@ -405,18 +417,118 @@ Characteristics:
 - requires a minimum score out of 5
 - trades both LONG and SHORT depending on confluence
 
-This is the system’s **oscillator + location + reversal** personality.
+This is the bounded reversion role.
 
-## 6.3 Why the system feels hybrid in practice
+Current known issue:
 
-Because each symbol has its own parameters, and because the governor can adapt those parameters over time, the net effect is:
+- it has recently been too quiet in live operation
+- part of that is genuine regime mismatch
+- part of that was stricter activation and governor treatment than `R_75`
+- a modest range-regime activation assist has now been added, but this role still needs empirical tuning
 
-- some instruments behave more like **faders**
-- some behave more like **divergence snipers**
-- some behave more like **breakout raiders**
-- some are pulled toward defensive high-confluence operation after underperformance
+### C. Event role: `BOOM500`
 
-That means the label “personality” is not decorative. It corresponds to a parameter cluster and adaptation tendency.
+This role is intended to act only after a valid spike event followed by exhaustion/recovery structure.
+
+Current known issue:
+
+- it is intentionally sparse, but it has recently been too silent
+- its post-spike window and recovery thresholds were widened slightly to improve executability
+- it should still remain much rarer than `R_75`
+
+## 6.3 Why the system still feels biased in practice
+
+Even after the three-engine refactor, the system can still feel trend-biased in practice because:
+
+- `R_75` has the simplest candidate-generation path
+- `R_25` requires stronger range/reversion alignment
+- `BOOM500` is event-gated
+- the governor has still found enough marginal trend candidates to keep `R_75` dominant
+
+At the current standpoint:
+
+- `R_75` is the most active engine
+- `R_25` is under-firing
+- `BOOM500` is intentionally rare and recently under-firing
+
+This is an active tuning problem, not a solved property.
+
+---
+
+# 7. Startup warmup behavior
+
+When the engine starts and authenticates with Deriv, it requests:
+
+- `350` historical ticks per active instrument
+
+This is the warmup query in `requestHistoryForSymbols()`.
+
+What that means:
+
+- it is not `350` trades
+- it is not `350` candles
+- it is `350` recent raw ticks used to seed:
+  - `tickBuffers`
+  - synthetic warmup candles
+  - RSI
+  - Bollinger Bands
+  - ATR / ADX
+  - Hurst / persistence calculations
+  - immediate regime estimation
+
+Why it exists:
+
+- without a warmup buffer, the engine would begin trading with unstable indicators and weak regime estimates
+- the first part of runtime would otherwise be partly blind
+
+Important limitation:
+
+- `350` ticks is fast, but still shallow for deeper structural understanding
+- especially for persistence and regime classification, the engine is estimating from a limited recent slice rather than a rich market history
+
+---
+
+# 8. Current operating reality
+
+The system does not “know” market state with certainty. It infers market state from:
+
+- indicator structure
+- persistence metrics
+- volatility shape
+- transition probabilities
+- execution-health overlays
+- recent empirical calibration
+
+So it is not making random guesses, but it is still producing a probabilistic approximation rather than reading a true hidden state.
+
+The current live weaknesses are:
+
+1. **engine distribution is still uneven**
+   - `R_75` dominates
+2. **startup regime context is still shallow**
+   - `350` warmup ticks are workable, not rich
+3. **trend exits needed repair**
+   - this has been improved, but fresh-session validation still matters
+4. **stale historical state can contaminate perception**
+   - reset and recovery logic has now been hardened to prevent old logs and trades from returning after a full reset
+
+---
+
+# 9. Best next improvements
+
+The highest-value next improvements are:
+
+1. **better startup regime context**
+   - longer historical warmup
+   - multi-horizon warmup instead of one shallow 350-tick request
+2. **better state classification**
+   - distinguish “trend exists” from “trend is worth paying for”
+   - distinguish “range” from “transitioning range”
+3. **better engine allocation discipline**
+   - give `R_25` more legitimate chances in true ranging conditions
+   - keep `BOOM500` sparse but executable
+4. **cleaner empirical feedback**
+   - judge current behavior from fresh post-reset sessions, not stale pre-refactor logs
 
 ---
 

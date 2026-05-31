@@ -61,8 +61,14 @@ export interface ActivePosition {
   isFractalTrend?: boolean;
   maxAdverseExcursion?: number;
   closeRequestedAt?: number;
+  closeRequestedAtEpoch?: number;
   closeRequestedReason?: "stop_loss" | "take_profit" | "time_exit" | "manual" | "circuit_breaker" | "early_cutoff";
   maxTicksOverride?: number;
+  hardMaxTicks?: number;
+  minHoldTicks?: number;
+  stagnationTicks?: number;
+  bestProgressRatio?: number;
+  lastProgressTick?: number;
   entrySignalProbability?: number;
   entryExpectedEdge?: number;
   entryExpectedSharpeImpact?: number;

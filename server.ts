@@ -82,15 +82,21 @@ const LIVE_TREND_MIN_CONFIDENCE = parseFloat(process.env.IML_LIVE_TREND_MIN_CONF
 const TREND_SHORT_EMA = 50;   // short EMA length (ticks)
 const TREND_LONG_EMA = 200;   // long EMA length (ticks)
 const TREND_MIN_ADX = 25;     // minimum ADX to consider a trend
+const TREND_MIN_HOLD_TICKS = 45;
+const TREND_STAGNATION_TICKS = 18;
+const TREND_TIME_EXIT_PROGRESS_FLOOR = 0.18;
+const TREND_HARD_TIMEOUT_MULTIPLIER = 2.1;
+const TREND_POST_LOSS_DIRECTIONAL_COOLDOWN_MS = 90000;
+const TREND_POST_TIMEOUT_DIRECTIONAL_COOLDOWN_MS = 45000;
 
 // Post-spike harvest parameters for Crash/Boom event reversals
-const POST_SPIKE_ENTRY_MIN_TICKS = 10;
-const POST_SPIKE_ENTRY_MAX_TICKS = 20;
-const POST_SPIKE_MIN_RECOVERY_PROB = 0.45;
-const POST_SPIKE_MIN_EXHAUSTION_PROB = 0.45;
+const POST_SPIKE_ENTRY_MIN_TICKS = 8;
+const POST_SPIKE_ENTRY_MAX_TICKS = 28;
+const POST_SPIKE_MIN_RECOVERY_PROB = 0.40;
+const POST_SPIKE_MIN_EXHAUSTION_PROB = 0.40;
 const POST_SPIKE_TARGET_RETRACE = 0.50;
 const POST_SPIKE_STOP_ATR_BUFFER = 0.35;
-const POST_SPIKE_MIN_RR = 2.50;
+const POST_SPIKE_MIN_RR = 2.20;
 
 // Pending Deriv order registry — holds local positions until Deriv returns a real contract_id
 type PendingDerivOrder = {
@@ -142,7 +148,8 @@ function finalizeDerivContractSettlement(pos: ActivePosition, contract: any) {
     return;
   }
   const exitPrice = parseFloat(contract.exit_tick || contract.sell_spot || contract.current_spot || contract.entry_tick || `${pos.currentPrice || pos.entryPrice || 0}`) || pos.currentPrice || pos.entryPrice;
-  const epoch = parseInt(String(contract.date_expiry || contract.date_settlement || contract.sell_time || Math.floor(Date.now() / 1000)), 10) || Math.floor(Date.now() / 1000);
+  const closeRequestedEpoch = pos.closeRequestedAtEpoch || (pos.closeRequestedAt ? Math.floor(pos.closeRequestedAt / 1000) : pos.entryEpoch);
+  const epoch = normalizeExitEpoch(contract.date_expiry || contract.date_settlement || contract.sell_time, closeRequestedEpoch);
   const authoritativePnl = parseFloat(contract.profit ?? "NaN");
   const reason = resolveExitReasonFromContract(pos, exitPrice);
   activePositions = activePositions.filter(p => p.id !== pos.id);
@@ -456,18 +463,47 @@ const mlEvidenceStats: Record<string, OnlineEvidenceBucket> = {};
 const pendingProposalEvidenceByPosition: Record<string, string> = {};
 
 const proposalCooldownUntil: Record<string, number> = {};
+const directionalLossCooldownUntil: Record<string, number> = {};
 
 function proposalCooldownKey(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT"): string {
   return `${symbol}:${strategy}:${direction}`;
 }
 
 function isProposalCoolingDown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT"): boolean {
-  return Date.now() < (proposalCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] || 0);
+  const key = proposalCooldownKey(symbol, strategy, direction);
+  return Date.now() < Math.max(proposalCooldownUntil[key] || 0, directionalLossCooldownUntil[key] || 0);
 }
 
 function startProposalCooldown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT") {
   const cooldownMs = strategy === "POST_SPIKE_HARVEST" ? 30000 : strategy === "TREND_EMA" ? 12000 : 8000;
   proposalCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] = Date.now() + cooldownMs;
+}
+
+function startDirectionalLossCooldown(symbol: string, strategy: StrategyKind, direction: "LONG" | "SHORT", cooldownMs: number) {
+  directionalLossCooldownUntil[proposalCooldownKey(symbol, strategy, direction)] = Date.now() + cooldownMs;
+}
+
+function normalizeExitEpoch(candidate: unknown, fallbackEpoch: number): number {
+  const numeric = Number(candidate);
+  if (Number.isFinite(numeric) && numeric > 946684800) {
+    return Math.max(Math.floor(numeric), fallbackEpoch);
+  }
+  return Math.max(fallbackEpoch, Math.floor(Date.now() / 1000));
+}
+
+function normalizeStoredTradeRecord(trade: TradeRecord): TradeRecord {
+  const safeEntryEpoch = Number.isFinite(trade.entryEpoch) && trade.entryEpoch > 946684800
+    ? Math.floor(trade.entryEpoch)
+    : Math.floor(Date.now() / 1000);
+  const safeExitEpoch = normalizeExitEpoch(trade.exitEpoch, safeEntryEpoch);
+  return {
+    ...trade,
+    engineName: trade.engineName || getEngineMetadata(trade.symbol).engineName,
+    strategyTag: trade.strategyTag || getEngineMetadata(trade.symbol).strategyAssignment,
+    executionTemplate: trade.executionTemplate || getEngineMetadata(trade.symbol).executionTemplate,
+    exitEpoch: safeExitEpoch,
+    entryEpoch: safeEntryEpoch,
+  };
 }
 
 function confidenceBucket(confidence: number): string {
@@ -2763,9 +2799,9 @@ async function loadStateFromSupabase() {
       if (loaded.completedTrades !== undefined) {
         const recoveredTrades = Array.isArray(loaded.completedTrades) ? loaded.completedTrades : [];
         const allowedInstruments = new Set(Object.keys(INSTRUMENTS));
-        const authoritativeTrades = recoveredTrades.filter((trade: any) =>
-          trade?.derivCloseConfirmed === true && allowedInstruments.has(trade?.symbol)
-        );
+        const authoritativeTrades = recoveredTrades
+          .filter((trade: any) => trade?.derivCloseConfirmed === true && allowedInstruments.has(trade?.symbol))
+          .map((trade: TradeRecord) => normalizeStoredTradeRecord(trade));
         if (authoritativeTrades.length !== recoveredTrades.length) {
           logs.push(`[STATE_SANITIZER] Removed ${recoveredTrades.length - authoritativeTrades.length} legacy/disallowed trades from recovered session state.`);
         }
@@ -2791,7 +2827,8 @@ async function loadStateFromSupabase() {
         currentParams.regimeAdxThreshold = Math.max(10, Math.min(40, currentParams.regimeAdxThreshold));
       }
       if (loaded.logs !== undefined) {
-        logs = loaded.logs;
+        const recoveredLogs = Array.isArray(loaded.logs) ? loaded.logs : [];
+        logs = filterLegacyGovernorLogs(filterRetiredInstrumentLogs(recoveredLogs));
         logs.push(`[${new Date().toISOString()}] State recovered successfully from Cloud Supabase Database.`);
       }
       if (loaded.subAlgorithmsParams !== undefined) {
@@ -3110,6 +3147,7 @@ class DerivLiveBridge {
             } else if (!completedTrades.some(t => t.id === contractIdStr)) {
               const internalSymbol = this.getInternalSymbolCode(contract.underlying || "");
               if (internalSymbol) {
+                const engineMeta = getEngineMetadata(internalSymbol);
                 const type = contract.contract_type || "";
                 const direction = inferDirectionFromContractType(type);
                 const entryPrice = parseFloat(contract.entry_tick || contract.entry_spot || contract.current_spot || "0");
@@ -3119,6 +3157,9 @@ class DerivLiveBridge {
                 finalizeDerivContractSettlement({
                   id: contractIdStr,
                   symbol: internalSymbol,
+                  engineName: engineMeta.engineName,
+                  strategyTag: engineMeta.strategyAssignment,
+                  executionTemplate: engineMeta.executionTemplate,
                   contractType: type as any,
                   direction,
                   stake: parseFloat(contract.buy_price || "0"),
@@ -3152,6 +3193,7 @@ class DerivLiveBridge {
 
           const internalSymbol = this.getInternalSymbolCode(contract.underlying || "");
           if (internalSymbol) {
+            const engineMeta = getEngineMetadata(internalSymbol);
             logs.push(`[DERIV_LIVE] 👻 Ghost Position Detected! Mapping orphan contract #${contractIdStr} (${contract.display_name}) to live registry.`);
             const type = contract.contract_type || "";
             const direction = inferDirectionFromContractType(type);
@@ -3166,6 +3208,9 @@ class DerivLiveBridge {
             activePositions.push({
               id: contractIdStr,
               symbol: internalSymbol,
+              engineName: engineMeta.engineName,
+              strategyTag: engineMeta.strategyAssignment,
+              executionTemplate: engineMeta.executionTemplate,
               contractType: type as any,
               direction: direction,
               stake: ghostStake,
@@ -5267,6 +5312,9 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
   const spikeRecoveryLong = 0;
   const spikeRecoveryShort = symbol === "BOOM500" && spikeState?.spikeDetected ? spikeState.recoveryProbability : 0;
   const spikeSuppression = symbol === "BOOM500" && spikeState?.spikeDetected && (spikeState.postSpikeTicksElapsed || 0) < 8 ? 0.55 : 1;
+  const meanReversionRegimeBoost = getEngineMetadata(symbol).strategyAssignment === "MEAN_REVERSION"
+    ? (((sub.regimeState?.meanReversionProbability || 0) > 0.45 ? 0.08 : 0) + ((currentRegime === MarketRegime.RANGING || currentRegime === MarketRegime.LOW_VOL) ? 0.06 : 0))
+    : 0;
 
   const longStrengthRaw =
     (isPersistentRegime ? clamp01((kamaLocal < currentPrice && smaHigher < currentPrice ? 0.45 + persistenceProbability * 0.55 + breakoutAlignment * 0.15 : persistenceProbability * 0.35)) : persistenceProbability * 0.12) * 0.35 +
@@ -5276,6 +5324,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     divergenceBoostLong * 0.4 +
     reversalBoostLong * 0.3 +
     meanReversionIntensity * 0.2 +
+    meanReversionRegimeBoost +
     spikeRecoveryLong * 0.55;
 
   const shortStrengthRaw =
@@ -5286,6 +5335,7 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     divergenceBoostShort * 0.4 +
     reversalBoostShort * 0.3 +
     meanReversionIntensity * 0.2 +
+    meanReversionRegimeBoost +
     spikeRecoveryShort * 0.55;
 
   const longStrength = clamp01(longStrengthRaw * spikeSuppression);
@@ -5306,12 +5356,19 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
 
   const tickEffMode = getEffectiveTradeType(symbol);
   const trendDir = detectTrendEMA(prices, TREND_SHORT_EMA, TREND_LONG_EMA);
-  const trendSignalActive = trendDir !== 0 && adx >= TREND_MIN_ADX;
+  const trendReentryPenalty = symbol === "R_75" && sub.consecutiveLosses >= 2 ? 1 : 0;
+  const trendSignalActive = trendDir !== 0
+    && adx >= (TREND_MIN_ADX + trendReentryPenalty * 3)
+    && persistenceProbability >= (0.50 + trendReentryPenalty * 0.06);
   const trendReason = `Trend mode (EMA${TREND_SHORT_EMA}/${TREND_LONG_EMA}, ADX=${adx.toFixed(1)})`;
   const postSpikeSetup = buildPostSpikeHarvestSetup(symbol, currentPrice, atr, spikeState);
   const assignedStrategy = getEngineMetadata(symbol).strategyAssignment;
-
-  const minActivation = Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
+  const mrRegimeAssist = assignedStrategy === "MEAN_REVERSION"
+    ? (((sub.regimeState?.meanReversionProbability || 0) >= 0.45 ? 0.05 : 0) + ((currentRegime === MarketRegime.RANGING || currentRegime === MarketRegime.LOW_VOL) ? 0.04 : 0))
+    : 0;
+  const minActivation = assignedStrategy === "MEAN_REVERSION"
+    ? Math.max(0.24, Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08) - mrRegimeAssist)
+    : Math.max(0.32, equityCurveThrottle.confidenceThreshold - 0.08);
   type TickSignalCandidate = {
     isTrend: boolean;
     isPostSpike: boolean;
@@ -5626,6 +5683,11 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
     }
 
     const positionId = `CT_${Math.random().toString(36).substring(2, 9).toUpperCase()}`;
+    const adaptiveTicksCap = Math.max(15, Math.ceil(Math.min(adaptiveExit.maxTicks, auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
+      : auditRes.confidenceTier === ConfidenceTier.MEDIUM ? sub.maxTicksInTrade * 0.85
+      : sub.maxTicksInTrade * 0.65) * equityCurveThrottle.maxPositionDurationScale));
+    const trendMinHoldTicks = selectedStrategy === "TREND_EMA" ? Math.max(TREND_MIN_HOLD_TICKS, Math.round(adaptiveTicksCap * 0.65)) : undefined;
+    const trendHardMaxTicks = selectedStrategy === "TREND_EMA" ? Math.max(adaptiveTicksCap + 20, Math.round(adaptiveTicksCap * TREND_HARD_TIMEOUT_MULTIPLIER)) : undefined;
     const position: ActivePosition = {
       id: positionId,
       symbol,
@@ -5653,9 +5715,12 @@ function processSubAlgorithmTick(symbol: string, currentPrice: number, epoch: nu
       targetRiskAmount: tickEffMode === "HYBRID_LINEAR" ? targetRisk : undefined,
       hybridPositionSize: tickEffMode === "HYBRID_LINEAR" ? (targetRisk / stopLossDistance) : undefined,
       isFractalTrend: isPersistentRegime || isTrendProposal,
-      maxTicksOverride: Math.max(15, Math.ceil(Math.min(adaptiveExit.maxTicks, auditRes.confidenceTier === ConfidenceTier.HIGH ? sub.maxTicksInTrade
-        : auditRes.confidenceTier === ConfidenceTier.MEDIUM ? sub.maxTicksInTrade * 0.85
-        : sub.maxTicksInTrade * 0.65) * equityCurveThrottle.maxPositionDurationScale)),
+      maxTicksOverride: adaptiveTicksCap,
+      hardMaxTicks: trendHardMaxTicks,
+      minHoldTicks: trendMinHoldTicks,
+      stagnationTicks: selectedStrategy === "TREND_EMA" ? TREND_STAGNATION_TICKS : undefined,
+      bestProgressRatio: 0,
+      lastProgressTick: 0,
       entrySignalProbability: auditRes.finalConfidence,
       entryExpectedEdge: auditRes.executionAdjustedEdge,
       entryExpectedSharpeImpact: auditRes.expectedSharpeImpact,
@@ -6140,6 +6205,15 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
         }
       }
     } else if (subAlg && (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN")) {
+      const tpDistanceAbs = Math.max(1e-9, Math.abs(pos.takeProfit - pos.entryPrice));
+      const favorableMove = pos.direction === "LONG"
+        ? Math.max(0, currentPrice - pos.entryPrice)
+        : Math.max(0, pos.entryPrice - currentPrice);
+      const progressRatio = clamp01(favorableMove / tpDistanceAbs);
+      if ((pos.bestProgressRatio ?? 0) + 0.01 < progressRatio) {
+        pos.bestProgressRatio = parseFloat(progressRatio.toFixed(4));
+        pos.lastProgressTick = pos.ticksElapsed;
+      }
       const prices = tickBuffers[pos.symbol] || [];
       if (pos.isFractalTrend && prices.length >= 50) {
         // Section 6.1 Volatility-Adaptive Trailing Stop
@@ -6274,10 +6348,33 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
     // Maximum ticks limit reached based on sub-algorithm customizable safety guidelines
     const isTimeExitEnabled = subAlg ? subAlg.timeExitEnabled : true;
     const limitTicks = pos.maxTicksOverride ?? (subAlg ? subAlg.maxTicksInTrade : currentParams.maxTicksInTrade);
+    const hardLimitTicks = pos.hardMaxTicks ?? limitTicks;
 
     if (!exitTriggered && isTimeExitEnabled && pos.ticksElapsed >= limitTicks) {
-      exitTriggered = true;
-      reason = "time_exit";
+      const isTrendMultiplier = pos.strategyTag === "TREND_EMA" && (pos.contractType === "MULTUP" || pos.contractType === "MULTDOWN");
+      if (isTrendMultiplier) {
+        const tpDistanceAbs = Math.max(1e-9, Math.abs(pos.takeProfit - pos.entryPrice));
+        const favorableMove = pos.direction === "LONG"
+          ? Math.max(0, currentPrice - pos.entryPrice)
+          : Math.max(0, pos.entryPrice - currentPrice);
+        const progressRatio = clamp01(favorableMove / tpDistanceAbs);
+        const bestProgressRatio = pos.bestProgressRatio ?? progressRatio;
+        const minHoldTicks = pos.minHoldTicks ?? TREND_MIN_HOLD_TICKS;
+        const lastProgressTick = pos.lastProgressTick ?? 0;
+        const stagnationTicks = pos.stagnationTicks ?? TREND_STAGNATION_TICKS;
+        const hasStalled = pos.ticksElapsed - lastProgressTick >= stagnationTicks;
+        const neverProgressed = bestProgressRatio < TREND_TIME_EXIT_PROGRESS_FLOOR;
+        const underwater = pos.pnl <= 0;
+        const hardTimeoutReached = pos.ticksElapsed >= hardLimitTicks;
+
+        if (hardTimeoutReached || (pos.ticksElapsed >= minHoldTicks && hasStalled && (neverProgressed || underwater))) {
+          exitTriggered = true;
+          reason = "time_exit";
+        }
+      } else {
+        exitTriggered = true;
+        reason = "time_exit";
+      }
     }
 
     if (exitTriggered) {
@@ -6289,10 +6386,12 @@ function updateOpenPositions(symbol: string, currentPrice: number, epoch: number
         return;
       }
       pos.closeRequestedAt = Date.now();
+      pos.closeRequestedAtEpoch = Math.floor(pos.closeRequestedAt / 1000);
       pos.closeRequestedReason = reason;
       const closeSent = liveBridgeInstance.requestContractClose(pos.id, reason);
       if (!closeSent) {
         pos.closeRequestedAt = undefined;
+        pos.closeRequestedAtEpoch = undefined;
         pos.closeRequestedReason = undefined;
         logs.push(`[DERIV_CLOSE_FAILED] Unable to request authoritative close for contract #${pos.id} on ${reason.toUpperCase()}.`);
       }
@@ -6383,7 +6482,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   }
 
   // Create record
-  const record: TradeRecord = {
+  const record: TradeRecord = normalizeStoredTradeRecord({
     id: pos.id,
     symbol: pos.symbol,
     engineName: pos.engineName || getEngineMetadata(pos.symbol).engineName,
@@ -6413,7 +6512,7 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
     entryExpectedEdge: pos.entryExpectedEdge,
     entryExpectedSharpeImpact: pos.entryExpectedSharpeImpact,
     proposalEvidenceId: pos.proposalEvidenceId,
-  };
+  });
 
   const latencySample = Math.abs((epoch - (pos.closeRequestedAt || pos.entryEpoch)) || 1);
   executionHealth.fillLatency = parseFloat((executionHealth.fillLatency * 0.7 + Math.min(2.0, latencySample / 60) * 0.3).toFixed(4));
@@ -6425,6 +6524,15 @@ function settleContract(pos: ActivePosition, exitPrice: number, reason: "stop_lo
   }
 
   completedTrades.push(record);
+  if (record.strategyTag === "TREND_EMA") {
+    if (finalPnl < 0) {
+      startDirectionalLossCooldown(record.symbol, "TREND_EMA", record.direction, TREND_POST_LOSS_DIRECTIONAL_COOLDOWN_MS);
+      logs.push(`[TREND_COOLDOWN] ${record.symbol} ${record.direction} paused for ${Math.round(TREND_POST_LOSS_DIRECTIONAL_COOLDOWN_MS / 1000)}s after settled trend loss.`);
+    } else if (reason === "time_exit" && finalPnl <= 0.05) {
+      startDirectionalLossCooldown(record.symbol, "TREND_EMA", record.direction, TREND_POST_TIMEOUT_DIRECTIONAL_COOLDOWN_MS);
+      logs.push(`[TREND_COOLDOWN] ${record.symbol} ${record.direction} paused for ${Math.round(TREND_POST_TIMEOUT_DIRECTIONAL_COOLDOWN_MS / 1000)}s after weak time-exit settlement.`);
+    }
+  }
   const evidenceId = pos.proposalEvidenceId || pendingProposalEvidenceByPosition[pos.id];
   const evidence = proposalEvidenceStore.find(item => item.id === evidenceId);
   if (evidence) {
@@ -8623,6 +8731,14 @@ function filterRetiredInstrumentLogs(entries: string[]): string[] {
   return entries.filter(raw => !raw.includes("CRASH500") && !raw.includes("Crash 500"));
 }
 
+function filterLegacyGovernorLogs(entries: string[]): string[] {
+  return entries.filter(raw =>
+    !raw.includes("Initiating personality realignment") &&
+    !raw.includes("Trend Mean Fader") &&
+    !raw.includes("Trend Divergence Sniper")
+  );
+}
+
 app.get("/api/logs/export", async (req, res) => {
   const format = String(req.query.format || "csv");
   const { startDay, endDay, label } = resolveKenyaLogRange(req.query);
@@ -8703,7 +8819,9 @@ app.get("/api/state", (req, res) => { res.setHeader("X-Cooldowns", JSON.stringif
   
   const totalPnl = parseFloat(completedTrades.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
   const recentTradeWindow = completedTrades.slice(-300);
-  const visibleRecentTrades = recentTradeWindow.filter(trade => Boolean(INSTRUMENTS[trade.symbol as keyof typeof INSTRUMENTS]));
+  const visibleRecentTrades = recentTradeWindow
+    .filter(trade => Boolean(INSTRUMENTS[trade.symbol as keyof typeof INSTRUMENTS]))
+    .map(trade => normalizeStoredTradeRecord(trade));
   const visibleActivePositions = activePositions.filter(position => Boolean(INSTRUMENTS[position.symbol as keyof typeof INSTRUMENTS]));
   const recentWindowPnl = parseFloat(recentTradeWindow.reduce((sum, t) => sum + t.pnl, 0).toFixed(2));
   const completedTradesCumulativeOffset = parseFloat((totalPnl - recentWindowPnl).toFixed(2));
@@ -9145,8 +9263,24 @@ app.get("/reports/:file", (req, res) => {
 
 // Reset live indicators and stats
 app.post("/api/reset", async (req, res) => {
+  if (stateSaveTimer) {
+    clearTimeout(stateSaveTimer);
+    stateSaveTimer = null;
+  }
   activePositions = [];
   completedTrades = [];
+  proposalEvidenceStore.splice(0, proposalEvidenceStore.length);
+  Object.keys(mlEvidenceStats).forEach(key => delete mlEvidenceStats[key]);
+  Object.keys(pendingProposalEvidenceByPosition).forEach(key => delete pendingProposalEvidenceByPosition[key]);
+  Object.keys(proposalCooldownUntil).forEach(key => delete proposalCooldownUntil[key]);
+  Object.keys(directionalLossCooldownUntil).forEach(key => delete directionalLossCooldownUntil[key]);
+  pendingOrderQueue.splice(0, pendingOrderQueue.length);
+  riskTelemetry.splice(0, riskTelemetry.length);
+  proposalLatencySamples.splice(0, proposalLatencySamples.length);
+  websocketEventSamples.splice(0, websocketEventSamples.length);
+  staleQuoteSamples.splice(0, staleQuoteSamples.length);
+  executionMismatchSamples.splice(0, executionMismatchSamples.length);
+  rejectionTimestamps.splice(0, rejectionTimestamps.length);
   consecutiveLosses = 0;
   consecutiveWins = 0;
   lossStreakStakeBuffer = [];
@@ -9159,6 +9293,12 @@ app.post("/api/reset", async (req, res) => {
   tradingEnabled = false;
   sessionBlocked = false;
   currentParams = { ...defaultParams };
+  governorMemory.approvals = 0;
+  governorMemory.vetoes = 0;
+  governorMemory.reasons = [];
+  governorMemory.lastInsight = "System initialized with baseline heuristic scrutiny.";
+  adaptiveIntelligenceState.lastShadowComparison = "Awaiting live feature and trade samples.";
+  (globalThis as any).lastReportSummary = null;
   
   // Always fetch live balance from Deriv on reset — no local default fallback
   try {
@@ -9187,7 +9327,13 @@ app.post("/api/reset", async (req, res) => {
   
   if (supabaseClient) {
     // Wipe every table — full clean slate as requested
-    const tablesToWipe: string[] = ["iml_trades", "iml_logs", "iml_strategy_history"];
+    const tablesToWipe: string[] = [
+      "iml_trades",
+      "iml_logs",
+      "iml_strategy_history",
+      "iml_proposal_evidence",
+      "iml_ml_evidence_buckets",
+    ];
     for (const table of tablesToWipe) {
       try {
         const filterCol = table === "iml_trades" ? "id" : "id";
@@ -9212,7 +9358,13 @@ app.post("/api/reset", async (req, res) => {
     try {
       await supabaseClient.from("iml_trades").delete().neq("id", "__NONE__");
     } catch (_) {}
-    // Overwrite iml_state dashboard document with clean in-memory state so stale symbols never reload
+    try {
+      await supabaseClient.from("iml_state").delete().eq("id", "dashboard");
+      logs.push(`[SUPABASE_RESET] 'iml_state' dashboard document removed from cloud database ✓`);
+    } catch (err: any) {
+      logs.push(`[SUPABASE_RESET_WARNING] Could not remove 'iml_state': ${err.message}`);
+    }
+    // Overwrite iml_state dashboard document with clean in-memory state so stale state never reloads
     try {
       await saveStateToSupabase();
       logs.push(`[SUPABASE_RESET] iml_state dashboard document refreshed with clean state ✓`);

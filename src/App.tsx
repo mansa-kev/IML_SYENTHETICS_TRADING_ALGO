@@ -2648,9 +2648,20 @@ export default function App() {
                       const instName = INSTRUMENTS[t.symbol as keyof typeof INSTRUMENTS]?.name || t.symbol;
 
                       // Format epoch times
-                      const entryTime = new Date(t.entryEpoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                      const exitTime = new Date(t.exitEpoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-                      const entryDate = new Date(t.entryEpoch * 1000).toLocaleDateString([], { month: '2-digit', day: '2-digit' });
+                      const validEntryEpoch = Number.isFinite(t.entryEpoch) && t.entryEpoch > 946684800 ? t.entryEpoch : null;
+                      const validExitEpoch = Number.isFinite(t.exitEpoch) && t.exitEpoch > 946684800 ? t.exitEpoch : null;
+                      const entryTime = validEntryEpoch !== null
+                        ? new Date(validEntryEpoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                        : "Invalid";
+                      const exitTime = validExitEpoch !== null
+                        ? new Date(validExitEpoch * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+                        : "Pending repair";
+                      const entryDate = validEntryEpoch !== null
+                        ? new Date(validEntryEpoch * 1000).toLocaleDateString([], { month: '2-digit', day: '2-digit' })
+                        : "--/--";
+                      const exitDate = validExitEpoch !== null
+                        ? new Date(validExitEpoch * 1000).toLocaleDateString([], { month: '2-digit', day: '2-digit' })
+                        : "--/--";
 
                       return (
                         <tr key={`${t.id}-${idx}`} className="hover:bg-slate-900/30 transition-colors">
@@ -2685,7 +2696,7 @@ export default function App() {
                           <td className="px-3 py-2 text-left align-middle text-slate-400 font-light">
                             <div className="flex flex-col leading-tight">
                               <span>In: <span className="text-slate-300">{entryDate} {entryTime}</span></span>
-                              <span>Out: <span className="text-slate-500">{exitTime}</span></span>
+                              <span>Out: <span className="text-slate-500">{exitDate} {exitTime}</span></span>
                             </div>
                           </td>
 
@@ -4270,9 +4281,9 @@ export default function App() {
               </p>
               <ul className="list-disc list-inside space-y-1 bg-[#1b211f]/50 p-3 rounded border border-brand-teal/10 text-slate-400">
                 <li>Wipes all active, pending, and past trade history logs</li>
-                <li>Resets demo/simulated virtual balance back to <span className="text-[#10b981] font-bold">$10,000.00</span></li>
+                <li>Preserves the authoritative live Deriv balance while resetting local session metrics and cooldown state</li>
                 <li>Synchronises live Deriv WS status stream and clears cooldown locks</li>
-                <li>Wipes the remote cloud database <span className="text-indigo-405">iml_trades</span> table on your Connected Supabase instances</li>
+                <li>Wipes the remote cloud history and evidence tables plus refreshes the persisted dashboard state to a clean slate</li>
               </ul>
             </div>
 
